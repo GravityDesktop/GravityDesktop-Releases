@@ -6107,23 +6107,6 @@ private:
             coreBoundaries.push_back(
                 {core.id, resolved, coreCollisionRadius});
             coreDisplayPositions_[core.id] = ScreenToWorld(resolved);
-            if (focusedCoreId_ == 0 &&
-                focusAnimationState_ == FocusAnimationState::Idle) {
-                const D2D1_POINT_2F safeWorld = ScreenToWorld(resolved);
-                if (DistanceSquared(core.position, safeWorld) > 0.25f) {
-                    core.position = safeWorld;
-                    core.xRatio = std::clamp(
-                        resolved.x / std::max(1.0f, client.width),
-                        0.0f, 1.0f);
-                    core.yRatio = std::clamp(
-                        resolved.y / std::max(1.0f, client.height),
-                        0.0f, 1.0f);
-                    core.monitorId = CurrentMonitorId();
-                    if (!benchmarkMode_) {
-                        dirty_ = true;
-                    }
-                }
-            }
         }
 
         std::vector<const Core*> orderedCores;
@@ -6682,6 +6665,41 @@ private:
             RebuildLayoutCache();
         }
         return layoutCache_;
+    }
+
+    bool CommitDisplayedCorePositions() {
+        const D2D1_SIZE_F client = ClientDipSize();
+        const std::wstring monitorId = CurrentMonitorId();
+        bool changed = false;
+        for (Core& core : state_.cores) {
+            const auto found =
+                coreDisplayPositions_.find(core.id);
+            if (found == coreDisplayPositions_.end()) {
+                continue;
+            }
+            const D2D1_POINT_2F displayWorld = found->second;
+            const D2D1_POINT_2F displayScreen =
+                WorldToScreen(displayWorld);
+            const float xRatio = std::clamp(
+                displayScreen.x /
+                    std::max(1.0f, client.width),
+                0.0f, 1.0f);
+            const float yRatio = std::clamp(
+                displayScreen.y /
+                    std::max(1.0f, client.height),
+                0.0f, 1.0f);
+            changed = changed ||
+                DistanceSquared(
+                    core.position, displayWorld) > 0.25f ||
+                std::abs(core.xRatio - xRatio) > 0.0001f ||
+                std::abs(core.yRatio - yRatio) > 0.0001f ||
+                core.monitorId != monitorId;
+            core.position = displayWorld;
+            core.xRatio = xRatio;
+            core.yRatio = yRatio;
+            core.monitorId = monitorId;
+        }
+        return changed;
     }
 
     static float ClampUnit(float value) {
@@ -13416,10 +13434,12 @@ private:
         const D2D1_POINT_2F world = ScreenToWorld(PixelToDip(x, y));
         if (draggingCore_ && dragMoved_) {
             StableLayouts();
-            if (Core* core = FindCore(dragCoreId_)) {
-                core->position = DisplayCoreWorld(*core);
-                layoutDirty_ = true;
-            }
+            // Drag completion is an explicit transaction. Commit the dragged
+            // core and any hard-body displacement here, with the caller's
+            // single undo snapshot, instead of writing model coordinates
+            // from an ordinary cache rebuild.
+            CommitDisplayedCorePositions();
+            layoutDirty_ = true;
             PushUndo(std::move(dragSnapshot_));
             ScheduleSave();
             WarnIfClustersOverlap(dragCoreId_);
@@ -17322,6 +17342,62 @@ bool RunSelfTest() {
     DestroyWindow(pauseInteraction);
     DestroyWindow(pauseVisual);
     if (!pauseHidBothWindows) {
+        return false;
+    }
+
+    HWND cacheVisual = CreateWindowExW(
+        WS_EX_TOOLWINDOW, L"STATIC", L"", WS_POPUP,
+        0, 0, 800, 600, nullptr, nullptr,
+        GetModuleHandleW(nullptr), nullptr);
+    if (cacheVisual == nullptr) {
+        return false;
+    }
+    GravityApp cachePurityApp;
+    cachePurityApp.AttachWindow(cacheVisual);
+    Core unsafeCacheCore;
+    unsafeCacheCore.id = 2;
+    unsafeCacheCore.name = L"cache-purity";
+    unsafeCacheCore.position =
+        D2D1::Point2F(-500.0f, -400.0f);
+    unsafeCacheCore.xRatio = -0.25f;
+    unsafeCacheCore.yRatio = -0.25f;
+    cachePurityApp.state_.cores.push_back(
+        unsafeCacheCore);
+    cachePurityApp.layoutDirty_ = true;
+    cachePurityApp.dirty_ = false;
+    const std::string cacheStateBefore =
+        SerializeState(cachePurityApp.state_);
+    cachePurityApp.StableLayouts();
+    const Core& unchangedCacheCore =
+        cachePurityApp.state_.cores.front();
+    const D2D1_POINT_2F safeDisplayPosition =
+        cachePurityApp.DisplayCoreWorld(
+            unchangedCacheCore);
+    const bool cacheWasPure =
+        SerializeState(cachePurityApp.state_) ==
+            cacheStateBefore &&
+        !cachePurityApp.dirty_ &&
+        cachePurityApp.DistanceSquared(
+            unchangedCacheCore.position,
+            safeDisplayPosition) > 0.25f;
+    const bool explicitCommitWorked =
+        cachePurityApp.CommitDisplayedCorePositions();
+    const Core& committedCacheCore =
+        cachePurityApp.state_.cores.front();
+    const bool explicitCommitWasPersistent =
+        explicitCommitWorked &&
+        SerializeState(cachePurityApp.state_) !=
+            cacheStateBefore &&
+        cachePurityApp.DistanceSquared(
+            committedCacheCore.position,
+            safeDisplayPosition) <= 0.25f &&
+        committedCacheCore.xRatio >= 0.0f &&
+        committedCacheCore.xRatio <= 1.0f &&
+        committedCacheCore.yRatio >= 0.0f &&
+        committedCacheCore.yRatio <= 1.0f;
+    DestroyWindow(cacheVisual);
+    if (!cacheWasPure ||
+        !explicitCommitWasPersistent) {
         return false;
     }
 
