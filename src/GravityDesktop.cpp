@@ -87,6 +87,8 @@ constexpr UINT kInteractionLayerRepairDelayMs = 600;
 constexpr int kDesktopReconnectAttemptLimit = 40;
 constexpr std::size_t kMaxRelationTraversalNodes = 4096;
 constexpr std::size_t kMaxRelationTraversalDepth = 256;
+constexpr std::size_t kHistoryRecentSnapshotCount = 48;
+constexpr std::size_t kHistoryDailySnapshotCount = 30;
 constexpr int kWorkspaceControlCount = 7;
 constexpr int kRelationHoverDelayMs = 10;
 constexpr int kHoverTooltipDelayMs = 320;
@@ -1493,6 +1495,79 @@ std::wstring BackupTimestamp() {
               time.wYear, time.wMonth, time.wDay, time.wHour, time.wMinute,
               time.wSecond, time.wMilliseconds);
     return value;
+}
+
+bool IsGeneratedHistorySnapshotName(
+    const std::filesystem::path& path) {
+    const std::wstring name = path.filename().wstring();
+    if (name.size() != 30 ||
+        name.compare(0, 6, L"state-") != 0 ||
+        name.compare(25, 5, L".json") != 0 ||
+        name[14] != L'-' || name[21] != L'-') {
+        return false;
+    }
+    for (std::size_t index = 6; index < 25; ++index) {
+        if (index == 14 || index == 21) {
+            continue;
+        }
+        if (!iswdigit(name[index])) {
+            return false;
+        }
+    }
+    return true;
+}
+
+bool PruneGeneratedHistorySnapshots(
+    const std::filesystem::path& folder) {
+    std::error_code error;
+    if (!std::filesystem::exists(folder, error)) {
+        return !error;
+    }
+    std::vector<std::filesystem::path> snapshots;
+    std::filesystem::directory_iterator iterator(folder, error);
+    const std::filesystem::directory_iterator end;
+    while (!error && iterator != end) {
+        const std::filesystem::directory_entry& entry = *iterator;
+        const std::filesystem::file_status status =
+            entry.symlink_status(error);
+        if (error) {
+            break;
+        }
+        if (std::filesystem::is_regular_file(status) &&
+            IsGeneratedHistorySnapshotName(entry.path())) {
+            snapshots.push_back(entry.path());
+        }
+        iterator.increment(error);
+    }
+    if (error) {
+        return false;
+    }
+    std::sort(
+        snapshots.begin(), snapshots.end(),
+        [](const std::filesystem::path& first,
+           const std::filesystem::path& second) {
+            return first.filename().wstring() >
+                   second.filename().wstring();
+        });
+
+    std::set<std::wstring> retainedDailyDates;
+    for (std::size_t index = kHistoryRecentSnapshotCount;
+         index < snapshots.size(); ++index) {
+        const std::wstring name =
+            snapshots[index].filename().wstring();
+        const std::wstring date = name.substr(6, 8);
+        if (retainedDailyDates.size() <
+                kHistoryDailySnapshotCount &&
+            retainedDailyDates.insert(date).second) {
+            continue;
+        }
+        error.clear();
+        std::filesystem::remove(snapshots[index], error);
+        if (error) {
+            return false;
+        }
+    }
+    return true;
 }
 
 std::string SerializeState(const WorkspaceState& state) {
@@ -15281,7 +15356,12 @@ private:
             folder / (L"state-" + BackupTimestamp() + L".json");
         std::filesystem::copy_file(stateFile_, target,
             std::filesystem::copy_options::none, error);
-        if (!error) lastHistoryBackupTime_ = now;
+        if (!error) {
+            lastHistoryBackupTime_ = now;
+            // Retention only touches snapshots created by this function.
+            // A pruning failure does not invalidate the backup just written.
+            PruneGeneratedHistorySnapshots(folder);
+        }
         return !error;
     }
 
@@ -17263,6 +17343,63 @@ bool RunSelfTest() {
             std::filesystem::remove_all(path, ignored);
         }
     } relationTestCleanup{relationTestDirectory};
+
+    const std::filesystem::path historyDirectory =
+        relationTestDirectory / L"backups";
+    std::filesystem::create_directories(
+        historyDirectory, tempError);
+    if (tempError) {
+        return false;
+    }
+    for (int dayIndex = 0; dayIndex < 80; ++dayIndex) {
+        const int month = 1 + dayIndex / 28;
+        const int day = 1 + dayIndex % 28;
+        for (int snapshotIndex = 0;
+             snapshotIndex < 2; ++snapshotIndex) {
+            wchar_t name[64]{};
+            swprintf_s(
+                name, L"state-2026%02d%02d-%06d-%03d.json",
+                month, day, 120000 + snapshotIndex,
+                snapshotIndex);
+            std::ofstream snapshot(
+                historyDirectory / name,
+                std::ios::binary | std::ios::trunc);
+            snapshot << "{}";
+            if (!snapshot) {
+                return false;
+            }
+        }
+    }
+    const std::filesystem::path unrelatedHistoryFile =
+        historyDirectory / L"keep-user-note.json";
+    {
+        std::ofstream unrelated(
+            unrelatedHistoryFile,
+            std::ios::binary | std::ios::trunc);
+        unrelated << "{}";
+        if (!unrelated) {
+            return false;
+        }
+    }
+    if (!PruneGeneratedHistorySnapshots(historyDirectory)) {
+        return false;
+    }
+    std::size_t retainedHistorySnapshots = 0;
+    for (const std::filesystem::directory_entry& entry :
+         std::filesystem::directory_iterator(historyDirectory)) {
+        if (IsGeneratedHistorySnapshotName(entry.path())) {
+            ++retainedHistorySnapshots;
+        }
+    }
+    if (retainedHistorySnapshots !=
+            kHistoryRecentSnapshotCount +
+                kHistoryDailySnapshotCount ||
+        !std::filesystem::exists(unrelatedHistoryFile) ||
+        !std::filesystem::exists(
+            historyDirectory /
+            L"state-20260324-120001-001.json")) {
+        return false;
+    }
 
     const std::filesystem::path layoutTracePath =
         relationTestDirectory /
