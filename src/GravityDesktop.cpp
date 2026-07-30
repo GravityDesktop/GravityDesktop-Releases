@@ -963,6 +963,13 @@ std::size_t AttachedFileCount(const Core& core) {
         }));
 }
 
+std::size_t AttachedFileCountAfterDissolve(
+    const Core& unclassified,
+    const Core& source) {
+    return AttachedFileCount(unclassified) +
+           AttachedFileCount(source);
+}
+
 bool CoreBodyVisible(const Core& core) {
     return core.id != kUnclassifiedCoreId ||
            AttachedFileCount(core) > 0;
@@ -15037,6 +15044,32 @@ private:
         if (source == nullptr || unclassified == nullptr) {
             return;
         }
+        const std::size_t currentAttachedCount =
+            AttachedFileCount(*unclassified);
+        const std::size_t incomingAttachedCount =
+            AttachedFileCount(*source);
+        const std::size_t resultingAttachedCount =
+            AttachedFileCountAfterDissolve(
+                *unclassified, *source);
+        if (resultingAttachedCount >
+            static_cast<std::size_t>(
+                kCoreFileCapacity)) {
+            SetStatus(
+                L"无法解散：未分类当前 " +
+                std::to_wstring(
+                    currentAttachedCount) +
+                L" 项，转入 " +
+                std::to_wstring(
+                    incomingAttachedCount) +
+                L" 项后为 " +
+                std::to_wstring(
+                    resultingAttachedCount) +
+                L"/" +
+                std::to_wstring(
+                    kCoreFileCapacity) +
+                L"；请先整理或移除部分引用");
+            return;
+        }
         const std::size_t referenceCount = source->files.size();
         const std::wstring warning =
             L"将解散核心“" + source->name + L"”。\n\n" +
@@ -15091,14 +15124,14 @@ private:
             SetStatus(L"未找到“未分类”核心，解散操作已取消");
             return;
         }
-        const std::size_t resultingAttachedCount =
+        const std::size_t committedAttachedCount =
             AttachedFileCount(*target) +
             static_cast<std::size_t>(std::count_if(
                 movedFiles.begin(), movedFiles.end(),
                 [](const FileItem& item) {
                     return !item.detachedFromUpper;
                 }));
-        if (resultingAttachedCount > 15) {
+        if (committedAttachedCount > 15) {
             target->layoutTemplate =
                 LayoutTemplate::HighCapacityDouble;
         }
@@ -18376,6 +18409,85 @@ bool RunSelfTest() {
         SerializeState(fullCoreApp.state_) !=
             fullCoreBefore ||
         !fullCoreApp.undoStack_.empty()) {
+        return false;
+    }
+
+    const auto makeDissolveCapacityCore =
+        [](std::uint64_t coreId,
+           std::uint64_t firstItemId,
+           std::size_t attachedCount) {
+            Core core;
+            core.id = coreId;
+            core.name =
+                coreId == kUnclassifiedCoreId
+                    ? L"未分类"
+                    : L"待解散核心";
+            for (std::size_t index = 0;
+                 index < attachedCount; ++index) {
+                FileItem item;
+                item.id =
+                    firstItemId + index;
+                item.path =
+                    L"C:\\GravityDesktopSelfTest\\dissolve-" +
+                    std::to_wstring(item.id) +
+                    L".txt";
+                item.originalName =
+                    L"dissolve-" +
+                    std::to_wstring(item.id) +
+                    L".txt";
+                item.displayName =
+                    L"dissolve-" +
+                    std::to_wstring(item.id);
+                core.files.push_back(
+                    std::move(item));
+            }
+            return core;
+        };
+    Core dissolveTargetAtLimit =
+        makeDissolveCapacityCore(
+            kUnclassifiedCoreId, 800, 10);
+    Core dissolveSourceAtLimit =
+        makeDissolveCapacityCore(
+            2, 900, 8);
+    if (AttachedFileCountAfterDissolve(
+            dissolveTargetAtLimit,
+            dissolveSourceAtLimit) !=
+        static_cast<std::size_t>(
+            kCoreFileCapacity)) {
+        return false;
+    }
+
+    Core dissolveSourceOverLimit =
+        makeDissolveCapacityCore(
+            2, 900, 9);
+    FileItem detachedDissolveItem;
+    detachedDissolveItem.id = 999;
+    detachedDissolveItem.path =
+        L"C:\\GravityDesktopSelfTest\\detached.txt";
+    detachedDissolveItem.detachedFromUpper = true;
+    dissolveSourceOverLimit.files.push_back(
+        std::move(detachedDissolveItem));
+    if (AttachedFileCountAfterDissolve(
+            dissolveTargetAtLimit,
+            dissolveSourceOverLimit) != 19) {
+        return false;
+    }
+    GravityApp dissolveOverCapacityApp;
+    dissolveOverCapacityApp.state_.cores.push_back(
+        dissolveTargetAtLimit);
+    dissolveOverCapacityApp.state_.cores.push_back(
+        dissolveSourceOverLimit);
+    const std::string dissolveOverCapacityBefore =
+        SerializeState(
+            dissolveOverCapacityApp.state_);
+    dissolveOverCapacityApp.DissolveCore(2);
+    if (SerializeState(
+            dissolveOverCapacityApp.state_) !=
+            dissolveOverCapacityBefore ||
+        !dissolveOverCapacityApp.undoStack_.empty() ||
+        dissolveOverCapacityApp.status_.find(
+            L"19/18") ==
+            std::wstring::npos) {
         return false;
     }
 
