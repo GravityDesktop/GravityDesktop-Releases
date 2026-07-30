@@ -11068,26 +11068,20 @@ private:
             }
         }
         WorkspaceState before = state_;
+        std::vector<std::uint64_t> movedRelationIds{
+            childId};
         if (source != target) {
-            std::vector<std::uint64_t> subtree{childId};
-            for (std::size_t index = 0; index < subtree.size(); ++index) {
-                for (const FileItem& candidate : source->files) {
-                    if (candidate.parentFileId == subtree[index]) {
-                        subtree.push_back(candidate.id);
-                    }
-                }
-            }
-            if (AttachedFileCount(*target) + subtree.size() >
-                static_cast<std::size_t>(kCoreFileCapacity)) {
-                SetStatus(L"目标核心容量不足，未改变文件关系");
+            std::wstring moveError;
+            if (!MoveSubtreeToCoreInternal(
+                    childCoreId, childId,
+                    parentCoreId,
+                    &movedRelationIds,
+                    &moveError)) {
+                SetStatus(
+                    moveError.empty()
+                        ? L"无法移入目标核心"
+                        : std::move(moveError));
                 return false;
-            }
-            for (const std::uint64_t id : subtree) {
-                if (!MoveItemToCoreInternal(childCoreId, id, parentCoreId)) {
-                    state_ = std::move(before);
-                    SetStatus(L"无法移入目标核心");
-                    return false;
-                }
             }
             child = FindItem(parentCoreId, childId);
             target = FindCore(parentCoreId);
@@ -11109,7 +11103,58 @@ private:
             parent->familyId = family.id;
             state_.families.push_back(std::move(family));
         }
-        child->familyId = parent->familyId;
+        std::unordered_set<std::uint64_t>
+            replacedFamilyIds;
+        for (const std::uint64_t id :
+             movedRelationIds) {
+            if (FileItem* moved =
+                    FindItem(parentCoreId, id)) {
+                if (moved->familyId != 0 &&
+                    moved->familyId !=
+                        parent->familyId) {
+                    replacedFamilyIds.insert(
+                        moved->familyId);
+                }
+                moved->familyId =
+                    parent->familyId;
+            }
+        }
+        state_.families.erase(
+            std::remove_if(
+                state_.families.begin(),
+                state_.families.end(),
+                [this, &replacedFamilyIds,
+                 parent](const FileFamily& family) {
+                    if (family.id ==
+                            parent->familyId ||
+                        !replacedFamilyIds.contains(
+                            family.id)) {
+                        return false;
+                    }
+                    for (const Core& core :
+                         state_.cores) {
+                        if (std::any_of(
+                                core.files.begin(),
+                                core.files.end(),
+                                [&family](
+                                    const FileItem& item) {
+                                    return item.familyId ==
+                                           family.id;
+                                })) {
+                            return false;
+                        }
+                    }
+                    return true;
+                }),
+            state_.families.end());
+        child = FindItem(parentCoreId, childId);
+        parent = FindItem(parentCoreId, parentId);
+        if (child == nullptr || parent == nullptr) {
+            state_ = std::move(before);
+            SetStatus(
+                L"文件族更新失败；已恢复迁移前状态");
+            return false;
+        }
         child->sizeTier = FileSizeTier::Minor;
         const float offsetX = childOriginalWorld.x - parentWorld.x;
         const float offsetY = childOriginalWorld.y - parentWorld.y;
@@ -11136,13 +11181,26 @@ private:
                                  std::uint64_t parentCoreId,
                                  std::uint64_t parentId,
                                  D2D1_POINT_2F childOriginalWorld) {
+        const bool dirtyBefore = dirty_;
         WorkspaceState before = state_;
         if (!ApplyParentRelation(childCoreId, childId, parentCoreId,
                                  parentId, childOriginalWorld)) {
             return;
         }
+        dirty_ = true;
+        if (!SaveState()) {
+            state_ = std::move(before);
+            dirty_ = dirtyBefore;
+            layoutCache_.clear();
+            layoutDirty_ = true;
+            SetStatus(
+                L"建立文件关系失败：状态未能保存，"
+                L"已完整恢复操作前布局");
+            Invalidate();
+            return;
+        }
         PushUndo(std::move(before));
-        ScheduleSave();
+        Invalidate();
     }
 
     void DetachParentRelation(std::uint64_t coreId, std::uint64_t itemId) {
@@ -11275,6 +11333,7 @@ private:
 
     void AttachItemToCore(std::uint64_t sourceCoreId, std::uint64_t itemId,
                           std::uint64_t targetCoreId, WorkspaceState before) {
+        const bool dirtyBefore = dirty_;
         Core* source = FindCore(sourceCoreId);
         Core* target = FindCore(targetCoreId);
         FileItem* item = FindItem(sourceCoreId, itemId);
@@ -11284,32 +11343,17 @@ private:
         }
 
         if (source != target) {
-            std::vector<std::uint64_t> subtree{itemId};
-            for (std::size_t index = 0; index < subtree.size(); ++index) {
-                for (const FileItem& candidate : source->files) {
-                    if (candidate.parentFileId == subtree[index]) {
-                        subtree.push_back(candidate.id);
-                    }
-                }
-            }
-            if (AttachedFileCount(*target) + subtree.size() >
-                static_cast<std::size_t>(kCoreFileCapacity)) {
-                SetStatus(L"目标核心容量不足，未改变连接");
+            std::vector<std::uint64_t> movedIds;
+            std::wstring moveError;
+            if (!MoveSubtreeToCoreInternal(
+                    sourceCoreId, itemId,
+                    targetCoreId, &movedIds,
+                    &moveError)) {
+                SetStatus(
+                    moveError.empty()
+                        ? L"无法连接到目标核心"
+                        : std::move(moveError));
                 return;
-            }
-            for (const std::uint64_t subtreeItemId : subtree) {
-                if (!MoveItemToCoreInternal(sourceCoreId, subtreeItemId, targetCoreId)) {
-                    state_ = std::move(before);
-                    SetStatus(L"无法连接到目标核心");
-                    return;
-                }
-            }
-            for (FileFamily& family : state_.families) {
-                if (std::find(
-                        subtree.begin(), subtree.end(),
-                        family.rootFileId) != subtree.end()) {
-                    family.coreId = targetCoreId;
-                }
             }
             target = FindCore(targetCoreId);
             item = FindItem(targetCoreId, itemId);
@@ -11334,10 +11378,22 @@ private:
         ArrangeAttachedSubtreeOutward(*target, itemId);
         target->expanded = true;
         layoutDirty_ = true;
+        dirty_ = true;
+        if (!SaveState()) {
+            state_ = std::move(before);
+            dirty_ = dirtyBefore;
+            layoutCache_.clear();
+            layoutDirty_ = true;
+            SetStatus(
+                L"连接到核心失败：状态未能保存，"
+                L"已完整恢复迁移前布局");
+            Invalidate();
+            return;
+        }
         PushUndo(std::move(before));
         SetSelection({HitKind::Item, targetCoreId, itemId});
-        ScheduleSave();
         SetStatus(L"已连接到核心；真实文件位置未变化 · 可按 Ctrl+Z 撤销");
+        Invalidate();
     }
 
     FileItem* FindItemByPath(const std::wstring& path, Core** owningCore = nullptr) {
@@ -14691,6 +14747,7 @@ private:
         }
 
         WorkspaceState before = state_;
+        const bool dirtyBefore = dirty_;
         if (target->layoutLocked) {
             const int choice = MessageBoxW(
                 window_, L"当前核心布局已锁定。\n\n是否解除锁定并加入文件？",
@@ -14709,11 +14766,14 @@ private:
             Core* owner = nullptr;
             FileItem* existing = FindItemByPath(path, &owner);
             if (existing != nullptr && owner != nullptr) {
-                if (owner->id != targetId &&
-                    AttachedFileCount(*target) < kCoreFileCapacity) {
+                if (owner->id != targetId) {
                     const std::uint64_t itemId = existing->id;
-                    if (MoveItemToCoreInternal(
-                            owner->id, itemId, targetId)) {
+                    std::vector<std::uint64_t> movedIds;
+                    std::wstring moveError;
+                    if (MoveSubtreeToCoreInternal(
+                            owner->id, itemId,
+                            targetId, &movedIds,
+                            &moveError)) {
                         target = FindCore(targetId);
                         if (target != nullptr) {
                             if (FileItem* movedItem =
@@ -14723,13 +14783,17 @@ private:
                                     dropOrdinal++);
                             }
                         }
-                        ++moved;
+                        moved += static_cast<int>(
+                            movedIds.size());
                     } else {
+                        if (moveError.find(
+                                L"容量不足") !=
+                            std::wstring::npos) {
+                            capacityReached = true;
+                        }
                         ++skipped;
                     }
                 } else {
-                    capacityReached = AttachedFileCount(*target) >=
-                        static_cast<std::size_t>(kCoreFileCapacity);
                     ++skipped;
                 }
                 continue;
@@ -14759,7 +14823,6 @@ private:
         }
 
         if (added > 0 || moved > 0) {
-            PushUndo(std::move(before));
             bool upgradedCapacity = false;
             bool appliedRecommendation = false;
             if (Core* core = FindCore(targetId)) {
@@ -14793,7 +14856,24 @@ private:
                 }
             }
             layoutDirty_ = true;
-            ScheduleSave();
+            if (moved > 0) {
+                dirty_ = true;
+                if (!SaveState()) {
+                    state_ = std::move(before);
+                    dirty_ = dirtyBefore;
+                    layoutCache_.clear();
+                    layoutDirty_ = true;
+                    SetStatus(
+                        L"跨核心子树迁移保存失败；"
+                        L"已完整恢复拖入前布局");
+                    Invalidate();
+                    return;
+                }
+            }
+            PushUndo(std::move(before));
+            if (moved == 0) {
+                ScheduleSave();
+            }
             std::wstring status =
                 L"已添加 " + std::to_wstring(added) + L" 项，转移 " +
                 std::to_wstring(moved) + L" 项";
@@ -15303,6 +15383,7 @@ private:
 
     void MoveItemToCore(std::uint64_t sourceId, std::uint64_t itemId,
                         std::uint64_t targetId, WorkspaceState before) {
+        const bool dirtyBefore = dirty_;
         Core* target = FindCore(targetId);
         if (target == nullptr) {
             return;
@@ -15316,71 +15397,356 @@ private:
             }
             target->layoutLocked = false;
         }
-        if (AttachedFileCount(*target) >= kCoreFileCapacity) {
-            SetStatus(L"目标核心已经达到 " +
-                      std::to_wstring(kCoreFileCapacity) + L" 项上限");
+        std::vector<std::uint64_t> movedIds;
+        std::wstring moveError;
+        if (!MoveSubtreeToCoreInternal(
+                sourceId, itemId, targetId,
+                &movedIds, &moveError)) {
+            state_ = std::move(before);
+            dirty_ = dirtyBefore;
+            layoutCache_.clear();
+            layoutDirty_ = true;
+            SetStatus(moveError.empty()
+                          ? L"文件迁移失败；原布局保持不变"
+                          : std::move(moveError));
             return;
         }
-        if (MoveItemToCoreInternal(sourceId, itemId, targetId)) {
-            PushUndo(std::move(before));
-            SetSelection({HitKind::Item, targetId, itemId});
-            bool upgradedCapacity = false;
-            if (Core* destination = FindCore(targetId);
-                destination != nullptr &&
-                AttachedFileCount(*destination) > 15 &&
-                destination->layoutTemplate !=
-                    LayoutTemplate::HighCapacityDouble) {
-                // A cross-core move is a user-owned placement. Upgrade the
-                // capacity state but never reorder the destination cluster.
-                destination->layoutTemplate =
-                    LayoutTemplate::HighCapacityDouble;
-                upgradedCapacity = true;
-            }
-            layoutDirty_ = true;
-            ScheduleSave();
-            SetStatus(upgradedCapacity
-                          ? L"已改变视觉归属；核心容量已升级为18，当前布局保持不变"
-                          : L"已改变视觉归属；真实文件位置未变化");
+        bool upgradedCapacity = false;
+        if (Core* destination = FindCore(targetId);
+            destination != nullptr &&
+            AttachedFileCount(*destination) > 15 &&
+            destination->layoutTemplate !=
+                LayoutTemplate::HighCapacityDouble) {
+            // A cross-core move is a user-owned placement. Upgrade the
+            // capacity state but never reorder the destination cluster.
+            destination->layoutTemplate =
+                LayoutTemplate::HighCapacityDouble;
+            upgradedCapacity = true;
         }
+        dirty_ = true;
+        layoutDirty_ = true;
+        if (!SaveState()) {
+            state_ = std::move(before);
+            dirty_ = dirtyBefore;
+            layoutCache_.clear();
+            layoutDirty_ = true;
+            SetStatus(
+                L"文件子树迁移保存失败；已完整恢复迁移前布局");
+            Invalidate();
+            return;
+        }
+        PushUndo(std::move(before));
+        SetSelection({HitKind::Item, targetId, itemId});
+        const std::wstring movedSummary =
+            movedIds.size() > 1
+                ? L"已迁移整棵子树，共 " +
+                      std::to_wstring(movedIds.size()) +
+                      L" 个文件引用"
+                : L"已改变视觉归属";
+        SetStatus(
+            movedSummary +
+            (upgradedCapacity
+                 ? L"；核心容量已升级为18，当前布局保持不变"
+                 : L"；真实文件位置未变化"));
+        Invalidate();
     }
 
-    bool MoveItemToCoreInternal(std::uint64_t sourceId, std::uint64_t itemId,
-                                std::uint64_t targetId) {
-        if (sourceId == targetId) {
+    bool CollectSubtreeForMove(
+        const Core& source,
+        std::uint64_t rootItemId,
+        std::vector<std::uint64_t>& subtree,
+        std::wstring& error) const {
+        if (std::none_of(
+                source.files.begin(), source.files.end(),
+                [rootItemId](const FileItem& item) {
+                    return item.id == rootItemId;
+                })) {
+            error = L"待迁移文件已不存在";
             return false;
+        }
+        std::unordered_set<std::uint64_t> visited;
+        subtree.clear();
+        subtree.push_back(rootItemId);
+        for (std::size_t index = 0;
+             index < subtree.size(); ++index) {
+            const std::uint64_t parentId = subtree[index];
+            if (!visited.insert(parentId).second) {
+                error =
+                    L"检测到循环或重复子节点；未迁移任何文件";
+                return false;
+            }
+            if (visited.size() >
+                kMaxRelationTraversalNodes) {
+                error =
+                    L"子树节点数超过安全上限；未迁移任何文件";
+                return false;
+            }
+            for (const FileItem& candidate :
+                 source.files) {
+                if (candidate.parentFileId == parentId) {
+                    subtree.push_back(candidate.id);
+                }
+            }
+        }
+        return true;
+    }
+
+    bool MoveSubtreeToCoreInternal(
+        std::uint64_t sourceId,
+        std::uint64_t rootItemId,
+        std::uint64_t targetId,
+        std::vector<std::uint64_t>* movedIds = nullptr,
+        std::wstring* errorMessage = nullptr) {
+        auto fail = [errorMessage](
+                        std::wstring message) {
+            if (errorMessage != nullptr) {
+                *errorMessage = std::move(message);
+            }
+            return false;
+        };
+        if (sourceId == targetId) {
+            return fail(L"源核心与目标核心相同");
         }
         Core* source = FindCore(sourceId);
         Core* target = FindCore(targetId);
         if (source == nullptr || target == nullptr) {
-            return false;
+            return fail(L"源核心或目标核心已不存在");
         }
-        if (AttachedFileCount(*target) >= kCoreFileCapacity) {
-            return false;
+
+        std::vector<std::uint64_t> subtree;
+        std::wstring collectError;
+        if (!CollectSubtreeForMove(
+                *source, rootItemId, subtree,
+                collectError)) {
+            return fail(std::move(collectError));
         }
-        const auto iterator = std::find_if(
+        if (AttachedFileCount(*target) +
+                subtree.size() >
+            static_cast<std::size_t>(
+                kCoreFileCapacity)) {
+            return fail(
+                L"目标核心容量不足：迁移需要 " +
+                std::to_wstring(subtree.size()) +
+                L" 个位置");
+        }
+
+        const std::unordered_set<std::uint64_t>
+            subtreeIds(
+                subtree.begin(), subtree.end());
+        const auto root = std::find_if(
             source->files.begin(), source->files.end(),
-            [itemId](const FileItem& item) { return item.id == itemId; });
-        if (iterator == source->files.end()) {
-            return false;
+            [rootItemId](const FileItem& item) {
+                return item.id == rootItemId;
+            });
+        if (root == source->files.end()) {
+            return fail(L"待迁移文件已不存在");
         }
-        FileItem item = std::move(*iterator);
-        source->files.erase(iterator);
-        if (item.detachedFromUpper) {
-            item.parentFileId = 0;
-            item.detachedFromUpper = false;
-            item.detachedWorldPosition = D2D1::Point2F();
+
+        const std::uint64_t sourceFamilyId =
+            root->familyId;
+        std::size_t familyIndex =
+            state_.families.size();
+        bool splitFamily = false;
+        if (sourceFamilyId != 0) {
+            const auto family = std::find_if(
+                state_.families.begin(),
+                state_.families.end(),
+                [sourceFamilyId](
+                    const FileFamily& candidate) {
+                    return candidate.id ==
+                           sourceFamilyId;
+                });
+            if (family == state_.families.end() ||
+                family->coreId != sourceId) {
+                return fail(
+                    L"文件族归属异常；未迁移任何文件");
+            }
+            familyIndex =
+                static_cast<std::size_t>(
+                    std::distance(
+                        state_.families.begin(),
+                        family));
+            const auto familyRoot = std::find_if(
+                source->files.begin(),
+                source->files.end(),
+                [family](const FileItem& item) {
+                    return item.id ==
+                           family->rootFileId;
+                });
+            const auto familyCurrent =
+                std::find_if(
+                    source->files.begin(),
+                    source->files.end(),
+                    [family](const FileItem& item) {
+                        return item.id ==
+                               family->currentFileId;
+                    });
+            if (familyRoot ==
+                    source->files.end() ||
+                familyCurrent ==
+                    source->files.end() ||
+                familyRoot->familyId !=
+                    sourceFamilyId ||
+                familyCurrent->familyId !=
+                    sourceFamilyId ||
+                familyRoot->parentFileId != 0) {
+                return fail(
+                    L"文件族根节点或当前版本异常；"
+                    L"未迁移任何文件");
+            }
+            for (const std::uint64_t id : subtree) {
+                const auto member = std::find_if(
+                    source->files.begin(),
+                    source->files.end(),
+                    [id](const FileItem& item) {
+                        return item.id == id;
+                    });
+                if (member == source->files.end() ||
+                    member->familyId !=
+                        sourceFamilyId) {
+                    return fail(
+                        L"子树文件族数据不一致；"
+                        L"未迁移任何文件");
+                }
+            }
+
+            const bool containsFamilyRoot =
+                subtreeIds.contains(
+                    family->rootFileId);
+            bool allFamilyMembersMoved = true;
+            for (const Core& core : state_.cores) {
+                for (const FileItem& item :
+                     core.files) {
+                    if (item.familyId ==
+                        sourceFamilyId) {
+                        if (core.id != sourceId) {
+                            return fail(
+                                L"文件族已跨核心分裂；"
+                                L"未迁移任何文件");
+                        }
+                        if (!subtreeIds.contains(
+                                item.id)) {
+                            allFamilyMembersMoved =
+                                false;
+                        }
+                    }
+                }
+            }
+            if (containsFamilyRoot &&
+                !allFamilyMembersMoved) {
+                return fail(
+                    L"文件族根节点的子树不完整；"
+                    L"未迁移任何文件");
+            }
+            splitFamily = !containsFamilyRoot;
+        } else if (subtree.size() > 1) {
+            return fail(
+                L"子树缺少有效文件族；未迁移任何文件");
         }
-        item.manuallyMoved = false;
-        item.lockedPosition = false;
-        item.manualOffset = D2D1::Point2F();
-        item.slot = -1;
-        item.ring = -1;
-        item.ringSlot = -1;
-        AssignNewItemLayout(*target, item);
-        target->files.push_back(std::move(item));
+
+        std::uint64_t splitFamilyId = 0;
+        FileFamily newFamily;
+        if (splitFamily) {
+            FileFamily& oldFamily =
+                state_.families[familyIndex];
+            splitFamilyId = state_.nextId++;
+            newFamily.id = splitFamilyId;
+            newFamily.coreId = targetId;
+            newFamily.rootFileId = rootItemId;
+            newFamily.currentFileId =
+                subtreeIds.contains(
+                    oldFamily.currentFileId)
+                    ? oldFamily.currentFileId
+                    : rootItemId;
+            newFamily.repairRequired = false;
+            for (const FileFamilyMemberSnapshot&
+                     snapshot :
+                 oldFamily.snapshots) {
+                if (subtreeIds.contains(
+                        snapshot.fileId)) {
+                    newFamily.snapshots.push_back(
+                        snapshot);
+                }
+            }
+        }
+
+        std::vector<FileItem> movedItems;
+        movedItems.reserve(subtree.size());
+        for (const std::uint64_t id : subtree) {
+            const auto item = std::find_if(
+                source->files.begin(),
+                source->files.end(),
+                [id](const FileItem& candidate) {
+                    return candidate.id == id;
+                });
+            if (item == source->files.end()) {
+                return fail(
+                    L"子树在迁移前发生变化；"
+                    L"未迁移任何文件");
+            }
+            movedItems.push_back(std::move(*item));
+            source->files.erase(item);
+        }
+
+        if (sourceFamilyId != 0) {
+            FileFamily& oldFamily =
+                state_.families[familyIndex];
+            if (splitFamily) {
+                oldFamily.currentFileId =
+                    oldFamily.rootFileId;
+                oldFamily.snapshots.erase(
+                    std::remove_if(
+                        oldFamily.snapshots.begin(),
+                        oldFamily.snapshots.end(),
+                        [&subtreeIds](
+                            const FileFamilyMemberSnapshot&
+                                snapshot) {
+                            return subtreeIds.contains(
+                                snapshot.fileId);
+                        }),
+                    oldFamily.snapshots.end());
+                state_.families.push_back(
+                    std::move(newFamily));
+            } else {
+                oldFamily.coreId = targetId;
+            }
+        }
+
+        for (FileItem& item : movedItems) {
+            if (splitFamily) {
+                item.familyId = splitFamilyId;
+            }
+            if (item.id == rootItemId) {
+                item.parentFileId = 0;
+                item.detachedFromUpper = false;
+                item.detachedWorldPosition =
+                    D2D1::Point2F();
+                item.manuallyMoved = false;
+                item.lockedPosition = false;
+                item.manualOffset =
+                    D2D1::Point2F();
+                item.slot = -1;
+                item.ring = -1;
+                item.ringSlot = -1;
+                AssignNewItemLayout(
+                    *target, item);
+            } else {
+                // Descendants keep their parent relation and local position.
+                // They do not consume destination main-ring slots.
+                item.detachedFromUpper = false;
+                item.slot = -1;
+                item.ring = -1;
+                item.ringSlot = -1;
+            }
+            target->files.push_back(
+                std::move(item));
+        }
         target->expanded = true;
         RefreshAutomaticCoreIdentity(*source);
         RefreshAutomaticCoreIdentity(*target);
+        if (movedIds != nullptr) {
+            *movedIds = std::move(subtree);
+        }
         return true;
     }
 
@@ -16786,6 +17152,366 @@ bool RunSelfTest() {
             validRelationState.cores.front().files[0].path ||
         legacyRoundTrip.cores.front().files[1].parentFileId != 101 ||
         legacyRoundTrip.cores.front().files[2].parentFileId != 102) {
+        return false;
+    }
+
+    const auto makeSubtreeMoveState =
+        [](const std::vector<
+               std::pair<std::uint64_t,
+                         std::uint64_t>>& nodes,
+           int targetFillCount) {
+            WorkspaceState state;
+            state.nextId = 5000;
+            Core source;
+            source.id = kUnclassifiedCoreId;
+            source.name = L"未分类";
+            Core target;
+            target.id = 2;
+            target.name = L"迁移目标";
+            for (std::size_t index = 0;
+                 index < nodes.size(); ++index) {
+                FileItem item;
+                item.id = nodes[index].first;
+                item.parentFileId =
+                    nodes[index].second;
+                item.path =
+                    L"C:\\GravityDesktopSelfTest\\move-" +
+                    std::to_wstring(item.id) +
+                    L".txt";
+                item.originalName =
+                    L"move-" +
+                    std::to_wstring(item.id) +
+                    L".txt";
+                item.displayName =
+                    L"move-" +
+                    std::to_wstring(item.id);
+                item.familyId =
+                    nodes.size() > 1 ? 4000 : 0;
+                item.slot =
+                    index == 0 ? 0 : -1;
+                item.ring =
+                    index == 0 ? 0 : -1;
+                item.ringSlot =
+                    index == 0 ? 0 : -1;
+                source.files.push_back(
+                    std::move(item));
+            }
+            for (int index = 0;
+                 index < targetFillCount; ++index) {
+                FileItem filler;
+                filler.id =
+                    1000 +
+                    static_cast<std::uint64_t>(
+                        index);
+                filler.path =
+                    L"C:\\GravityDesktopSelfTest\\fill-" +
+                    std::to_wstring(index) +
+                    L".txt";
+                filler.originalName =
+                    L"fill-" +
+                    std::to_wstring(index) +
+                    L".txt";
+                filler.displayName =
+                    L"fill-" +
+                    std::to_wstring(index);
+                filler.slot = index;
+                filler.ring =
+                    RingForSlot(index);
+                filler.ringSlot =
+                    RingSlotForSlot(index);
+                target.files.push_back(
+                    std::move(filler));
+            }
+            state.cores.push_back(
+                std::move(source));
+            state.cores.push_back(
+                std::move(target));
+            if (nodes.size() > 1) {
+                FileFamily family;
+                family.id = 4000;
+                family.coreId =
+                    kUnclassifiedCoreId;
+                family.rootFileId =
+                    nodes.front().first;
+                family.currentFileId =
+                    nodes.back().first;
+                state.families.push_back(
+                    std::move(family));
+            }
+            return state;
+        };
+    const auto itemOwnerId =
+        [](const WorkspaceState& state,
+           std::uint64_t itemId) {
+            for (const Core& core : state.cores) {
+                if (std::any_of(
+                        core.files.begin(),
+                        core.files.end(),
+                        [itemId](
+                            const FileItem& item) {
+                            return item.id ==
+                                   itemId;
+                        })) {
+                    return core.id;
+                }
+            }
+            return std::uint64_t{0};
+        };
+    const auto moveTestPath =
+        [&relationTestDirectory](
+            const wchar_t* name) {
+            return relationTestDirectory /
+                   (std::wstring(name) +
+                    L".json");
+        };
+
+    GravityApp singleMoveApp;
+    singleMoveApp.state_ =
+        makeSubtreeMoveState({{500, 0}}, 0);
+    singleMoveApp.stateFile_ =
+        moveTestPath(L"move-single");
+    const std::wstring singleOriginalPath =
+        singleMoveApp.state_.cores.front().
+            files.front().path;
+    WorkspaceState singleMoveBefore =
+        singleMoveApp.state_;
+    singleMoveApp.MoveItemToCore(
+        1, 500, 2, singleMoveBefore);
+    FileItem* movedSingle =
+        singleMoveApp.FindItem(2, 500);
+    if (movedSingle == nullptr ||
+        singleMoveApp.FindItem(1, 500) != nullptr ||
+        movedSingle->path != singleOriginalPath ||
+        singleMoveApp.undoStack_.size() != 1 ||
+        !ValidateRelationState(
+            singleMoveApp.state_).IsValid()) {
+        return false;
+    }
+
+    GravityApp parentChildMoveApp;
+    parentChildMoveApp.state_ =
+        makeSubtreeMoveState(
+            {{500, 0}, {501, 500}}, 0);
+    parentChildMoveApp.stateFile_ =
+        moveTestPath(L"move-parent-child");
+    WorkspaceState parentChildBefore =
+        parentChildMoveApp.state_;
+    parentChildMoveApp.MoveItemToCore(
+        1, 500, 2, parentChildBefore);
+    if (itemOwnerId(
+            parentChildMoveApp.state_, 500) != 2 ||
+        itemOwnerId(
+            parentChildMoveApp.state_, 501) != 2 ||
+        parentChildMoveApp.FindItem(
+            2, 501)->parentFileId != 500 ||
+        parentChildMoveApp.state_.families.front().
+            coreId != 2 ||
+        !ValidateRelationState(
+            parentChildMoveApp.state_).IsValid()) {
+        return false;
+    }
+
+    GravityApp threeLevelMoveApp;
+    threeLevelMoveApp.state_ =
+        makeSubtreeMoveState(
+            {{500, 0}, {501, 500},
+             {502, 501}}, 0);
+    threeLevelMoveApp.stateFile_ =
+        moveTestPath(L"move-three-level");
+    WorkspaceState threeLevelBefore =
+        threeLevelMoveApp.state_;
+    threeLevelMoveApp.MoveItemToCore(
+        1, 500, 2, threeLevelBefore);
+    if (itemOwnerId(
+            threeLevelMoveApp.state_, 500) != 2 ||
+        itemOwnerId(
+            threeLevelMoveApp.state_, 501) != 2 ||
+        itemOwnerId(
+            threeLevelMoveApp.state_, 502) != 2 ||
+        threeLevelMoveApp.FindItem(
+            2, 502)->parentFileId != 501 ||
+        !ValidateRelationState(
+            threeLevelMoveApp.state_).IsValid()) {
+        return false;
+    }
+
+    GravityApp branchMoveApp;
+    branchMoveApp.state_ =
+        makeSubtreeMoveState(
+            {{500, 0}, {501, 500},
+             {502, 500}, {503, 501},
+             {504, 502}}, 0);
+    branchMoveApp.stateFile_ =
+        moveTestPath(L"move-branches");
+    WorkspaceState branchMoveBefore =
+        branchMoveApp.state_;
+    branchMoveApp.MoveItemToCore(
+        1, 500, 2, branchMoveBefore);
+    for (const std::uint64_t id :
+         {500ULL, 501ULL, 502ULL,
+          503ULL, 504ULL}) {
+        if (itemOwnerId(
+                branchMoveApp.state_, id) != 2) {
+            return false;
+        }
+    }
+    if (!ValidateRelationState(
+            branchMoveApp.state_).IsValid()) {
+        return false;
+    }
+
+    GravityApp exactCapacityMoveApp;
+    exactCapacityMoveApp.state_ =
+        makeSubtreeMoveState(
+            {{500, 0}, {501, 500}}, 16);
+    exactCapacityMoveApp.stateFile_ =
+        moveTestPath(L"move-exact-capacity");
+    WorkspaceState exactCapacityBefore =
+        exactCapacityMoveApp.state_;
+    exactCapacityMoveApp.MoveItemToCore(
+        1, 500, 2, exactCapacityBefore);
+    const Core* exactCapacityTarget =
+        exactCapacityMoveApp.FindCore(2);
+    if (exactCapacityTarget == nullptr ||
+        AttachedFileCount(
+            *exactCapacityTarget) != 18 ||
+        exactCapacityTarget->layoutTemplate !=
+            LayoutTemplate::HighCapacityDouble ||
+        !ValidateRelationState(
+            exactCapacityMoveApp.state_).IsValid()) {
+        return false;
+    }
+
+    GravityApp insufficientCapacityMoveApp;
+    insufficientCapacityMoveApp.state_ =
+        makeSubtreeMoveState(
+            {{500, 0}, {501, 500}}, 17);
+    insufficientCapacityMoveApp.stateFile_ =
+        moveTestPath(
+            L"move-insufficient-capacity");
+    const std::string insufficientBefore =
+        SerializeState(
+            insufficientCapacityMoveApp.state_);
+    WorkspaceState insufficientSnapshot =
+        insufficientCapacityMoveApp.state_;
+    insufficientCapacityMoveApp.MoveItemToCore(
+        1, 500, 2, insufficientSnapshot);
+    if (SerializeState(
+            insufficientCapacityMoveApp.state_) !=
+            insufficientBefore ||
+        !insufficientCapacityMoveApp.
+             undoStack_.empty() ||
+        insufficientCapacityMoveApp.status_.find(
+            L"容量不足") == std::wstring::npos) {
+        return false;
+    }
+
+    GravityApp cyclicMoveApp;
+    cyclicMoveApp.state_ =
+        makeSubtreeMoveState(
+            {{500, 501}, {501, 500}}, 0);
+    cyclicMoveApp.stateFile_ =
+        moveTestPath(L"move-cycle");
+    const std::string cyclicBefore =
+        SerializeState(cyclicMoveApp.state_);
+    WorkspaceState cyclicSnapshot =
+        cyclicMoveApp.state_;
+    cyclicMoveApp.MoveItemToCore(
+        1, 500, 2, cyclicSnapshot);
+    if (SerializeState(cyclicMoveApp.state_) !=
+            cyclicBefore ||
+        cyclicMoveApp.status_.find(
+            L"循环") == std::wstring::npos) {
+        return false;
+    }
+
+    const std::filesystem::path moveSaveBlocker =
+        relationTestDirectory /
+        L"move-save-blocker";
+    blockerFile = CreateFileW(
+        moveSaveBlocker.c_str(), GENERIC_WRITE,
+        0, nullptr, CREATE_ALWAYS,
+        FILE_ATTRIBUTE_TEMPORARY, nullptr);
+    if (blockerFile == INVALID_HANDLE_VALUE) {
+        return false;
+    }
+    CloseHandle(blockerFile);
+    GravityApp failedMoveApp;
+    failedMoveApp.state_ =
+        makeSubtreeMoveState(
+            {{500, 0}, {501, 500},
+             {502, 501}}, 0);
+    failedMoveApp.stateFile_ =
+        moveSaveBlocker / L"state.json";
+    const std::string failedMoveBefore =
+        SerializeState(failedMoveApp.state_);
+    WorkspaceState failedMoveSnapshot =
+        failedMoveApp.state_;
+    failedMoveApp.MoveItemToCore(
+        1, 500, 2, failedMoveSnapshot);
+    if (SerializeState(failedMoveApp.state_) !=
+            failedMoveBefore ||
+        !failedMoveApp.undoStack_.empty() ||
+        failedMoveApp.status_.find(
+            L"完整恢复") == std::wstring::npos) {
+        return false;
+    }
+
+    if (branchMoveApp.undoStack_.size() != 1) {
+        return false;
+    }
+    branchMoveApp.Undo();
+    for (const std::uint64_t id :
+         {500ULL, 501ULL, 502ULL,
+          503ULL, 504ULL}) {
+        if (itemOwnerId(
+                branchMoveApp.state_, id) != 1) {
+            return false;
+        }
+    }
+    if (!ValidateRelationState(
+            branchMoveApp.state_).IsValid()) {
+        return false;
+    }
+
+    const std::optional<std::string>
+        persistedThreeLevel =
+            ReadUtf8File(
+                threeLevelMoveApp.stateFile_);
+    WorkspaceState restartedMoveState;
+    if (!persistedThreeLevel ||
+        !DeserializeState(
+            *persistedThreeLevel,
+            restartedMoveState) ||
+        !ValidateRelationState(
+            restartedMoveState).IsValid() ||
+        itemOwnerId(
+            restartedMoveState, 500) != 2 ||
+        itemOwnerId(
+            restartedMoveState, 501) != 2 ||
+        itemOwnerId(
+            restartedMoveState, 502) != 2) {
+        return false;
+    }
+    const FileItem* restartedGrandchild =
+        nullptr;
+    for (const Core& core :
+         restartedMoveState.cores) {
+        const auto item = std::find_if(
+            core.files.begin(),
+            core.files.end(),
+            [](const FileItem& candidate) {
+                return candidate.id == 502;
+            });
+        if (item != core.files.end()) {
+            restartedGrandchild = &*item;
+            break;
+        }
+    }
+    if (restartedGrandchild == nullptr ||
+        restartedGrandchild->parentFileId != 501 ||
+        restartedGrandchild->path !=
+            L"C:\\GravityDesktopSelfTest\\move-502.txt") {
         return false;
     }
 
