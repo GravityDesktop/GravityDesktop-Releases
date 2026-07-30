@@ -84,6 +84,8 @@ constexpr UINT kDesktopHostWatchIntervalMs = 2000;
 constexpr UINT kDesktopReconnectIntervalMs = 250;
 constexpr UINT kInteractionLayerRepairDelayMs = 600;
 constexpr int kDesktopReconnectAttemptLimit = 40;
+constexpr std::size_t kMaxRelationTraversalNodes = 4096;
+constexpr std::size_t kMaxRelationTraversalDepth = 256;
 constexpr int kWorkspaceControlCount = 7;
 constexpr int kRelationHoverDelayMs = 10;
 constexpr int kHoverTooltipDelayMs = 320;
@@ -2143,6 +2145,383 @@ bool DeserializeState(const std::string& json, WorkspaceState& state) {
     return true;
 }
 
+struct RelationValidationIssue {
+    std::wstring code;
+    std::wstring subject;
+    std::wstring reason;
+};
+
+struct RelationValidationResult {
+    std::vector<RelationValidationIssue> issues;
+
+    bool IsValid() const {
+        return issues.empty();
+    }
+};
+
+void AddRelationValidationIssue(
+    RelationValidationResult& result,
+    std::set<std::wstring>& fingerprints,
+    std::wstring code,
+    std::wstring subject,
+    std::wstring reason) {
+    const std::wstring fingerprint =
+        code + L"|" + subject + L"|" + reason;
+    if (!fingerprints.insert(fingerprint).second) {
+        return;
+    }
+    result.issues.push_back(
+        {std::move(code), std::move(subject), std::move(reason)});
+}
+
+RelationValidationResult ValidateRelationState(
+    const WorkspaceState& state) {
+    struct ItemOwner {
+        const Core* core = nullptr;
+        const FileItem* item = nullptr;
+    };
+
+    RelationValidationResult result;
+    std::set<std::wstring> fingerprints;
+    std::unordered_map<std::uint64_t, const Core*> cores;
+    std::unordered_map<std::uint64_t, ItemOwner> items;
+    std::unordered_map<std::uint64_t, const FileFamily*> families;
+
+    for (const Core& core : state.cores) {
+        if (!cores.emplace(core.id, &core).second) {
+            AddRelationValidationIssue(
+                result, fingerprints, L"duplicate_core",
+                L"核心 " + std::to_wstring(core.id),
+                L"核心ID重复");
+        }
+        if (core.files.size() > kMaxRelationTraversalNodes) {
+            AddRelationValidationIssue(
+                result, fingerprints, L"node_limit",
+                L"核心 " + std::to_wstring(core.id),
+                L"关系节点数超过安全上限 " +
+                    std::to_wstring(kMaxRelationTraversalNodes));
+        }
+        for (const FileItem& item : core.files) {
+            if (!items.emplace(
+                    item.id, ItemOwner{&core, &item}).second) {
+                AddRelationValidationIssue(
+                    result, fingerprints, L"duplicate_item",
+                    L"文件 " + std::to_wstring(item.id),
+                    L"文件ID重复");
+            }
+        }
+    }
+
+    for (const FileFamily& family : state.families) {
+        if (!families.emplace(family.id, &family).second) {
+            AddRelationValidationIssue(
+                result, fingerprints, L"duplicate_family",
+                L"文件族 " + std::to_wstring(family.id),
+                L"文件族ID重复");
+        }
+    }
+
+    for (const Core& core : state.cores) {
+        for (const FileItem& item : core.files) {
+            if (item.familyId != 0) {
+                const auto family = families.find(item.familyId);
+                if (family == families.end()) {
+                    AddRelationValidationIssue(
+                        result, fingerprints, L"missing_family",
+                        L"文件 " + std::to_wstring(item.id),
+                        L"所属文件族 " +
+                            std::to_wstring(item.familyId) +
+                            L" 不存在");
+                } else if (family->second->coreId != core.id) {
+                    AddRelationValidationIssue(
+                        result, fingerprints,
+                        L"family_core_mismatch",
+                        L"文件 " + std::to_wstring(item.id),
+                        L"所属文件族 " +
+                            std::to_wstring(item.familyId) +
+                            L" 位于其他核心");
+                }
+            }
+
+            if (item.parentFileId == 0) {
+                continue;
+            }
+            if (item.parentFileId == item.id) {
+                AddRelationValidationIssue(
+                    result, fingerprints, L"self_parent",
+                    L"文件 " + std::to_wstring(item.id),
+                    L"直接父文件指向自身");
+                continue;
+            }
+            const auto parent = items.find(item.parentFileId);
+            if (parent == items.end()) {
+                AddRelationValidationIssue(
+                    result, fingerprints, L"missing_parent",
+                    L"文件 " + std::to_wstring(item.id),
+                    L"父文件 " +
+                        std::to_wstring(item.parentFileId) +
+                        L" 不存在");
+                continue;
+            }
+            if (parent->second.core->id != core.id) {
+                AddRelationValidationIssue(
+                    result, fingerprints, L"cross_core_parent",
+                    L"文件 " + std::to_wstring(item.id),
+                    L"父文件 " +
+                        std::to_wstring(item.parentFileId) +
+                        L" 位于核心 " +
+                        std::to_wstring(parent->second.core->id));
+            }
+            if (item.familyId == 0 ||
+                parent->second.item->familyId == 0 ||
+                item.familyId != parent->second.item->familyId) {
+                AddRelationValidationIssue(
+                    result, fingerprints, L"cross_family_parent",
+                    L"文件 " + std::to_wstring(item.id),
+                    L"与父文件 " +
+                        std::to_wstring(item.parentFileId) +
+                        L" 不属于同一文件族");
+            }
+        }
+    }
+
+    for (const FileFamily& family : state.families) {
+        const auto owner = cores.find(family.coreId);
+        if (owner == cores.end()) {
+            AddRelationValidationIssue(
+                result, fingerprints, L"missing_family_core",
+                L"文件族 " + std::to_wstring(family.id),
+                L"所属核心 " +
+                    std::to_wstring(family.coreId) +
+                    L" 不存在");
+        }
+
+        const auto root = items.find(family.rootFileId);
+        if (root == items.end()) {
+            AddRelationValidationIssue(
+                result, fingerprints, L"missing_root",
+                L"文件族 " + std::to_wstring(family.id),
+                L"根文件 " +
+                    std::to_wstring(family.rootFileId) +
+                    L" 不存在");
+        } else {
+            if (root->second.core->id != family.coreId) {
+                AddRelationValidationIssue(
+                    result, fingerprints, L"root_core_mismatch",
+                    L"文件族 " + std::to_wstring(family.id),
+                    L"根文件 " +
+                        std::to_wstring(family.rootFileId) +
+                        L" 位于其他核心");
+            }
+            if (root->second.item->parentFileId != 0) {
+                AddRelationValidationIssue(
+                    result, fingerprints, L"root_has_parent",
+                    L"文件族 " + std::to_wstring(family.id),
+                    L"根文件 " +
+                        std::to_wstring(family.rootFileId) +
+                        L" 仍有上级文件");
+            }
+            if (root->second.item->familyId != family.id) {
+                AddRelationValidationIssue(
+                    result, fingerprints, L"root_family_mismatch",
+                    L"文件族 " + std::to_wstring(family.id),
+                    L"根文件 " +
+                        std::to_wstring(family.rootFileId) +
+                        L" 的familyId不一致");
+            }
+        }
+
+        const auto current = items.find(family.currentFileId);
+        if (current == items.end()) {
+            AddRelationValidationIssue(
+                result, fingerprints, L"missing_current",
+                L"文件族 " + std::to_wstring(family.id),
+                L"当前版本文件 " +
+                    std::to_wstring(family.currentFileId) +
+                    L" 不存在");
+        } else {
+            if (current->second.core->id != family.coreId) {
+                AddRelationValidationIssue(
+                    result, fingerprints, L"current_core_mismatch",
+                    L"文件族 " + std::to_wstring(family.id),
+                    L"当前版本文件 " +
+                        std::to_wstring(family.currentFileId) +
+                        L" 位于其他核心");
+            }
+            if (current->second.item->familyId != family.id) {
+                AddRelationValidationIssue(
+                    result, fingerprints,
+                    L"current_family_mismatch",
+                    L"文件族 " + std::to_wstring(family.id),
+                    L"当前版本文件 " +
+                        std::to_wstring(family.currentFileId) +
+                        L" 的familyId不一致");
+            }
+        }
+    }
+
+    std::unordered_set<std::uint64_t> reportedCycles;
+    for (const auto& [startId, start] : items) {
+        (void)start;
+        std::unordered_map<std::uint64_t, std::size_t> pathPositions;
+        std::vector<std::uint64_t> path;
+        std::uint64_t cursor = startId;
+        while (cursor != 0) {
+            const auto repeated = pathPositions.find(cursor);
+            if (repeated != pathPositions.end()) {
+                if (reportedCycles.insert(cursor).second) {
+                    std::wstring cycle;
+                    for (std::size_t index = repeated->second;
+                         index < path.size(); ++index) {
+                        if (!cycle.empty()) {
+                            cycle += L" -> ";
+                        }
+                        cycle += std::to_wstring(path[index]);
+                        reportedCycles.insert(path[index]);
+                    }
+                    if (!cycle.empty()) {
+                        cycle += L" -> ";
+                    }
+                    cycle += std::to_wstring(cursor);
+                    AddRelationValidationIssue(
+                        result, fingerprints, L"cycle",
+                        L"文件 " + std::to_wstring(cursor),
+                        L"检测到循环关系：" + cycle);
+                }
+                break;
+            }
+            if (path.size() >= kMaxRelationTraversalDepth) {
+                AddRelationValidationIssue(
+                    result, fingerprints, L"depth_limit",
+                    L"文件 " + std::to_wstring(startId),
+                    L"关系深度超过安全上限 " +
+                        std::to_wstring(kMaxRelationTraversalDepth));
+                break;
+            }
+            const auto node = items.find(cursor);
+            if (node == items.end()) {
+                break;
+            }
+            pathPositions.emplace(cursor, path.size());
+            path.push_back(cursor);
+            cursor = node->second.item->parentFileId;
+        }
+    }
+    return result;
+}
+
+bool HasRelationValidationIssue(
+    const RelationValidationResult& result,
+    const wchar_t* code) {
+    return std::any_of(
+        result.issues.begin(), result.issues.end(),
+        [code](const RelationValidationIssue& issue) {
+            return issue.code == code;
+        });
+}
+
+std::wstring FormatRelationValidationReport(
+    const RelationValidationResult& result,
+    std::size_t maximumIssues = 16) {
+    if (result.IsValid()) {
+        return L"关系校验通过";
+    }
+    std::wstring report =
+        L"关系校验失败，共 " +
+        std::to_wstring(result.issues.size()) + L" 项：";
+    const std::size_t shown =
+        std::min(maximumIssues, result.issues.size());
+    for (std::size_t index = 0; index < shown; ++index) {
+        const RelationValidationIssue& issue =
+            result.issues[index];
+        report += L"\n- [" + issue.code + L"] " +
+                  issue.subject + L"：" + issue.reason;
+    }
+    if (shown < result.issues.size()) {
+        report += L"\n- 另有 " +
+                  std::to_wstring(result.issues.size() - shown) +
+                  L" 项未展开";
+    }
+    return report;
+}
+
+bool PreserveInvalidRelationStateCopy(
+    const std::filesystem::path& sourcePath,
+    const std::string& originalText,
+    const RelationValidationResult& validation,
+    std::filesystem::path* preservedPath = nullptr) {
+    std::error_code error;
+    std::filesystem::path folder = sourcePath.parent_path();
+    if (folder.empty()) {
+        folder = std::filesystem::temp_directory_path(error);
+    }
+    if (error || folder.empty()) {
+        return false;
+    }
+    const std::wstring stem =
+        sourcePath.stem().empty() ? L"state" :
+                                   sourcePath.stem().wstring();
+    std::filesystem::path copyPath =
+        folder / (stem + L".invalid-relations.json");
+    if (const std::optional<std::string> existing =
+            ReadUtf8File(copyPath);
+        existing && *existing != originalText) {
+        copyPath =
+            folder /
+            (stem + L".invalid-relations." +
+             BackupTimestamp() + L"." +
+             std::to_wstring(GetCurrentProcessId()) +
+             L".json");
+    }
+    const std::optional<std::string> existingCopy =
+        ReadUtf8File(copyPath);
+    if ((!existingCopy || *existingCopy != originalText) &&
+        !WriteUtf8Atomic(copyPath, originalText)) {
+        return false;
+    }
+    const std::filesystem::path reportPath =
+        copyPath.wstring() + L".report.txt";
+    (void)WriteUtf8Atomic(
+        reportPath,
+        WideToUtf8(FormatRelationValidationReport(
+            validation,
+            validation.issues.size())));
+    if (preservedPath != nullptr) {
+        *preservedPath = copyPath;
+    }
+    return true;
+}
+
+class RelationTraversalGuard {
+public:
+    bool Enter(std::uint64_t itemId, std::size_t depth) {
+        if (itemId == 0 ||
+            depth > kMaxRelationTraversalDepth ||
+            visited_.size() >= kMaxRelationTraversalNodes ||
+            recursionStack_.contains(itemId) ||
+            visited_.contains(itemId)) {
+            issueDetected_ = true;
+            return false;
+        }
+        visited_.insert(itemId);
+        recursionStack_.insert(itemId);
+        return true;
+    }
+
+    void Leave(std::uint64_t itemId) {
+        recursionStack_.erase(itemId);
+    }
+
+    bool IssueDetected() const {
+        return issueDetected_;
+    }
+
+private:
+    std::unordered_set<std::uint64_t> visited_;
+    std::unordered_set<std::uint64_t> recursionStack_;
+    bool issueDetected_ = false;
+};
+
 D2D1_POINT_2F SlotPosition(const Core& core, int slot) {
     const int ring = RingForSlot(slot);
     const int ringSlot = RingSlotForSlot(slot);
@@ -3639,6 +4018,20 @@ private:
     }
 
     void RequestExit() {
+        if (stateRecoveryBlocked_) {
+            // Protected relation states are intentionally never written back.
+            // Exiting is safe because the original invalid file and diagnostic
+            // copy remain untouched; refusing to exit would trap the user in
+            // the recovery session.
+            exitRequested_ = true;
+            if (window_ != nullptr &&
+                IsWindow(window_) != FALSE) {
+                DestroyWindow(window_);
+            } else {
+                PostQuitMessage(0);
+            }
+            return;
+        }
         if (SaveState()) {
             exitRequested_ = true;
             if (window_ != nullptr &&
@@ -5876,14 +6269,22 @@ private:
                 static_cast<int>(layoutCache_[core->id].size());
 
             // Child nodes are local to their parent and never consume a main-ring slot.
-            std::function<void(std::uint64_t, D2D1_POINT_2F)> appendChildren;
+            RelationTraversalGuard childTraversalGuard;
+            std::function<void(
+                std::uint64_t, D2D1_POINT_2F, std::size_t)>
+                appendChildren;
             appendChildren = [this, core, &appendChildren, &client,
                               &slideAwayFromForeignCluster, &occupied,
-                              &globalFootprints](
+                              &globalFootprints,
+                              &childTraversalGuard](
                                  std::uint64_t parentId,
-                                 D2D1_POINT_2F parentWorld) {
+                                 D2D1_POINT_2F parentWorld,
+                                 std::size_t depth) {
                 FileItem* parent = FindItem(core->id, parentId);
                 if (parent == nullptr || parent->childrenCollapsed) return;
+                if (!childTraversalGuard.Enter(parentId, depth)) {
+                    return;
+                }
                 std::vector<FileItem*> children;
                 for (FileItem& candidate : const_cast<Core*>(core)->files) {
                     if (candidate.parentFileId == parentId) children.push_back(&candidate);
@@ -5923,8 +6324,11 @@ private:
                         ShouldShowFileLabel(*child), false, 0};
                     childEntry.isChild = true;
                     layoutCache_[core->id].push_back(childEntry);
-                    appendChildren(child->id, childEntry.position);
+                    appendChildren(
+                        child->id, childEntry.position,
+                        depth + 1);
                 }
+                childTraversalGuard.Leave(parentId);
             };
             for (const FileItem& item : core->files) {
                 if (!item.detachedFromUpper || item.parentFileId != 0) continue;
@@ -5948,7 +6352,14 @@ private:
                     roots.emplace_back(entry.item->id, entry.position);
                 }
             }
-            for (const auto& [id, position] : roots) appendChildren(id, position);
+            for (const auto& [id, position] : roots) {
+                appendChildren(id, position, 0);
+            }
+            if (childTraversalGuard.IssueDetected()) {
+                OutputDebugStringW(
+                    L"[GravityDesktop] 关系渲染分支已安全中止："
+                    L"检测到重复节点、循环或超出安全上限。\n");
+            }
 
             int hidden = mainClusterVisible
                 ? static_cast<int>(std::count_if(
@@ -10776,11 +11187,19 @@ private:
             DisplayCoreWorld(core);
         const D2D1_POINT_2F rootPosition =
             BaseDisplayItemPosition(core, *root);
-        std::function<void(std::uint64_t, D2D1_POINT_2F, int)> arrange;
-        arrange = [this, &core, coreCenter, &arrange](
+        RelationTraversalGuard subtreeTraversalGuard;
+        std::function<void(
+            std::uint64_t, D2D1_POINT_2F, std::size_t)>
+            arrange;
+        arrange = [this, &core, coreCenter, &arrange,
+                   &subtreeTraversalGuard](
                       std::uint64_t parentId,
                       D2D1_POINT_2F parentPosition,
-                      int depth) {
+                      std::size_t depth) {
+            if (!subtreeTraversalGuard.Enter(
+                    parentId, depth)) {
+                return;
+            }
             std::vector<FileItem*> children;
             for (FileItem& candidate : core.files) {
                 if (candidate.parentFileId == parentId) {
@@ -10792,7 +11211,10 @@ private:
                 [](const FileItem* first, const FileItem* second) {
                     return first->id < second->id;
                 });
-            if (children.empty()) return;
+            if (children.empty()) {
+                subtreeTraversalGuard.Leave(parentId);
+                return;
+            }
 
             const float outwardAngle = std::atan2(
                 parentPosition.y - coreCenter.y,
@@ -10837,10 +11259,18 @@ private:
                         parentPosition.y +
                             std::sin(angle) *
                                 child.relativeRadius);
-                arrange(child.id, childPosition, depth + 1);
+                arrange(
+                    child.id, childPosition,
+                    depth + 1);
             }
+            subtreeTraversalGuard.Leave(parentId);
         };
         arrange(rootItemId, rootPosition, 0);
+        if (subtreeTraversalGuard.IssueDetected()) {
+            OutputDebugStringW(
+                L"[GravityDesktop] 子树整理分支已安全中止："
+                L"检测到重复节点、循环或超出安全上限。\n");
+        }
     }
 
     void AttachItemToCore(std::uint64_t sourceCoreId, std::uint64_t itemId,
@@ -14744,6 +15174,32 @@ private:
                         L"导入布局", MB_OK | MB_ICONERROR);
             return;
         }
+        const RelationValidationResult importedValidation =
+            ValidateRelationState(imported);
+        if (!importedValidation.IsValid()) {
+            const std::filesystem::path diagnosticBase =
+                stateFile_.empty()
+                    ? std::filesystem::path(path.data())
+                    : stateFile_.parent_path() /
+                          L"rejected-import.json";
+            std::filesystem::path preserved;
+            (void)PreserveInvalidRelationStateCopy(
+                diagnosticBase, *text, importedValidation,
+                &preserved);
+            std::wstring message =
+                L"导入文件包含非法文件关系；当前布局没有改变。\n\n" +
+                FormatRelationValidationReport(
+                    importedValidation, 8);
+            if (!preserved.empty()) {
+                message +=
+                    L"\n\n异常导入副本已保存到：\n" +
+                    preserved.wstring();
+            }
+            MessageBoxW(
+                window_, message.c_str(), L"导入布局",
+                MB_OK | MB_ICONERROR);
+            return;
+        }
         const std::wstring prompt = L"导入预览：" +
             std::to_wstring(imported.cores.size()) + L" 个核心，" +
             std::to_wstring(ReferenceCount(imported)) + L" 个文件引用。\n\n"
@@ -14752,10 +15208,27 @@ private:
         const int choice = MessageBoxW(window_, prompt.c_str(), L"导入布局",
                                        MB_YESNOCANCEL | MB_ICONQUESTION | MB_DEFBUTTON3);
         if (choice == IDCANCEL) return;
+        WorkspaceState candidate =
+            choice == IDYES
+                ? std::move(imported)
+                : MergeImportedState(imported);
+        const RelationValidationResult candidateValidation =
+            ValidateRelationState(candidate);
+        if (!candidateValidation.IsValid()) {
+            std::wstring message =
+                L"导入后的组合状态包含非法文件关系；"
+                L"当前布局没有改变。\n\n" +
+                FormatRelationValidationReport(
+                    candidateValidation, 8);
+            MessageBoxW(
+                window_, message.c_str(), L"导入布局",
+                MB_OK | MB_ICONERROR);
+            return;
+        }
         if (!stateRecoveryBlocked_ && !SaveState()) return;
         CreateHistoryBackup(true);
         WorkspaceState before = state_;
-        state_ = choice == IDYES ? std::move(imported) : MergeImportedState(imported);
+        state_ = std::move(candidate);
         NormalizeStateModel();
         state_.workspacePaused = false;
         ApplyCompanionWorkspaceFrame();
@@ -15380,15 +15853,69 @@ private:
     void LoadState() {
         stateFile_ = StateFilePath();
         const std::optional<std::string> stateText = ReadUtf8File(stateFile_);
-        if (stateText && DeserializeState(*stateText, state_)) {
-            return;
+        if (stateText) {
+            WorkspaceState loaded;
+            if (DeserializeState(*stateText, loaded)) {
+                const RelationValidationResult validation =
+                    ValidateRelationState(loaded);
+                state_ = std::move(loaded);
+                if (validation.IsValid()) {
+                    return;
+                }
+                std::filesystem::path preserved;
+                (void)PreserveInvalidRelationStateCopy(
+                    stateFile_, *stateText, validation,
+                    &preserved);
+                stateRecoveryBlocked_ = true;
+                dirty_ = false;
+                std::wstring message =
+                    L"检测到非法文件关系，已原样载入只读保护模式；"
+                    L"不会覆盖原状态。";
+                if (!validation.issues.empty()) {
+                    message += L" " +
+                        validation.issues.front().subject +
+                        L"：" +
+                        validation.issues.front().reason;
+                }
+                if (!preserved.empty()) {
+                    message += L" 异常副本：" +
+                               preserved.filename().wstring();
+                }
+                SetStatus(std::move(message));
+                return;
+            }
         }
         const std::optional<std::string> backup =
             ReadUtf8File(stateFile_.wstring() + L".bak");
-        if (backup && DeserializeState(*backup, state_)) {
-            SetStatus(L"主状态文件无效，已从备份恢复");
-            dirty_ = true;
-            return;
+        if (backup) {
+            WorkspaceState loaded;
+            if (DeserializeState(*backup, loaded)) {
+                const RelationValidationResult validation =
+                    ValidateRelationState(loaded);
+                state_ = std::move(loaded);
+                if (validation.IsValid()) {
+                    SetStatus(L"主状态文件无效，已从备份恢复");
+                    dirty_ = true;
+                    return;
+                }
+                std::filesystem::path preserved;
+                (void)PreserveInvalidRelationStateCopy(
+                    stateFile_.wstring() + L".bak",
+                    *backup, validation, &preserved);
+                stateRecoveryBlocked_ = true;
+                dirty_ = false;
+                std::wstring message =
+                    L"主状态无效，备份也含非法文件关系；"
+                    L"已原样载入备份的只读保护模式。";
+                if (!validation.issues.empty()) {
+                    message += L" " +
+                        validation.issues.front().subject +
+                        L"：" +
+                        validation.issues.front().reason;
+                }
+                SetStatus(std::move(message));
+                return;
+            }
         }
         const bool existingStateWasUnreadable = stateText.has_value() || backup.has_value();
         Core unclassified;
@@ -15947,6 +16474,320 @@ bool RunSelfTest() {
             GlobalUnlock(memory);
             return reinterpret_cast<HDROP>(memory);
         };
+
+    const auto makeValidatedRelationState = []() {
+        WorkspaceState state;
+        state.nextId = 204;
+        Core core;
+        core.id = kUnclassifiedCoreId;
+        core.name = L"未分类";
+
+        FileItem root;
+        root.id = 101;
+        root.path =
+            L"C:\\GravityDesktopSelfTest\\relation-root.txt";
+        root.originalName = L"relation-root.txt";
+        root.displayName = L"relation-root";
+        root.slot = 0;
+        root.ring = 0;
+        root.ringSlot = 0;
+        root.familyId = 201;
+
+        FileItem child;
+        child.id = 102;
+        child.path =
+            L"C:\\GravityDesktopSelfTest\\relation-child.txt";
+        child.originalName = L"relation-child.txt";
+        child.displayName = L"relation-child";
+        child.parentFileId = 101;
+        child.familyId = 201;
+
+        FileItem grandchild;
+        grandchild.id = 103;
+        grandchild.path =
+            L"C:\\GravityDesktopSelfTest\\relation-grandchild.txt";
+        grandchild.originalName =
+            L"relation-grandchild.txt";
+        grandchild.displayName =
+            L"relation-grandchild";
+        grandchild.parentFileId = 102;
+        grandchild.familyId = 201;
+
+        core.files.push_back(std::move(root));
+        core.files.push_back(std::move(child));
+        core.files.push_back(std::move(grandchild));
+        state.cores.push_back(std::move(core));
+
+        FileFamily family;
+        family.id = 201;
+        family.coreId = kUnclassifiedCoreId;
+        family.rootFileId = 101;
+        family.currentFileId = 103;
+        state.families.push_back(std::move(family));
+        return state;
+    };
+    const auto findTestItem =
+        [](WorkspaceState& state,
+           std::uint64_t itemId) -> FileItem* {
+            for (Core& core : state.cores) {
+                const auto item = std::find_if(
+                    core.files.begin(), core.files.end(),
+                    [itemId](const FileItem& candidate) {
+                        return candidate.id == itemId;
+                    });
+                if (item != core.files.end()) {
+                    return &*item;
+                }
+            }
+            return nullptr;
+        };
+
+    const WorkspaceState validRelationState =
+        makeValidatedRelationState();
+    if (!ValidateRelationState(
+             validRelationState).IsValid()) {
+        return false;
+    }
+
+    WorkspaceState missingParentState =
+        makeValidatedRelationState();
+    findTestItem(missingParentState, 102)->
+        parentFileId = 999;
+    const RelationValidationResult missingParentValidation =
+        ValidateRelationState(missingParentState);
+    if (!HasRelationValidationIssue(
+            missingParentValidation, L"missing_parent")) {
+        return false;
+    }
+
+    WorkspaceState selfParentState =
+        makeValidatedRelationState();
+    findTestItem(selfParentState, 102)->
+        parentFileId = 102;
+    const RelationValidationResult selfParentValidation =
+        ValidateRelationState(selfParentState);
+    if (!HasRelationValidationIssue(
+            selfParentValidation, L"self_parent") ||
+        !HasRelationValidationIssue(
+            selfParentValidation, L"cycle")) {
+        return false;
+    }
+
+    WorkspaceState twoNodeCycleState =
+        makeValidatedRelationState();
+    findTestItem(twoNodeCycleState, 101)->
+        parentFileId = 102;
+    findTestItem(twoNodeCycleState, 102)->
+        parentFileId = 101;
+    if (!HasRelationValidationIssue(
+            ValidateRelationState(twoNodeCycleState),
+            L"cycle")) {
+        return false;
+    }
+
+    WorkspaceState threeNodeCycleState =
+        makeValidatedRelationState();
+    findTestItem(threeNodeCycleState, 101)->
+        parentFileId = 103;
+    findTestItem(threeNodeCycleState, 102)->
+        parentFileId = 101;
+    findTestItem(threeNodeCycleState, 103)->
+        parentFileId = 102;
+    if (!HasRelationValidationIssue(
+            ValidateRelationState(threeNodeCycleState),
+            L"cycle")) {
+        return false;
+    }
+
+    WorkspaceState crossCoreState =
+        makeValidatedRelationState();
+    Core foreignRelationCore;
+    foreignRelationCore.id = 301;
+    foreignRelationCore.name = L"其他核心";
+    FileItem foreignRelationParent;
+    foreignRelationParent.id = 302;
+    foreignRelationParent.path =
+        L"C:\\GravityDesktopSelfTest\\foreign-parent.txt";
+    foreignRelationParent.familyId = 201;
+    foreignRelationCore.files.push_back(
+        std::move(foreignRelationParent));
+    crossCoreState.cores.push_back(
+        std::move(foreignRelationCore));
+    findTestItem(crossCoreState, 102)->
+        parentFileId = 302;
+    if (!HasRelationValidationIssue(
+            ValidateRelationState(crossCoreState),
+            L"cross_core_parent")) {
+        return false;
+    }
+
+    WorkspaceState crossFamilyState =
+        makeValidatedRelationState();
+    FileItem secondFamilyRoot;
+    secondFamilyRoot.id = 202;
+    secondFamilyRoot.path =
+        L"C:\\GravityDesktopSelfTest\\second-family.txt";
+    secondFamilyRoot.familyId = 203;
+    crossFamilyState.cores.front().files.push_back(
+        std::move(secondFamilyRoot));
+    FileFamily secondFamily;
+    secondFamily.id = 203;
+    secondFamily.coreId = kUnclassifiedCoreId;
+    secondFamily.rootFileId = 202;
+    secondFamily.currentFileId = 202;
+    crossFamilyState.families.push_back(
+        std::move(secondFamily));
+    findTestItem(crossFamilyState, 102)->familyId = 203;
+    if (!HasRelationValidationIssue(
+            ValidateRelationState(crossFamilyState),
+            L"cross_family_parent")) {
+        return false;
+    }
+
+    WorkspaceState missingCurrentState =
+        makeValidatedRelationState();
+    missingCurrentState.families.front().
+        currentFileId = 999;
+    if (!HasRelationValidationIssue(
+            ValidateRelationState(missingCurrentState),
+            L"missing_current")) {
+        return false;
+    }
+
+    WorkspaceState inconsistentMemberState =
+        makeValidatedRelationState();
+    findTestItem(inconsistentMemberState, 101)->
+        familyId = 999;
+    const RelationValidationResult inconsistentMemberValidation =
+        ValidateRelationState(inconsistentMemberState);
+    if (!HasRelationValidationIssue(
+            inconsistentMemberValidation,
+            L"missing_family") ||
+        !HasRelationValidationIssue(
+            inconsistentMemberValidation,
+            L"root_family_mismatch")) {
+        return false;
+    }
+
+    // An invalid overwrite candidate is rejected before the current state is
+    // assigned or serialized.
+    WorkspaceState importTarget =
+        makeValidatedRelationState();
+    const std::string importTargetBefore =
+        SerializeState(importTarget);
+    const RelationValidationResult invalidImportValidation =
+        ValidateRelationState(missingParentState);
+    if (invalidImportValidation.IsValid() ||
+        SerializeState(importTarget) !=
+            importTargetBefore) {
+        return false;
+    }
+
+    RelationTraversalGuard traversalGuard;
+    if (!traversalGuard.Enter(101, 0) ||
+        !traversalGuard.Enter(102, 1) ||
+        traversalGuard.Enter(101, 2) ||
+        !traversalGuard.IssueDetected()) {
+        return false;
+    }
+    traversalGuard.Leave(102);
+    traversalGuard.Leave(101);
+
+    const std::filesystem::path protectedStatePath =
+        relationTestDirectory /
+        L"protected-state.json";
+    const std::string protectedStateText =
+        SerializeState(missingParentState);
+    if (!WriteUtf8Atomic(
+            protectedStatePath,
+            protectedStateText)) {
+        return false;
+    }
+    const DWORD previousOverrideLength =
+        GetEnvironmentVariableW(
+            L"GRAVITY_DESKTOP_STATE_FILE",
+            nullptr, 0);
+    std::wstring previousOverride;
+    if (previousOverrideLength > 0) {
+        previousOverride.resize(
+            previousOverrideLength);
+        const DWORD copied = GetEnvironmentVariableW(
+            L"GRAVITY_DESKTOP_STATE_FILE",
+            previousOverride.data(),
+            previousOverrideLength);
+        if (copied >= previousOverrideLength) {
+            return false;
+        }
+        previousOverride.resize(copied);
+    }
+    if (!SetEnvironmentVariableW(
+            L"GRAVITY_DESKTOP_STATE_FILE",
+            protectedStatePath.c_str())) {
+        return false;
+    }
+    GravityApp protectedLoadApp;
+    protectedLoadApp.LoadState();
+    if (previousOverrideLength > 0) {
+        SetEnvironmentVariableW(
+            L"GRAVITY_DESKTOP_STATE_FILE",
+            previousOverride.c_str());
+    } else {
+        SetEnvironmentVariableW(
+            L"GRAVITY_DESKTOP_STATE_FILE",
+            nullptr);
+    }
+    protectedLoadApp.layoutDirty_ = true;
+    (void)protectedLoadApp.StableLayouts();
+    protectedLoadApp.dirty_ = true;
+    bool preservedInvalidCopy = false;
+    for (const auto& entry :
+         std::filesystem::directory_iterator(
+             relationTestDirectory)) {
+        const std::wstring name =
+            entry.path().filename().wstring();
+        if (name.starts_with(
+                L"protected-state.invalid-relations.") &&
+            entry.path().extension() == L".json") {
+            preservedInvalidCopy = true;
+            break;
+        }
+    }
+    if (!protectedLoadApp.stateRecoveryBlocked_ ||
+        protectedLoadApp.state_.cores.size() !=
+            missingParentState.cores.size() ||
+        protectedLoadApp.state_.cores.front().files.size() !=
+            missingParentState.cores.front().files.size() ||
+        protectedLoadApp.SaveState() ||
+        !preservedInvalidCopy ||
+        ReadUtf8File(protectedStatePath) !=
+            std::optional<std::string>(
+                protectedStateText)) {
+        return false;
+    }
+
+    WorkspaceState legacyRoundTrip;
+    const std::string validRelationText =
+        SerializeState(validRelationState);
+    if (!DeserializeState(
+            validRelationText, legacyRoundTrip)) {
+        return false;
+    }
+    if (!ValidateRelationState(
+            legacyRoundTrip).IsValid()) {
+        return false;
+    }
+    if (legacyRoundTrip.cores.size() != 1 ||
+        legacyRoundTrip.cores.front().files.size() != 3 ||
+        legacyRoundTrip.families.size() != 1 ||
+        legacyRoundTrip.families.front().id != 201 ||
+        legacyRoundTrip.families.front().rootFileId != 101 ||
+        legacyRoundTrip.families.front().currentFileId != 103 ||
+        legacyRoundTrip.cores.front().files[0].path !=
+            validRelationState.cores.front().files[0].path ||
+        legacyRoundTrip.cores.front().files[1].parentFileId != 101 ||
+        legacyRoundTrip.cores.front().files[2].parentFileId != 102) {
+        return false;
+    }
 
     const std::wstring newChildPath =
         L"C:\\GravityDesktopSelfTest\\new-child.txt";
