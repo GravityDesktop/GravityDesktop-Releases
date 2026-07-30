@@ -2762,6 +2762,16 @@ public:
             return 0;
         }
         switch (message) {
+        case WM_QUERYENDSESSION:
+            (void)SaveForSessionEnd();
+            // Never delay or veto Windows shutdown.
+            return TRUE;
+        case WM_ENDSESSION:
+            if (wParam != FALSE) {
+                shuttingDown_ = true;
+                (void)SaveForSessionEnd();
+            }
+            return 0;
         case WM_TIMER:
             HandleDesktopLifecycleTimer(wParam);
             return 0;
@@ -2867,6 +2877,15 @@ public:
     LRESULT HandleMessage(
         HWND source, UINT message, WPARAM wParam, LPARAM lParam) {
         switch (message) {
+        case WM_QUERYENDSESSION:
+            (void)SaveForSessionEnd();
+            return TRUE;
+        case WM_ENDSESSION:
+            if (wParam != FALSE) {
+                shuttingDown_ = true;
+                (void)SaveForSessionEnd();
+            }
+            return 0;
         case WM_PAINT:
             Paint();
             return 0;
@@ -4113,6 +4132,35 @@ private:
             MessageBoxW(window_, L"当前布局未能可靠保存，程序不会退出。\n\n请先处理保存失败后再退出。",
                         L"引力桌面", MB_OK | MB_ICONWARNING);
         }
+    }
+
+    bool SaveForSessionEnd() {
+        // Commit an active rename before bypassing the normal 600 ms save
+        // debounce. A failure is recorded, but the caller still allows
+        // Windows to continue ending the session.
+        EndRename(true);
+        if (window_ != nullptr) {
+            KillTimer(window_, kSaveTimer);
+        }
+        const bool saved = SaveState();
+        sessionEndSaveFailed_ = !saved;
+        const std::filesystem::path recoveryPath =
+            SessionEndRecoveryPath();
+        if (saved) {
+            sessionEndRecoveryWritten_ = false;
+            if (!recoveryPath.empty()) {
+                DeleteFileW(recoveryPath.c_str());
+            }
+        } else if (!stateRecoveryBlocked_ &&
+                   !recoveryPath.empty()) {
+            sessionEndRecoveryWritten_ =
+                WriteUtf8Atomic(
+                    recoveryPath,
+                    SerializeState(state_));
+        } else {
+            sessionEndRecoveryWritten_ = false;
+        }
+        return saved;
     }
 
     void ToggleWorkspacePause() {
@@ -16566,6 +16614,28 @@ private:
         Invalidate();
     }
 
+    std::filesystem::path SessionEndRecoveryPath() const {
+        if (stateFile_.empty()) {
+            return {};
+        }
+        return std::filesystem::path(
+            stateFile_.wstring() +
+            L".session-recovery.json");
+    }
+
+    void NotifyPendingSessionEndRecovery() {
+        const std::filesystem::path path =
+            SessionEndRecoveryPath();
+        if (!path.empty() &&
+            GetFileAttributesW(path.c_str()) !=
+                INVALID_FILE_ATTRIBUTES) {
+            SetStatus(
+                L"检测到上次关机保存失败的恢复副本：" +
+                path.filename().wstring() +
+                L"。可通过“导入布局”恢复。");
+        }
+    }
+
     void LoadState() {
         stateFile_ = StateFilePath();
         const std::optional<std::string> stateText = ReadUtf8File(stateFile_);
@@ -16576,6 +16646,7 @@ private:
                     ValidateRelationState(loaded);
                 state_ = std::move(loaded);
                 if (validation.IsValid()) {
+                    NotifyPendingSessionEndRecovery();
                     return;
                 }
                 std::filesystem::path preserved;
@@ -16612,6 +16683,7 @@ private:
                 if (validation.IsValid()) {
                     SetStatus(L"主状态文件无效，已从备份恢复");
                     dirty_ = true;
+                    NotifyPendingSessionEndRecovery();
                     return;
                 }
                 std::filesystem::path preserved;
@@ -16766,6 +16838,8 @@ private:
     bool benchmarkMode_ = false;
     bool initialized_ = false;
     bool shuttingDown_ = false;
+    bool sessionEndSaveFailed_ = false;
+    bool sessionEndRecoveryWritten_ = false;
     bool stateRecoveryBlocked_ = false;
     bool applyingWorkspaceFrame_ = false;
     bool hidingToTray_ = false;
@@ -17217,6 +17291,118 @@ bool RunSelfTest() {
         return false;
     }
 #endif
+
+    GravityApp sessionEndApp;
+    sessionEndApp.stateFile_ =
+        relationTestDirectory /
+        L"session-end-state.json";
+    sessionEndApp.state_.nextId = 321;
+    sessionEndApp.dirty_ = true;
+    if (sessionEndApp.HandleShellLifecycleMessage(
+            nullptr, WM_QUERYENDSESSION,
+            0, 0) != TRUE ||
+        sessionEndApp.dirty_ ||
+        sessionEndApp.sessionEndSaveFailed_) {
+        return false;
+    }
+    std::optional<std::string> sessionStateText =
+        ReadUtf8File(
+            sessionEndApp.stateFile_);
+    WorkspaceState savedSessionState;
+    if (!sessionStateText ||
+        !DeserializeState(
+            *sessionStateText,
+            savedSessionState) ||
+        savedSessionState.nextId != 321) {
+        return false;
+    }
+
+    sessionEndApp.state_.nextId = 322;
+    sessionEndApp.dirty_ = true;
+    if (sessionEndApp.HandleMessage(
+            nullptr, WM_QUERYENDSESSION,
+            0, 0) != TRUE ||
+        sessionEndApp.dirty_ ||
+        sessionEndApp.sessionEndSaveFailed_) {
+        return false;
+    }
+    sessionEndApp.HandleShellLifecycleMessage(
+        nullptr, WM_ENDSESSION, FALSE, 0);
+    if (sessionEndApp.shuttingDown_) {
+        return false;
+    }
+    sessionEndApp.state_.nextId = 323;
+    sessionEndApp.dirty_ = true;
+    sessionEndApp.HandleShellLifecycleMessage(
+        nullptr, WM_ENDSESSION, TRUE, 0);
+    if (!sessionEndApp.shuttingDown_ ||
+        sessionEndApp.dirty_ ||
+        sessionEndApp.sessionEndSaveFailed_) {
+        return false;
+    }
+    const std::filesystem::path staleSessionRecovery =
+        sessionEndApp.SessionEndRecoveryPath();
+    if (!WriteUtf8Atomic(
+            staleSessionRecovery,
+            SerializeState(sessionEndApp.state_))) {
+        return false;
+    }
+    sessionEndApp.state_.nextId = 324;
+    sessionEndApp.dirty_ = true;
+    if (!sessionEndApp.SaveForSessionEnd() ||
+        std::filesystem::exists(
+            staleSessionRecovery)) {
+        return false;
+    }
+
+    const std::filesystem::path sessionSaveBlocker =
+        relationTestDirectory /
+        L"session-save-blocker";
+    if (!std::filesystem::create_directories(
+            sessionSaveBlocker,
+            tempError) ||
+        tempError) {
+        return false;
+    }
+    GravityApp failedSessionEndApp;
+    failedSessionEndApp.stateFile_ =
+        sessionSaveBlocker;
+    failedSessionEndApp.state_.nextId = 400;
+    failedSessionEndApp.dirty_ = true;
+    if (failedSessionEndApp.HandleMessage(
+            nullptr, WM_QUERYENDSESSION,
+            0, 0) != TRUE ||
+        !failedSessionEndApp.dirty_ ||
+        !failedSessionEndApp.
+            sessionEndSaveFailed_ ||
+        !failedSessionEndApp.
+            sessionEndRecoveryWritten_) {
+        return false;
+    }
+    const std::filesystem::path failedRecoveryPath =
+        failedSessionEndApp.
+            SessionEndRecoveryPath();
+    const std::optional<std::string>
+        failedRecoveryText =
+            ReadUtf8File(failedRecoveryPath);
+    WorkspaceState failedRecoveryState;
+    if (!failedRecoveryText ||
+        !DeserializeState(
+            *failedRecoveryText,
+            failedRecoveryState) ||
+        failedRecoveryState.nextId != 400) {
+        return false;
+    }
+    GravityApp sessionRecoveryNoticeApp;
+    sessionRecoveryNoticeApp.stateFile_ =
+        sessionSaveBlocker;
+    sessionRecoveryNoticeApp.
+        NotifyPendingSessionEndRecovery();
+    if (sessionRecoveryNoticeApp.status_.find(
+            L"恢复副本") ==
+        std::wstring::npos) {
+        return false;
+    }
 
     const auto makeRelationCore =
         [](std::uint64_t coreId,
