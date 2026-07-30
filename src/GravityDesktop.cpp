@@ -8118,6 +8118,7 @@ private:
 
     void TraceCoreLayoutAdjustment(const Core& core,
                                    const char* phase) const {
+#ifdef _DEBUG
         if (stateFile_.empty()) return;
         const std::filesystem::path tracePath =
             stateFile_.parent_path() / L"layout-adjustment.log";
@@ -8139,6 +8140,10 @@ private:
               << " focus_amount=" << CoreFocusAmount(core.id)
               << " focus_visual_scale=1"
               << '\n';
+#else
+        (void)core;
+        (void)phase;
+#endif
     }
 
     struct CoreLayoutInvariant {
@@ -8150,14 +8155,20 @@ private:
     };
 
     void RecordCoreLayoutInvariant(const Core& core, const char* phase) {
+#ifdef _DEBUG
         layoutInvariants_[core.id] = {
             core.baseInnerRadius, core.baseOuterRadius,
             core.innerDistanceScale, core.outerDistanceScale,
             core.rotationAngle};
         TraceCoreLayoutAdjustment(core, phase);
+#else
+        (void)core;
+        (void)phase;
+#endif
     }
 
     void VerifyCoreLayoutInvariant(const Core& core, const char* phase) {
+#ifdef _DEBUG
         const auto found = layoutInvariants_.find(core.id);
         if (found == layoutInvariants_.end()) {
             RecordCoreLayoutInvariant(core, phase);
@@ -8187,8 +8198,10 @@ private:
                       << '\n';
             }
         }
-#ifdef _DEBUG
         assert(unchanged && "focus/collapse modified persisted layout parameters");
+#else
+        (void)core;
+        (void)phase;
 #endif
     }
 
@@ -17176,6 +17189,35 @@ bool RunSelfTest() {
             std::filesystem::remove_all(path, ignored);
         }
     } relationTestCleanup{relationTestDirectory};
+
+    const std::filesystem::path layoutTracePath =
+        relationTestDirectory /
+        L"layout-adjustment.log";
+    GravityApp layoutTraceApp;
+    layoutTraceApp.stateFile_ =
+        relationTestDirectory / L"state.json";
+    Core layoutTraceCore;
+    layoutTraceCore.id = 42;
+    layoutTraceCore.baseInnerRadius = 74.0f;
+    layoutTraceCore.baseOuterRadius = 134.0f;
+    layoutTraceApp.TraceCoreLayoutAdjustment(
+        layoutTraceCore, "release-self-test");
+    layoutTraceApp.RecordCoreLayoutInvariant(
+        layoutTraceCore, "release-record");
+    layoutTraceApp.VerifyCoreLayoutInvariant(
+        layoutTraceCore, "release-verify");
+#ifdef _DEBUG
+    if (!std::filesystem::exists(
+            layoutTracePath)) {
+        return false;
+    }
+#else
+    if (std::filesystem::exists(
+            layoutTracePath)) {
+        return false;
+    }
+#endif
+
     const auto makeRelationCore =
         [](std::uint64_t coreId,
            std::uint64_t parentId) {
