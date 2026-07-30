@@ -15382,7 +15382,7 @@ private:
                         L"导出布局", MB_OKCANCEL | MB_ICONINFORMATION) != IDOK) {
             return;
         }
-        std::array<wchar_t, 32768> path{};
+        std::vector<wchar_t> path(32768, L'\0');
         OPENFILENAMEW dialog{sizeof(dialog)};
         dialog.hwndOwner = window_;
         dialog.lpstrFilter = L"引力桌面布局 (*.json)\0*.json\0所有文件\0*.*\0";
@@ -15399,7 +15399,7 @@ private:
     }
 
     void ImportLayout() {
-        std::array<wchar_t, 32768> path{};
+        std::vector<wchar_t> path(32768, L'\0');
         OPENFILENAMEW dialog{sizeof(dialog)};
         dialog.hwndOwner = window_;
         dialog.lpstrFilter = L"引力桌面布局 (*.json)\0*.json\0所有文件\0*.*\0";
