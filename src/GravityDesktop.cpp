@@ -1001,6 +1001,12 @@ enum class HitKind {
     More,
 };
 
+enum class RemoveItemChoice {
+    Prompt,
+    RemoveSubtree,
+    Cancel,
+};
+
 struct HitResult {
     HitKind kind = HitKind::None;
     std::uint64_t coreId = 0;
@@ -15750,24 +15756,262 @@ private:
         return true;
     }
 
-    void RemoveItem(std::uint64_t coreId, std::uint64_t itemId) {
+    bool RemoveItemTransactional(
+        std::uint64_t coreId,
+        std::uint64_t itemId,
+        RemoveItemChoice choice) {
         Core* core = FindCore(coreId);
         if (core == nullptr) {
-            return;
+            return false;
         }
         const auto iterator = std::find_if(
             core->files.begin(), core->files.end(),
             [itemId](const FileItem& item) { return item.id == itemId; });
         if (iterator == core->files.end()) {
-            return;
+            return false;
         }
-        PushUndo(state_);
-        core->files.erase(iterator);
-        RefreshAutomaticCoreIdentity(*core);
+
+        std::vector<std::uint64_t> subtree;
+        std::wstring collectError;
+        if (!CollectSubtreeForMove(
+                *core, itemId, subtree,
+                collectError)) {
+            SetStatus(
+                collectError.empty()
+                    ? L"无法确定完整子树；未移除任何引用"
+                    : std::move(collectError));
+            return false;
+        }
+        if (choice == RemoveItemChoice::Cancel) {
+            SetStatus(L"已取消移除；所有文件引用保持不变");
+            return false;
+        }
+        if (subtree.size() > 1 &&
+            choice == RemoveItemChoice::Prompt) {
+            const std::wstring itemName =
+                iterator->displayName.empty()
+                    ? FileDisplayName(iterator->path)
+                    : iterator->displayName;
+            const std::wstring warning =
+                L"“" + itemName +
+                L"”包含子文件。\n\n"
+                L"选择“确定”将同时移除整棵子树，共 " +
+                std::to_wstring(subtree.size()) +
+                L" 个引力桌面文件引用。\n\n"
+                L"真实文件不会被移动或删除。\n"
+                L"选择“取消”将保持全部引用不变。";
+            if (MessageBoxW(
+                    window_, warning.c_str(),
+                    L"移除文件子树",
+                    MB_OKCANCEL | MB_ICONWARNING |
+                        MB_DEFBUTTON2) != IDOK) {
+                SetStatus(
+                    L"已取消移除；所有文件引用保持不变");
+                return false;
+            }
+        }
+
+        const std::unordered_set<std::uint64_t>
+            removedIds(
+                subtree.begin(), subtree.end());
+        WorkspaceState before = state_;
+        WorkspaceState candidate = state_;
+        auto candidateCore = std::find_if(
+            candidate.cores.begin(),
+            candidate.cores.end(),
+            [coreId](const Core& value) {
+                return value.id == coreId;
+            });
+        if (candidateCore == candidate.cores.end()) {
+            SetStatus(L"核心状态已变化；未移除任何引用");
+            return false;
+        }
+
+        std::unordered_set<std::uint64_t>
+            affectedFamilyIds;
+        for (const FileItem& item :
+             candidateCore->files) {
+            if (removedIds.contains(item.id) &&
+                item.familyId != 0) {
+                affectedFamilyIds.insert(
+                    item.familyId);
+            }
+        }
+        candidateCore->files.erase(
+            std::remove_if(
+                candidateCore->files.begin(),
+                candidateCore->files.end(),
+                [&removedIds](
+                    const FileItem& item) {
+                    return removedIds.contains(
+                        item.id);
+                }),
+            candidateCore->files.end());
+        candidateCore->savedBaselineLayout.erase(
+            std::remove_if(
+                candidateCore->savedBaselineLayout.begin(),
+                candidateCore->savedBaselineLayout.end(),
+                [&removedIds](
+                    const CoreBaselineFileLayout&
+                        item) {
+                    return removedIds.contains(
+                        item.fileId);
+                }),
+            candidateCore->savedBaselineLayout.end());
+
+        for (FileFamily& family :
+             candidate.families) {
+            if (!affectedFamilyIds.contains(
+                    family.id)) {
+                continue;
+            }
+            family.snapshots.erase(
+                std::remove_if(
+                    family.snapshots.begin(),
+                    family.snapshots.end(),
+                    [&removedIds](
+                        const FileFamilyMemberSnapshot&
+                            snapshot) {
+                        return removedIds.contains(
+                            snapshot.fileId);
+                    }),
+                family.snapshots.end());
+            if (removedIds.contains(
+                    family.currentFileId) &&
+                !removedIds.contains(
+                    family.rootFileId)) {
+                family.currentFileId =
+                    family.rootFileId;
+            }
+        }
+
+        std::unordered_set<std::uint64_t>
+            dissolvedFamilyIds;
+        for (const FileFamily& family :
+             candidate.families) {
+            if (!affectedFamilyIds.contains(
+                    family.id) ||
+                !removedIds.contains(
+                    family.rootFileId)) {
+                continue;
+            }
+            dissolvedFamilyIds.insert(family.id);
+            for (Core& owner : candidate.cores) {
+                for (FileItem& member :
+                     owner.files) {
+                    if (member.familyId !=
+                        family.id) {
+                        continue;
+                    }
+                    member.familyId = 0;
+                    member.parentFileId = 0;
+                    member.childrenCollapsed =
+                        false;
+                    member.detachedFromUpper =
+                        true;
+                }
+            }
+        }
+        candidate.families.erase(
+            std::remove_if(
+                candidate.families.begin(),
+                candidate.families.end(),
+                [&affectedFamilyIds,
+                 &dissolvedFamilyIds,
+                 &candidate](
+                    const FileFamily& family) {
+                    if (dissolvedFamilyIds.contains(
+                            family.id)) {
+                        return true;
+                    }
+                    if (!affectedFamilyIds.contains(
+                            family.id)) {
+                        return false;
+                    }
+                    for (const Core& owner :
+                         candidate.cores) {
+                        if (std::any_of(
+                                owner.files.begin(),
+                                owner.files.end(),
+                                [&family](
+                                    const FileItem& item) {
+                                    return item.familyId ==
+                                           family.id;
+                                })) {
+                            return false;
+                        }
+                    }
+                    return true;
+                }),
+            candidate.families.end());
+
+        for (FileItem& remaining :
+             candidateCore->files) {
+            const bool stillHasChildren =
+                std::any_of(
+                    candidateCore->files.begin(),
+                    candidateCore->files.end(),
+                    [&remaining](
+                        const FileItem& item) {
+                        return item.parentFileId ==
+                               remaining.id;
+                    });
+            if (!stillHasChildren) {
+                remaining.childrenCollapsed =
+                    false;
+            }
+        }
+        RefreshAutomaticCoreIdentity(
+            *candidateCore);
+
+        const RelationValidationResult validation =
+            ValidateRelationState(candidate);
+        if (!validation.IsValid()) {
+            SetStatus(
+                L"删除后的关系校验失败；原状态保持不变。 " +
+                validation.issues.front().subject +
+                L"：" +
+                validation.issues.front().reason);
+            return false;
+        }
+        if (stateRecoveryBlocked_) {
+            SetStatus(
+                L"状态处于只读保护模式；未移除任何引用");
+            return false;
+        }
+        if (stateFile_.empty() ||
+            !WriteUtf8Atomic(
+                stateFile_,
+                SerializeState(candidate))) {
+            SetStatus(
+                L"移除操作保存失败；原状态保持不变");
+            return false;
+        }
+
+        state_ = std::move(candidate);
+        dirty_ = false;
+        CreateHistoryBackup(false);
+        PushUndo(std::move(before));
         ClearSelection();
-        ScheduleSave();
-        SetStatus(L"已移除视觉关联；真实文件未被删除");
+        hover_ = {};
+        layoutCache_.clear();
+        layoutDirty_ = true;
+        SetStatus(
+            subtree.size() > 1
+                ? L"已移除完整文件子树，共 " +
+                      std::to_wstring(subtree.size()) +
+                      L" 个视觉引用；真实文件未被删除"
+                : L"已移除视觉关联；真实文件未被删除");
         Invalidate();
+        return true;
+    }
+
+    void RemoveItem(
+        std::uint64_t coreId,
+        std::uint64_t itemId) {
+        (void)RemoveItemTransactional(
+            coreId, itemId,
+            RemoveItemChoice::Prompt);
     }
 
     void TogglePinned(std::uint64_t coreId, std::uint64_t itemId) {
@@ -17512,6 +17756,241 @@ bool RunSelfTest() {
         restartedGrandchild->parentFileId != 501 ||
         restartedGrandchild->path !=
             L"C:\\GravityDesktopSelfTest\\move-502.txt") {
+        return false;
+    }
+
+    const std::filesystem::path realRemovalFile =
+        relationTestDirectory /
+        L"real-file-must-survive.txt";
+    const std::string realRemovalContent =
+        "GravityDesktop real file safety";
+    if (!WriteUtf8Atomic(
+            realRemovalFile,
+            realRemovalContent)) {
+        return false;
+    }
+    GravityApp leafRemovalApp;
+    leafRemovalApp.state_ =
+        makeSubtreeMoveState({{500, 0}}, 0);
+    findTestItem(leafRemovalApp.state_, 500)->
+        path = realRemovalFile.wstring();
+    leafRemovalApp.stateFile_ =
+        moveTestPath(L"remove-leaf");
+    if (!leafRemovalApp.RemoveItemTransactional(
+            1, 500,
+            RemoveItemChoice::RemoveSubtree) ||
+        itemOwnerId(
+            leafRemovalApp.state_, 500) != 0 ||
+        leafRemovalApp.undoStack_.size() != 1 ||
+        ReadUtf8File(realRemovalFile) !=
+            std::optional<std::string>(
+                realRemovalContent) ||
+        !ValidateRelationState(
+            leafRemovalApp.state_).IsValid()) {
+        return false;
+    }
+
+    GravityApp parentRemovalApp;
+    parentRemovalApp.state_ =
+        makeSubtreeMoveState(
+            {{500, 0}, {501, 500}}, 0);
+    parentRemovalApp.stateFile_ =
+        moveTestPath(L"remove-parent-child");
+    if (!parentRemovalApp.RemoveItemTransactional(
+            1, 500,
+            RemoveItemChoice::RemoveSubtree) ||
+        itemOwnerId(
+            parentRemovalApp.state_, 500) != 0 ||
+        itemOwnerId(
+            parentRemovalApp.state_, 501) != 0 ||
+        !parentRemovalApp.state_.families.empty() ||
+        !ValidateRelationState(
+            parentRemovalApp.state_).IsValid()) {
+        return false;
+    }
+
+    GravityApp threeLevelRemovalApp;
+    threeLevelRemovalApp.state_ =
+        makeSubtreeMoveState(
+            {{500, 0}, {501, 500},
+             {502, 501}}, 0);
+    threeLevelRemovalApp.stateFile_ =
+        moveTestPath(L"remove-three-level");
+    if (!threeLevelRemovalApp.
+             RemoveItemTransactional(
+                 1, 500,
+                 RemoveItemChoice::RemoveSubtree) ||
+        itemOwnerId(
+            threeLevelRemovalApp.state_, 500) != 0 ||
+        itemOwnerId(
+            threeLevelRemovalApp.state_, 501) != 0 ||
+        itemOwnerId(
+            threeLevelRemovalApp.state_, 502) != 0 ||
+        !ValidateRelationState(
+            threeLevelRemovalApp.state_).IsValid()) {
+        return false;
+    }
+
+    GravityApp middleRemovalApp;
+    middleRemovalApp.state_ =
+        makeSubtreeMoveState(
+            {{500, 0}, {501, 500},
+             {502, 501}, {503, 500}}, 0);
+    middleRemovalApp.stateFile_ =
+        moveTestPath(L"remove-middle");
+    if (!middleRemovalApp.RemoveItemTransactional(
+            1, 501,
+            RemoveItemChoice::RemoveSubtree) ||
+        itemOwnerId(
+            middleRemovalApp.state_, 500) != 1 ||
+        itemOwnerId(
+            middleRemovalApp.state_, 501) != 0 ||
+        itemOwnerId(
+            middleRemovalApp.state_, 502) != 0 ||
+        itemOwnerId(
+            middleRemovalApp.state_, 503) != 1 ||
+        middleRemovalApp.state_.families.size() !=
+            1 ||
+        middleRemovalApp.state_.families.front().
+            rootFileId != 500 ||
+        middleRemovalApp.state_.families.front().
+            currentFileId != 503 ||
+        !ValidateRelationState(
+            middleRemovalApp.state_).IsValid()) {
+        return false;
+    }
+
+    GravityApp currentVersionRemovalApp;
+    currentVersionRemovalApp.state_ =
+        makeSubtreeMoveState(
+            {{500, 0}, {501, 500}}, 0);
+    findTestItem(
+        currentVersionRemovalApp.state_, 500)->
+        childrenCollapsed = true;
+    currentVersionRemovalApp.stateFile_ =
+        moveTestPath(L"remove-current-version");
+    if (!currentVersionRemovalApp.
+             RemoveItemTransactional(
+                 1, 501,
+                 RemoveItemChoice::RemoveSubtree) ||
+        currentVersionRemovalApp.state_.
+            families.size() != 1 ||
+        currentVersionRemovalApp.state_.
+            families.front().currentFileId != 500 ||
+        findTestItem(
+            currentVersionRemovalApp.state_, 500)->
+            childrenCollapsed ||
+        !ValidateRelationState(
+            currentVersionRemovalApp.state_).IsValid()) {
+        return false;
+    }
+
+    GravityApp familyRootRemovalApp;
+    familyRootRemovalApp.state_ =
+        makeSubtreeMoveState(
+            {{500, 0}, {501, 500},
+             {502, 500}}, 0);
+    familyRootRemovalApp.state_.families.front().
+        snapshots.push_back(
+            {500, 0, 0, -90.0f, 0.0f,
+             D2D1::Point2F(), false});
+    familyRootRemovalApp.state_.families.front().
+        snapshots.push_back(
+            {501, -1, -1, 90.0f, 0.0f,
+             D2D1::Point2F(), false});
+    familyRootRemovalApp.state_.cores.front().
+        savedBaselineLayout.push_back(
+            {500, 0, 0, 0, -90.0f, 0.0f,
+             0.0f, D2D1::Point2F(),
+             false, false});
+    familyRootRemovalApp.stateFile_ =
+        moveTestPath(L"remove-family-root");
+    if (!familyRootRemovalApp.
+             RemoveItemTransactional(
+                 1, 500,
+                 RemoveItemChoice::RemoveSubtree) ||
+        !familyRootRemovalApp.state_.
+             families.empty() ||
+        !familyRootRemovalApp.state_.cores.front().
+             savedBaselineLayout.empty() ||
+        !ValidateRelationState(
+            familyRootRemovalApp.state_).IsValid()) {
+        return false;
+    }
+
+    GravityApp cancelledRemovalApp;
+    cancelledRemovalApp.state_ =
+        makeSubtreeMoveState(
+            {{500, 0}, {501, 500}}, 0);
+    const std::string cancelledRemovalBefore =
+        SerializeState(cancelledRemovalApp.state_);
+    if (cancelledRemovalApp.
+            RemoveItemTransactional(
+                1, 500,
+                RemoveItemChoice::Cancel) ||
+        SerializeState(
+            cancelledRemovalApp.state_) !=
+            cancelledRemovalBefore ||
+        !cancelledRemovalApp.undoStack_.empty()) {
+        return false;
+    }
+
+    const std::filesystem::path
+        removalSaveBlocker =
+            relationTestDirectory /
+            L"remove-save-blocker";
+    blockerFile = CreateFileW(
+        removalSaveBlocker.c_str(),
+        GENERIC_WRITE, 0, nullptr,
+        CREATE_ALWAYS,
+        FILE_ATTRIBUTE_TEMPORARY,
+        nullptr);
+    if (blockerFile == INVALID_HANDLE_VALUE) {
+        return false;
+    }
+    CloseHandle(blockerFile);
+    GravityApp failedRemovalApp;
+    failedRemovalApp.state_ =
+        makeSubtreeMoveState(
+            {{500, 0}, {501, 500},
+             {502, 501}}, 0);
+    failedRemovalApp.stateFile_ =
+        removalSaveBlocker / L"state.json";
+    const std::string failedRemovalBefore =
+        SerializeState(failedRemovalApp.state_);
+    if (failedRemovalApp.
+            RemoveItemTransactional(
+                1, 500,
+                RemoveItemChoice::RemoveSubtree) ||
+        SerializeState(
+            failedRemovalApp.state_) !=
+            failedRemovalBefore ||
+        !failedRemovalApp.undoStack_.empty() ||
+        failedRemovalApp.status_.find(
+            L"原状态保持不变") ==
+            std::wstring::npos) {
+        return false;
+    }
+
+    const std::optional<std::string>
+        persistedMiddleRemoval =
+            ReadUtf8File(
+                middleRemovalApp.stateFile_);
+    WorkspaceState restartedRemovalState;
+    if (!persistedMiddleRemoval ||
+        !DeserializeState(
+            *persistedMiddleRemoval,
+            restartedRemovalState) ||
+        !ValidateRelationState(
+            restartedRemovalState).IsValid() ||
+        itemOwnerId(
+            restartedRemovalState, 501) != 0 ||
+        itemOwnerId(
+            restartedRemovalState, 502) != 0 ||
+        itemOwnerId(
+            restartedRemovalState, 500) != 1 ||
+        itemOwnerId(
+            restartedRemovalState, 503) != 1) {
         return false;
     }
 
