@@ -32,6 +32,7 @@
 #include <locale>
 #include <map>
 #include <optional>
+#include <random>
 #include <set>
 #include <sstream>
 #include <string>
@@ -993,6 +994,61 @@ struct WorkspaceState {
     std::vector<Core> cores;
     std::vector<FileFamily> families;
 };
+
+bool IsCoreColorPreset(UINT32 color) {
+    return std::any_of(
+        kCoreColorPresets.begin(), kCoreColorPresets.end(),
+        [color](const CoreColorPreset& preset) {
+            return preset.color == color;
+        });
+}
+
+UINT32 ChooseNewCoreColor(const WorkspaceState& state) {
+    std::unordered_set<UINT32> activeColors;
+    std::optional<UINT32> mostRecentColor;
+    for (auto iterator = state.cores.rbegin();
+         iterator != state.cores.rend(); ++iterator) {
+        if (iterator->archived ||
+            !IsCoreColorPreset(iterator->themeColor)) {
+            continue;
+        }
+        activeColors.insert(iterator->themeColor);
+        if (!mostRecentColor.has_value()) {
+            mostRecentColor = iterator->themeColor;
+        }
+    }
+
+    std::vector<UINT32> candidates;
+    candidates.reserve(kCoreColorPresets.size());
+    for (const CoreColorPreset& preset : kCoreColorPresets) {
+        if (!activeColors.contains(preset.color)) {
+            candidates.push_back(preset.color);
+        }
+    }
+    if (candidates.empty()) {
+        for (const CoreColorPreset& preset : kCoreColorPresets) {
+            if (!mostRecentColor.has_value() ||
+                preset.color != *mostRecentColor) {
+                candidates.push_back(preset.color);
+            }
+        }
+    }
+    if (candidates.empty()) {
+        return kCoreColorPresets.front().color;
+    }
+
+    static std::mt19937 generator([] {
+        std::random_device device;
+        std::seed_seq seed{
+            device(), device(),
+            static_cast<unsigned int>(GetCurrentProcessId()),
+            static_cast<unsigned int>(GetTickCount())};
+        return std::mt19937(seed);
+    }());
+    std::uniform_int_distribution<std::size_t> distribution(
+        0, candidates.size() - 1);
+    return candidates[distribution(generator)];
+}
 
 enum class HitKind {
     None,
@@ -14958,7 +15014,11 @@ private:
         // quiet until selected, keeping the fixed companion workspace dense.
         core.expanded = !hasExistingUserCore;
         core.iconKind = CoreIconKind::General;
-        core.themeColor = DefaultCoreColor(core.iconKind);
+        core.themeColor = ChooseNewCoreColor(state_);
+        // The randomized color is the new core's persistent identity.  Treat
+        // it as an explicit assignment so later automatic icon inference
+        // cannot collapse every new core back to the same category color.
+        core.themeColorCustomized = true;
         const std::uint64_t id = core.id;
         state_.cores.push_back(std::move(core));
         SetSelection({HitKind::Core, id, 0}, true);
@@ -16903,6 +16963,68 @@ bool RunSelfTest() {
     if (!CommitImportedStateWrite(
             recoveryClearedAfterSuccess, []() { return true; }) ||
         recoveryClearedAfterSuccess) {
+        return false;
+    }
+
+    WorkspaceState randomColorState;
+    Core unclassifiedColorCore;
+    unclassifiedColorCore.id = kUnclassifiedCoreId;
+    unclassifiedColorCore.themeColor = 0x7E69DA;
+    randomColorState.cores.push_back(unclassifiedColorCore);
+    std::unordered_set<UINT32> generatedColors{
+        unclassifiedColorCore.themeColor};
+    for (std::size_t index = 1;
+         index < kCoreColorPresets.size(); ++index) {
+        const UINT32 color =
+            ChooseNewCoreColor(randomColorState);
+        if (!IsCoreColorPreset(color) ||
+            generatedColors.contains(color)) {
+            return false;
+        }
+        generatedColors.insert(color);
+        Core generatedCore;
+        generatedCore.id =
+            static_cast<std::uint64_t>(index + 1);
+        generatedCore.themeColor = color;
+        generatedCore.themeColorCustomized = true;
+        randomColorState.cores.push_back(
+            generatedCore);
+    }
+    const UINT32 mostRecentColor =
+        randomColorState.cores.back().themeColor;
+    const UINT32 recycledColor =
+        ChooseNewCoreColor(randomColorState);
+    if (!IsCoreColorPreset(recycledColor) ||
+        recycledColor == mostRecentColor) {
+        return false;
+    }
+
+    GravityApp randomColorCreationApp;
+    randomColorCreationApp.state_.cores.push_back(
+        unclassifiedColorCore);
+    randomColorCreationApp.state_.nextId = 2;
+    randomColorCreationApp.CreateCore(
+        D2D1::Point2F(100.0f, 100.0f), false);
+    if (randomColorCreationApp.state_.cores.size() != 2) {
+        return false;
+    }
+    const Core& createdColorCore =
+        randomColorCreationApp.state_.cores.back();
+    if (!IsCoreColorPreset(createdColorCore.themeColor) ||
+        createdColorCore.themeColor ==
+            unclassifiedColorCore.themeColor ||
+        !createdColorCore.themeColorCustomized) {
+        return false;
+    }
+    WorkspaceState restoredRandomColorState;
+    if (!DeserializeState(
+            SerializeState(randomColorCreationApp.state_),
+            restoredRandomColorState) ||
+        restoredRandomColorState.cores.size() != 2 ||
+        restoredRandomColorState.cores.back().themeColor !=
+            createdColorCore.themeColor ||
+        !restoredRandomColorState.cores.back().
+            themeColorCustomized) {
         return false;
     }
 
