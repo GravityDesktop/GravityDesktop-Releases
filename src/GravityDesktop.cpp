@@ -1,0 +1,16683 @@
+#include <windows.h>
+#include <windowsx.h>
+#include <commctrl.h>
+#include <commoncontrols.h>
+#include <commdlg.h>
+#include <d2d1.h>
+#include <d2d1helper.h>
+#include <dwrite.h>
+#include <shellapi.h>
+#include <shlobj.h>
+#include <shlwapi.h>
+#include <wincodec.h>
+#include <wrl/client.h>
+
+#include <algorithm>
+#include <array>
+#include <atomic>
+#include <cassert>
+#include <chrono>
+#include <cstddef>
+#include <cstring>
+#include <cfloat>
+#include <cmath>
+#include <ctime>
+#include <cstdint>
+#include <cwchar>
+#include <cwctype>
+#include <filesystem>
+#include <functional>
+#include <fstream>
+#include <iomanip>
+#include <locale>
+#include <map>
+#include <optional>
+#include <set>
+#include <sstream>
+#include <string>
+#include <unordered_map>
+#include <unordered_set>
+#include <utility>
+#include <variant>
+#include <vector>
+
+#pragma comment(lib, "d2d1.lib")
+#pragma comment(lib, "dwrite.lib")
+#pragma comment(lib, "windowscodecs.lib")
+#pragma comment(lib, "shell32.lib")
+#pragma comment(lib, "shlwapi.lib")
+#pragma comment(lib, "ole32.lib")
+#pragma comment(lib, "uuid.lib")
+#pragma comment(lib, "comdlg32.lib")
+#pragma comment(lib, "comctl32.lib")
+
+using Microsoft::WRL::ComPtr;
+
+namespace {
+
+constexpr wchar_t kWindowClass[] = L"GravityDesktop.NativeWindow";
+constexpr wchar_t kInteractionWindowClass[] =
+    L"GravityDesktop.InteractionIslands";
+constexpr wchar_t kShellLifecycleWindowClass[] =
+    L"GravityDesktop.ShellLifecycle";
+constexpr wchar_t kWindowTitle[] = L"引力桌面系统";
+constexpr std::uint64_t kUnclassifiedCoreId = 1;
+constexpr int kCoreFileCapacity = 18;
+constexpr int kPriorityPlacementSlots = 19;
+constexpr int kLayoutVersion = 16;
+constexpr int kNormalVisibleLimit = 18;
+constexpr int kFocusedVisibleLimit = 18;
+constexpr UINT_PTR kSaveTimer = 1;
+constexpr UINT_PTR kStatusTimer = 2;
+constexpr UINT_PTR kAnimationTimer = 3;
+constexpr UINT kCoreExpansionFrameIntervalMs = 33;
+constexpr UINT_PTR kMarqueeTimer = 4;
+constexpr UINT_PTR kRelationPreviewTimer = 5;
+constexpr UINT_PTR kReferenceCheckTimer = 6;
+constexpr UINT_PTR kHoverTooltipTimer = 7;
+constexpr UINT_PTR kCoreSelectionHaloTimer = 8;
+constexpr UINT_PTR kSelectionDismissTimer = 9;
+constexpr UINT_PTR kDesktopHostWatchTimer = 10;
+constexpr UINT_PTR kDesktopReconnectTimer = 11;
+constexpr UINT_PTR kInteractionLayerRepairTimer = 12;
+constexpr UINT kDesktopHostWatchIntervalMs = 2000;
+constexpr UINT kDesktopReconnectIntervalMs = 250;
+constexpr UINT kInteractionLayerRepairDelayMs = 600;
+constexpr int kDesktopReconnectAttemptLimit = 40;
+constexpr int kWorkspaceControlCount = 7;
+constexpr int kRelationHoverDelayMs = 10;
+constexpr int kHoverTooltipDelayMs = 320;
+constexpr UINT kCommitRenameMessage = WM_APP + 1;
+constexpr UINT kTrayCallbackMessage = WM_APP + 2;
+constexpr UINT kRestoreExistingInstanceMessage = WM_APP + 3;
+constexpr UINT kRefreshInteractionLayerMessage = WM_APP + 4;
+constexpr UINT kTrayIconId = 1;
+constexpr float kPi = 3.14159265358979323846f;
+constexpr std::array<int, 3> kRingCapacities{6, 13, 0};
+constexpr std::array<int, 3> kRingStarts{0, 6, 19};
+constexpr std::array<float, 3> kDefaultRingRadii{74.0f, 134.0f, 240.0f};
+
+enum class FileSizeTier : int {
+    Minor = 0,
+    Normal = 1,
+    Important = 2,
+};
+
+enum class CoreIconKind : int {
+    General = 0,
+    Documents = 1,
+    Games = 2,
+    Folder = 3,
+    Study = 4,
+    Unclassified = 5,
+};
+
+enum class DensityMode : int {
+    Compact = 0,
+    Standard = 1,
+    Clear = 2,
+};
+
+enum class AnimationMode : int {
+    Off = 0,
+    Simple = 1,
+    Standard = 2,
+    Soft = 3,
+};
+
+// Independent from general layout animation: selection must remain visible
+// even when movement effects are disabled.
+enum class CoreSelectionEffect : int {
+    GentleRipple = 0,
+    RippleOnceThenStatic = 1,
+    Static = 2,
+};
+
+enum class ConnectionWidthPreset : int {
+    Thin = 0,
+    Standard = 1,
+    Emphasis = 2,
+    Custom = 3,
+};
+
+enum class ConnectionLineColorMode : int {
+    FollowCore = 0,
+    Black = 1,
+    White = 2,
+    Custom = 3,
+};
+
+constexpr float kConnectionLineWidthThin = 0.8f;
+constexpr float kConnectionLineWidthStandard = 1.2f;
+constexpr float kConnectionLineWidthEmphasis = 1.6f;
+
+ConnectionWidthPreset ConnectionWidthPresetFor(float width) {
+    constexpr float epsilon = 0.015f;
+    if (std::abs(width - kConnectionLineWidthThin) <= epsilon) {
+        return ConnectionWidthPreset::Thin;
+    }
+    if (std::abs(width - kConnectionLineWidthStandard) <= epsilon) {
+        return ConnectionWidthPreset::Standard;
+    }
+    if (std::abs(width - kConnectionLineWidthEmphasis) <= epsilon) {
+        return ConnectionWidthPreset::Emphasis;
+    }
+    return ConnectionWidthPreset::Custom;
+}
+
+enum class FocusAnimationState : int {
+    Idle = 0,
+    Focusing = 1,
+    Focused = 2,
+    Switching = 3,
+    Unfocusing = 4,
+};
+
+enum class LayoutMode : int {
+    Standard = 0,
+    GrowToSpace = 1,
+    KeepAngles = 2,
+    Free = 3,
+};
+
+enum class LayoutTemplate : int {
+    AutoCompact = 0,
+    SingleRing = 1,
+    CompactDouble = 2,
+    HighCapacityDouble = 3,
+};
+
+struct ResponsiveMetrics {
+    float workspaceWidth = 1200.0f;
+    float workspaceHeight = 760.0f;
+    float shortSide = 760.0f;
+    float normalIconSize = 42.0f;
+    float importantIconSize = 48.0f;
+    float minorIconSize = 36.0f;
+    float coreSize = 56.0f;
+    float fileFontSize = 12.0f;
+    float coreFontSize = 14.0f;
+    float helperFontSize = 11.0f;
+    float tutorialTitleSize = 28.0f;
+    float tutorialStepSize = 22.0f;
+    float tutorialBodySize = 16.0f;
+    float tutorialButtonSize = 15.0f;
+    float labelWidth = 84.0f;
+    float minimumGap = 8.0f;
+    float spacingScale = 1.0f;
+    float densityVisibleFactor = 1.0f;
+    float spreadScale = 1.0f;
+    int gridColumns = 1;
+    int gridRows = 1;
+    int normalVisibleLimit = 18;
+    int focusedVisibleLimit = 18;
+    std::array<float, 3> ringRadii = kDefaultRingRadii;
+    std::array<int, 3> ringCapacities{6, 13, 0};
+    std::array<float, 3> focusedRingRadii = kDefaultRingRadii;
+    std::array<int, 3> focusedRingCapacities{6, 13, 0};
+};
+
+enum MenuCommand : UINT {
+    MenuCreateCore = 1001,
+    MenuUndo,
+    MenuResetView,
+    MenuToggleCore,
+    MenuRenameCore,
+    MenuCoreAppearanceSettings,
+    MenuAppearanceColor,
+    MenuAppearanceCoreScale,
+    MenuAppearanceLineWidth,
+    MenuAppearanceGlowIntensity,
+    MenuResetCoreAppearance,
+    MenuChangeCoreColor,
+    MenuSetCoreColorBlue,
+    MenuSetCoreColorPurple,
+    MenuSetCoreColorPink,
+    MenuSetCoreColorRed,
+    MenuSetCoreColorOrange,
+    MenuSetCoreColorYellow,
+    MenuSetCoreColorGreen,
+    MenuSetCoreColorCyan,
+    MenuSetCoreColorGray,
+    MenuDeleteCore,
+    MenuOpenItem,
+    MenuTogglePinned,
+    MenuToggleFavorite,
+    MenuToggleInProgress,
+    MenuRemoveItem,
+    MenuRelocateItem,
+    MenuOptimizeCore,
+    MenuGrowToSpace,
+    MenuKeepAngles,
+    MenuFreeLayout,
+    MenuCompactDouble,
+    MenuSingleRing,
+    MenuHighCapacityDouble,
+    MenuDirectionUp,
+    MenuDirectionUpperRight,
+    MenuDirectionDefault,
+    MenuToggleLayoutLock,
+    MenuRestoreCoreLayout,
+    MenuOptimizeAll,
+    MenuDisperseCores,
+    MenuArrangeAll,
+    MenuSaveNow,
+    MenuOpenDataFolder,
+    MenuAdjustCoreDistance,
+    MenuConnectionStyleThin,
+    MenuConnectionStyleStandard,
+    MenuConnectionStyleEmphasis,
+    MenuConnectionStyleCustom,
+    MenuRepairCoreDistanceData,
+    MenuSaveCoreBaseline,
+    MenuRestoreCoreBaseline,
+    MenuDensityCompact,
+    MenuDensityStandard,
+    MenuDensityClear,
+    MenuAnimationOff,
+    MenuAnimationSimple,
+    MenuAnimationStandard,
+    MenuAnimationSoft,
+    MenuCoreSelectionEffectRotate,
+    MenuCoreSelectionEffectOnce,
+    MenuCoreSelectionEffectStatic,
+    MenuToggleCoreFocus,
+    MenuDetachParent,
+    MenuOpenContainingFolder,
+    MenuRevealInExplorer,
+    MenuShowFullPath,
+    MenuArchiveCore,
+    MenuDissolveCore,
+    MenuRestoreCore,
+    MenuTrayShowHide,
+    MenuTrayPauseResume,
+    MenuTrayTutorial,
+    MenuExportLayout,
+    MenuImportLayout,
+    MenuRefreshReferences,
+    MenuTrayExit,
+};
+
+struct CoreColorPreset {
+    UINT command;
+    UINT32 color;
+    const wchar_t* name;
+};
+
+constexpr std::array<CoreColorPreset, 9> kCoreColorPresets{{
+    {MenuSetCoreColorRed,    0xC8545E, L"红"},
+    {MenuSetCoreColorOrange, 0xD68A2C, L"橙"},
+    {MenuSetCoreColorYellow, 0xB99A27, L"黄"},
+    {MenuSetCoreColorGreen,  0x46966B, L"绿"},
+    {MenuSetCoreColorCyan,   0x2C9BA8, L"青"},
+    {MenuSetCoreColorBlue,   0x3978D3, L"蓝"},
+    {MenuSetCoreColorPurple, 0x7E69DA, L"紫"},
+    {MenuSetCoreColorPink,   0xD86A9E, L"粉"},
+    {MenuSetCoreColorGray,   0x778392, L"灰"},
+}};
+
+// The recommended range protects label boxes.  Manual distance adjustments
+// may enter the compact range; only overlapping icon hit areas are a hard
+// limit because those make individual files ambiguous to click.
+struct DistanceScaleResult {
+    bool applied = false;
+    bool compact = false;
+};
+
+enum class CoreLayoutControl : int {
+    None = -1,
+    InnerDistance = 0,
+    OuterDistance = 1,
+    Rotation = 2,
+};
+
+enum class CoreAppearanceControl : int {
+    None = -1,
+    CoreScale = 0,
+    LineWidth = 1,
+    GlowIntensity = 2,
+};
+
+BOOL CALLBACK FindDesktopViewHostCallback(HWND window, LPARAM parameter) {
+    auto* result = reinterpret_cast<HWND*>(parameter);
+    if (result == nullptr || *result != nullptr) {
+        return FALSE;
+    }
+    if (FindWindowExW(
+            window, nullptr, L"SHELLDLL_DefView", nullptr) != nullptr) {
+        *result = window;
+        return FALSE;
+    }
+    return TRUE;
+}
+
+HWND FindDesktopViewHost() {
+    HWND result = nullptr;
+    EnumWindows(
+        FindDesktopViewHostCallback,
+        reinterpret_cast<LPARAM>(&result));
+    if (result != nullptr) {
+        return result;
+    }
+    return FindWindowW(L"Progman", nullptr);
+}
+
+UINT TaskbarCreatedMessage() {
+    static const UINT message =
+        RegisterWindowMessageW(L"TaskbarCreated");
+    return message;
+}
+
+UINT ShellHookMessage() {
+    static const UINT message =
+        RegisterWindowMessageW(L"SHELLHOOK");
+    return message;
+}
+
+BOOL CALLBACK FindGravityWindowCallback(HWND window, LPARAM parameter) {
+    auto* result = reinterpret_cast<HWND*>(parameter);
+    if (result == nullptr || *result != nullptr) {
+        return FALSE;
+    }
+    wchar_t className[128]{};
+    if (GetClassNameW(
+            window, className,
+            static_cast<int>(std::size(className))) > 0 &&
+        wcscmp(className, kWindowClass) == 0) {
+        *result = window;
+        return FALSE;
+    }
+    return TRUE;
+}
+
+HWND FindExistingGravityWindow() {
+    if (HWND lifecycle =
+            FindWindowW(kShellLifecycleWindowClass, nullptr);
+        lifecycle != nullptr) {
+        return lifecycle;
+    }
+    if (HWND topLevel = FindWindowW(kWindowClass, nullptr);
+        topLevel != nullptr) {
+        return topLevel;
+    }
+    HWND result = nullptr;
+    EnumWindows(FindGravityWindowCallback,
+                reinterpret_cast<LPARAM>(&result));
+    if (result != nullptr) {
+        return result;
+    }
+    const HWND desktopHost = FindDesktopViewHost();
+    if (desktopHost != nullptr) {
+        EnumChildWindows(
+            desktopHost, FindGravityWindowCallback,
+            reinterpret_cast<LPARAM>(&result));
+    }
+    const HWND progman = FindWindowW(L"Progman", nullptr);
+    if (result == nullptr && progman != nullptr &&
+        progman != desktopHost) {
+        EnumChildWindows(
+            progman, FindGravityWindowCallback,
+            reinterpret_cast<LPARAM>(&result));
+    }
+    return result;
+}
+
+UINT32 RgbFromColorRef(COLORREF color) {
+    return (static_cast<UINT32>(GetRValue(color)) << 16U) |
+           (static_cast<UINT32>(GetGValue(color)) << 8U) |
+           static_cast<UINT32>(GetBValue(color));
+}
+
+std::wstring Utf8ToWide(const std::string& text) {
+    if (text.empty()) {
+        return {};
+    }
+    const int required = MultiByteToWideChar(CP_UTF8, MB_ERR_INVALID_CHARS, text.data(),
+                                              static_cast<int>(text.size()), nullptr, 0);
+    if (required <= 0) {
+        return {};
+    }
+    std::wstring output(static_cast<std::size_t>(required), L'\0');
+    MultiByteToWideChar(CP_UTF8, MB_ERR_INVALID_CHARS, text.data(),
+                        static_cast<int>(text.size()), output.data(), required);
+    return output;
+}
+
+std::string WideToUtf8(const std::wstring& text) {
+    if (text.empty()) {
+        return {};
+    }
+    const int required = WideCharToMultiByte(CP_UTF8, WC_ERR_INVALID_CHARS, text.data(),
+                                              static_cast<int>(text.size()), nullptr, 0,
+                                              nullptr, nullptr);
+    if (required <= 0) {
+        return {};
+    }
+    std::string output(static_cast<std::size_t>(required), '\0');
+    WideCharToMultiByte(CP_UTF8, WC_ERR_INVALID_CHARS, text.data(),
+                        static_cast<int>(text.size()), output.data(), required, nullptr, nullptr);
+    return output;
+}
+
+std::string EscapeJson(const std::wstring& value) {
+    const std::string utf8 = WideToUtf8(value);
+    std::ostringstream output;
+    output << '"';
+    for (const unsigned char ch : utf8) {
+        switch (ch) {
+        case '"':
+            output << "\\\"";
+            break;
+        case '\\':
+            output << "\\\\";
+            break;
+        case '\b':
+            output << "\\b";
+            break;
+        case '\f':
+            output << "\\f";
+            break;
+        case '\n':
+            output << "\\n";
+            break;
+        case '\r':
+            output << "\\r";
+            break;
+        case '\t':
+            output << "\\t";
+            break;
+        default:
+            if (ch < 0x20) {
+                output << "\\u" << std::hex << std::setw(4) << std::setfill('0')
+                       << static_cast<int>(ch) << std::dec;
+            } else {
+                output << static_cast<char>(ch);
+            }
+            break;
+        }
+    }
+    output << '"';
+    return output.str();
+}
+
+class JsonValue {
+public:
+    using Object = std::map<std::string, JsonValue>;
+    using Array = std::vector<JsonValue>;
+    using Storage = std::variant<std::nullptr_t, bool, double, std::string, Object, Array>;
+
+    JsonValue() : value_(nullptr) {}
+    explicit JsonValue(bool value) : value_(value) {}
+    explicit JsonValue(double value) : value_(value) {}
+    explicit JsonValue(std::string value) : value_(std::move(value)) {}
+    explicit JsonValue(Object value) : value_(std::move(value)) {}
+    explicit JsonValue(Array value) : value_(std::move(value)) {}
+
+    const Object* AsObject() const { return std::get_if<Object>(&value_); }
+    const Array* AsArray() const { return std::get_if<Array>(&value_); }
+    const std::string* AsString() const { return std::get_if<std::string>(&value_); }
+    const double* AsNumber() const { return std::get_if<double>(&value_); }
+    const bool* AsBool() const { return std::get_if<bool>(&value_); }
+
+private:
+    Storage value_;
+};
+
+class JsonParser {
+public:
+    explicit JsonParser(const std::string& source) : source_(source) {}
+
+    bool Parse(JsonValue& value) {
+        SkipWhitespace();
+        if (!ParseValue(value)) {
+            return false;
+        }
+        SkipWhitespace();
+        return position_ == source_.size();
+    }
+
+private:
+    bool ParseValue(JsonValue& value) {
+        SkipWhitespace();
+        if (position_ >= source_.size()) {
+            return false;
+        }
+        const char ch = source_[position_];
+        if (ch == '{') {
+            return ParseObject(value);
+        }
+        if (ch == '[') {
+            return ParseArray(value);
+        }
+        if (ch == '"') {
+            std::string stringValue;
+            if (!ParseString(stringValue)) {
+                return false;
+            }
+            value = JsonValue(std::move(stringValue));
+            return true;
+        }
+        if (ch == 't' && ConsumeLiteral("true")) {
+            value = JsonValue(true);
+            return true;
+        }
+        if (ch == 'f' && ConsumeLiteral("false")) {
+            value = JsonValue(false);
+            return true;
+        }
+        if (ch == 'n' && ConsumeLiteral("null")) {
+            value = JsonValue();
+            return true;
+        }
+        return ParseNumber(value);
+    }
+
+    bool ParseObject(JsonValue& value) {
+        if (!Consume('{')) {
+            return false;
+        }
+        JsonValue::Object object;
+        SkipWhitespace();
+        if (Consume('}')) {
+            value = JsonValue(std::move(object));
+            return true;
+        }
+        while (position_ < source_.size()) {
+            std::string key;
+            if (!ParseString(key)) {
+                return false;
+            }
+            SkipWhitespace();
+            if (!Consume(':')) {
+                return false;
+            }
+            JsonValue child;
+            if (!ParseValue(child)) {
+                return false;
+            }
+            object.insert_or_assign(std::move(key), std::move(child));
+            SkipWhitespace();
+            if (Consume('}')) {
+                value = JsonValue(std::move(object));
+                return true;
+            }
+            if (!Consume(',')) {
+                return false;
+            }
+            SkipWhitespace();
+        }
+        return false;
+    }
+
+    bool ParseArray(JsonValue& value) {
+        if (!Consume('[')) {
+            return false;
+        }
+        JsonValue::Array array;
+        SkipWhitespace();
+        if (Consume(']')) {
+            value = JsonValue(std::move(array));
+            return true;
+        }
+        while (position_ < source_.size()) {
+            JsonValue child;
+            if (!ParseValue(child)) {
+                return false;
+            }
+            array.push_back(std::move(child));
+            SkipWhitespace();
+            if (Consume(']')) {
+                value = JsonValue(std::move(array));
+                return true;
+            }
+            if (!Consume(',')) {
+                return false;
+            }
+            SkipWhitespace();
+        }
+        return false;
+    }
+
+    static void AppendUtf8(std::string& output, unsigned int codepoint) {
+        if (codepoint <= 0x7F) {
+            output.push_back(static_cast<char>(codepoint));
+        } else if (codepoint <= 0x7FF) {
+            output.push_back(static_cast<char>(0xC0 | (codepoint >> 6)));
+            output.push_back(static_cast<char>(0x80 | (codepoint & 0x3F)));
+        } else {
+            output.push_back(static_cast<char>(0xE0 | (codepoint >> 12)));
+            output.push_back(static_cast<char>(0x80 | ((codepoint >> 6) & 0x3F)));
+            output.push_back(static_cast<char>(0x80 | (codepoint & 0x3F)));
+        }
+    }
+
+    bool ParseString(std::string& output) {
+        if (!Consume('"')) {
+            return false;
+        }
+        output.clear();
+        while (position_ < source_.size()) {
+            const char ch = source_[position_++];
+            if (ch == '"') {
+                return true;
+            }
+            if (static_cast<unsigned char>(ch) < 0x20) {
+                return false;
+            }
+            if (ch != '\\') {
+                output.push_back(ch);
+                continue;
+            }
+            if (position_ >= source_.size()) {
+                return false;
+            }
+            const char escaped = source_[position_++];
+            switch (escaped) {
+            case '"': output.push_back('"'); break;
+            case '\\': output.push_back('\\'); break;
+            case '/': output.push_back('/'); break;
+            case 'b': output.push_back('\b'); break;
+            case 'f': output.push_back('\f'); break;
+            case 'n': output.push_back('\n'); break;
+            case 'r': output.push_back('\r'); break;
+            case 't': output.push_back('\t'); break;
+            case 'u': {
+                if (position_ + 4 > source_.size()) {
+                    return false;
+                }
+                unsigned int codepoint = 0;
+                for (int i = 0; i < 4; ++i) {
+                    const char hex = source_[position_++];
+                    codepoint <<= 4;
+                    if (hex >= '0' && hex <= '9') {
+                        codepoint += static_cast<unsigned int>(hex - '0');
+                    } else if (hex >= 'a' && hex <= 'f') {
+                        codepoint += static_cast<unsigned int>(hex - 'a' + 10);
+                    } else if (hex >= 'A' && hex <= 'F') {
+                        codepoint += static_cast<unsigned int>(hex - 'A' + 10);
+                    } else {
+                        return false;
+                    }
+                }
+                AppendUtf8(output, codepoint);
+                break;
+            }
+            default:
+                return false;
+            }
+        }
+        return false;
+    }
+
+    bool ParseNumber(JsonValue& value) {
+        const std::size_t start = position_;
+        if (position_ < source_.size() && source_[position_] == '-') {
+            ++position_;
+        }
+        if (position_ >= source_.size()) {
+            return false;
+        }
+        if (source_[position_] == '0') {
+            ++position_;
+        } else {
+            if (source_[position_] < '1' || source_[position_] > '9') {
+                return false;
+            }
+            while (position_ < source_.size() && source_[position_] >= '0' &&
+                   source_[position_] <= '9') {
+                ++position_;
+            }
+        }
+        if (position_ < source_.size() && source_[position_] == '.') {
+            ++position_;
+            if (position_ >= source_.size() || source_[position_] < '0' ||
+                source_[position_] > '9') {
+                return false;
+            }
+            while (position_ < source_.size() && source_[position_] >= '0' &&
+                   source_[position_] <= '9') {
+                ++position_;
+            }
+        }
+        if (position_ < source_.size() &&
+            (source_[position_] == 'e' || source_[position_] == 'E')) {
+            ++position_;
+            if (position_ < source_.size() &&
+                (source_[position_] == '+' || source_[position_] == '-')) {
+                ++position_;
+            }
+            if (position_ >= source_.size() || source_[position_] < '0' ||
+                source_[position_] > '9') {
+                return false;
+            }
+            while (position_ < source_.size() && source_[position_] >= '0' &&
+                   source_[position_] <= '9') {
+                ++position_;
+            }
+        }
+        try {
+            value = JsonValue(std::stod(source_.substr(start, position_ - start)));
+            return true;
+        } catch (...) {
+            return false;
+        }
+    }
+
+    bool Consume(char expected) {
+        if (position_ < source_.size() && source_[position_] == expected) {
+            ++position_;
+            return true;
+        }
+        return false;
+    }
+
+    bool ConsumeLiteral(const char* literal) {
+        const std::size_t length = std::char_traits<char>::length(literal);
+        if (source_.compare(position_, length, literal) != 0) {
+            return false;
+        }
+        position_ += length;
+        return true;
+    }
+
+    void SkipWhitespace() {
+        while (position_ < source_.size()) {
+            const char ch = source_[position_];
+            if (ch != ' ' && ch != '\t' && ch != '\r' && ch != '\n') {
+                break;
+            }
+            ++position_;
+        }
+    }
+
+    const std::string& source_;
+    std::size_t position_ = 0;
+};
+
+const JsonValue* FindMember(const JsonValue::Object& object, const char* name) {
+    const auto iterator = object.find(name);
+    return iterator == object.end() ? nullptr : &iterator->second;
+}
+
+double NumberMember(const JsonValue::Object& object, const char* name, double fallback) {
+    const JsonValue* value = FindMember(object, name);
+    const double* number = value == nullptr ? nullptr : value->AsNumber();
+    return number == nullptr ? fallback : *number;
+}
+
+bool BoolMember(const JsonValue::Object& object, const char* name, bool fallback) {
+    const JsonValue* value = FindMember(object, name);
+    const bool* boolean = value == nullptr ? nullptr : value->AsBool();
+    return boolean == nullptr ? fallback : *boolean;
+}
+
+std::wstring StringMember(const JsonValue::Object& object, const char* name,
+                          const std::wstring& fallback) {
+    const JsonValue* value = FindMember(object, name);
+    const std::string* stringValue = value == nullptr ? nullptr : value->AsString();
+    if (stringValue == nullptr) {
+        return fallback;
+    }
+    const std::wstring wide = Utf8ToWide(*stringValue);
+    return wide.empty() && !stringValue->empty() ? fallback : wide;
+}
+
+struct FileItem {
+    std::uint64_t id = 0;
+    std::wstring path;
+    std::wstring originalName;
+    std::wstring displayName;
+    int slot = -1;
+    int ring = -1;
+    int ringSlot = -1;
+    FileSizeTier sizeTier = FileSizeTier::Normal;
+    bool pinned = false;
+    bool manuallyMoved = false;
+    bool lockedPosition = false;
+    float angleDegrees = -90.0f;
+    float angleOffsetDegrees = 0.0f;
+    float radiusOffset = 0.0f;
+    D2D1_POINT_2F manualOffset = D2D1::Point2F();
+    bool favorite = false;
+    bool inProgress = false;
+    int openCount = 0;
+    std::int64_t lastOpened = 0;
+    std::vector<std::int64_t> recentOpens;
+    bool isDirectory = false;
+    bool missing = false;
+    // Relationship layer: never changes the real file or its path.
+    std::uint64_t parentFileId = 0;
+    float relativeAngle = 90.0f;
+    float relativeRadius = 62.0f;
+    D2D1_POINT_2F relativeManualOffset = D2D1::Point2F();
+    bool relativeManualLock = false;
+    bool childrenCollapsed = false;
+    std::uint64_t familyId = 0;
+    bool detachedFromUpper = false;
+    D2D1_POINT_2F detachedWorldPosition = D2D1::Point2F();
+};
+
+struct FileFamilyMemberSnapshot {
+    std::uint64_t fileId = 0;
+    int slot = -1;
+    int ring = -1;
+    float angle = -90.0f;
+    float radiusOffset = 0.0f;
+    D2D1_POINT_2F manualOffset = D2D1::Point2F();
+    bool locked = false;
+};
+
+struct FileFamily {
+    std::uint64_t id = 0;
+    std::uint64_t coreId = 0;
+    std::uint64_t rootFileId = 0;
+    std::uint64_t currentFileId = 0;
+    bool repairRequired = false;
+    std::vector<FileFamilyMemberSnapshot> snapshots;
+};
+
+// A baseline is user-owned layout data.  It is deliberately separate from the
+// short-lived "restore previous arrange" snapshot: it survives restarts and
+// never changes unless the user explicitly saves a new default layout.
+struct CoreBaselineFileLayout {
+    std::uint64_t fileId = 0;
+    int slot = -1;
+    int ring = -1;
+    int ringSlot = -1;
+    float angleDegrees = -90.0f;
+    float angleOffsetDegrees = 0.0f;
+    float radiusOffset = 0.0f;
+    D2D1_POINT_2F manualOffset = D2D1::Point2F();
+    bool manuallyMoved = false;
+    bool lockedPosition = false;
+};
+
+struct Core {
+    std::uint64_t id = 0;
+    std::wstring name;
+    D2D1_POINT_2F position = D2D1::Point2F();
+    bool expanded = true;
+    int displayLimit = kNormalVisibleLimit;
+    int layoutVersion = kLayoutVersion;
+    float innerRadius = kDefaultRingRadii[0];
+    float middleRadius = kDefaultRingRadii[1];
+    float outerRadius = kDefaultRingRadii[2];
+    float radiusScale = 1.0f;
+    // distanceScale remains only for state-file migration from layout v14.
+    // Ring-specific values below are the authoritative user controls.
+    float distanceScale = 1.0f;
+    float innerDistanceScale = 1.0f;
+    float outerDistanceScale = 1.0f;
+    float rotationAngle = 0.0f;
+    bool userLayoutCustomized = false;
+    std::int64_t userAdjustedAt = 0;
+    float baselineRadiusScale = 1.0f;
+    float baselineInnerDistanceScale = 1.0f;
+    float baselineOuterDistanceScale = 1.0f;
+    float baselineRotationAngle = 0.0f;
+    bool baselineUserLayoutCustomized = false;
+    float baseInnerRadius = kDefaultRingRadii[0];
+    float baseOuterRadius = kDefaultRingRadii[1];
+    // The user's saved default must retain its own immutable radii.  Reusing
+    // the core's current base radii makes "restore my default" depend on the
+    // most recently executed automatic organizer and can pull every node
+    // inward.
+    float baselineBaseInnerRadius = 0.0f;
+    float baselineBaseOuterRadius = 0.0f;
+    std::int64_t baselineCreatedAt = 0;
+    LayoutMode baselineLayoutMode = LayoutMode::Standard;
+    LayoutTemplate baselineLayoutTemplate = LayoutTemplate::AutoCompact;
+    bool baselineLayoutLocked = false;
+    float baselineBaseRotationDegrees = 0.0f;
+    float baselineGrowthDirectionDegrees = 0.0f;
+    std::vector<CoreBaselineFileLayout> savedBaselineLayout;
+    float xRatio = -1.0f;
+    float yRatio = -1.0f;
+    std::wstring monitorId;
+    UINT32 themeColor = 0;
+    bool themeColorCustomized = false;
+    // Appearance stays deliberately separate from every layout coordinate,
+    // slot, radius and collision property.
+    float appearanceCoreScale = 1.0f;
+    ConnectionLineColorMode connectionLineColorMode =
+        ConnectionLineColorMode::FollowCore;
+    UINT32 connectionLineCustomColor = 0x7A8490;
+    CoreIconKind iconKind = CoreIconKind::General;
+    LayoutMode layoutMode = LayoutMode::Standard;
+    LayoutTemplate layoutTemplate = LayoutTemplate::AutoCompact;
+    bool layoutLocked = false;
+    bool archived = false;
+    float baseRotationDegrees = 0.0f;
+    float growthDirectionDegrees = 0.0f;
+    std::vector<FileItem> files;
+};
+
+std::size_t AttachedFileCount(const Core& core) {
+    return static_cast<std::size_t>(std::count_if(
+        core.files.begin(), core.files.end(),
+        [](const FileItem& item) {
+            return !item.detachedFromUpper;
+        }));
+}
+
+bool CoreBodyVisible(const Core& core) {
+    return core.id != kUnclassifiedCoreId ||
+           AttachedFileCount(core) > 0;
+}
+
+struct WorkspaceState {
+    std::uint64_t nextId = 2;
+    D2D1_POINT_2F viewOffset = D2D1::Point2F();
+    float zoom = 1.0f;
+    DensityMode densityMode = DensityMode::Standard;
+    AnimationMode animationMode = AnimationMode::Standard;
+    CoreSelectionEffect coreSelectionEffect = CoreSelectionEffect::GentleRipple;
+    float connectionLineWidth = kConnectionLineWidthStandard;
+    float coreGlowIntensity = 1.0f;
+    // Companion-workspace state. Values are logical workspace settings, not
+    // physical-pixel measurements, so they survive DPI and resolution changes.
+    float workspaceWidthRatio = 0.50f;
+    bool workspaceCollapsed = false;
+    bool workspacePaused = false;
+    bool tutorialCompleted = false;
+    bool firstRunCompleted = false;
+    bool fullScreenWorkMode = false;
+    float backgroundOpacity = 0.52f;
+    float dividerPosition = 0.50f;
+    bool dividerVisible = true;
+    int dividerStyle = 0;
+    D2D1_POINT_2F halfScreenViewOffset = D2D1::Point2F();
+    D2D1_POINT_2F fullScreenViewOffset = D2D1::Point2F();
+    std::vector<Core> cores;
+    std::vector<FileFamily> families;
+};
+
+enum class HitKind {
+    None,
+    Core,
+    Item,
+    More,
+};
+
+struct HitResult {
+    HitKind kind = HitKind::None;
+    std::uint64_t coreId = 0;
+    std::uint64_t itemId = 0;
+
+    bool operator==(const HitResult& other) const {
+        return kind == other.kind && coreId == other.coreId && itemId == other.itemId;
+    }
+    bool operator!=(const HitResult& other) const { return !(*this == other); }
+};
+
+struct ItemLayout {
+    const FileItem* item = nullptr;
+    D2D1_POINT_2F position = D2D1::Point2F();
+    D2D1_RECT_F labelRect = D2D1::RectF();
+    bool showLabel = false;
+    bool isMore = false;
+    int hiddenCount = 0;
+    int ring = 0;
+    bool focusOnly = false;
+    bool isChild = false;
+};
+
+struct FileLayoutSnapshot {
+    int slot = -1;
+    int ring = -1;
+    int ringSlot = -1;
+    float angleDegrees = -90.0f;
+    float angleOffsetDegrees = 0.0f;
+    float radiusOffset = 0.0f;
+    D2D1_POINT_2F manualOffset = D2D1::Point2F();
+    bool manuallyMoved = false;
+    bool lockedPosition = false;
+};
+
+struct CoreLayoutSnapshot {
+    LayoutMode layoutMode = LayoutMode::Standard;
+    LayoutTemplate layoutTemplate = LayoutTemplate::AutoCompact;
+    bool layoutLocked = false;
+    float baseRotationDegrees = 0.0f;
+    float growthDirectionDegrees = 0.0f;
+    float innerDistanceScale = 1.0f;
+    float outerDistanceScale = 1.0f;
+    float rotationAngle = 0.0f;
+    bool userLayoutCustomized = false;
+    std::unordered_map<std::uint64_t, FileLayoutSnapshot> files;
+};
+
+struct InteractionShape {
+    RECT bounds{};
+    bool ellipse = false;
+
+    bool operator==(const InteractionShape& other) const {
+        return bounds.left == other.bounds.left &&
+               bounds.top == other.bounds.top &&
+               bounds.right == other.bounds.right &&
+               bounds.bottom == other.bounds.bottom &&
+               ellipse == other.ellipse;
+    }
+};
+
+class GravityApp;
+LRESULT CALLBACK InteractionWindowProcedure(
+    HWND window, UINT message, WPARAM wParam, LPARAM lParam);
+
+std::wstring Trim(std::wstring text) {
+    const auto isSpace = [](wchar_t ch) { return std::iswspace(ch) != 0; };
+    text.erase(text.begin(), std::find_if_not(text.begin(), text.end(), isSpace));
+    text.erase(std::find_if_not(text.rbegin(), text.rend(), isSpace).base(), text.end());
+    return text;
+}
+
+std::wstring Shorten(const std::wstring& text, std::size_t maximum) {
+    if (text.size() <= maximum) {
+        return text;
+    }
+    if (maximum < 2) {
+        return text.substr(0, maximum);
+    }
+    return text.substr(0, maximum - 1) + L"…";
+}
+
+std::wstring FileDisplayName(const std::wstring& path) {
+    if (path.empty()) {
+        return L"未知文件";
+    }
+    const wchar_t* filename = PathFindFileNameW(path.c_str());
+    if (filename != nullptr && *filename != L'\0') {
+        return filename;
+    }
+    return path;
+}
+
+std::wstring MakeDisplayName(const std::wstring& path, bool isDirectory) {
+    std::wstring title = FileDisplayName(path);
+    if (!isDirectory) {
+        const std::size_t separator = title.find_last_of(L'.');
+        if (separator != std::wstring::npos && separator > 0) {
+            title.resize(separator);
+        }
+    }
+    title = Trim(std::move(title));
+    if (title.empty()) {
+        title = L"未知文件";
+    }
+    return Shorten(title, 12);
+}
+
+int RingForSlot(int slot) {
+    for (int ring = 0; ring < static_cast<int>(kRingCapacities.size()); ++ring) {
+        if (slot >= kRingStarts[ring] &&
+            slot < kRingStarts[ring] + kRingCapacities[ring]) {
+            return ring;
+        }
+    }
+    return -1;
+}
+
+int RingSlotForSlot(int slot) {
+    const int ring = RingForSlot(slot);
+    return ring < 0 ? -1 : slot - kRingStarts[ring];
+}
+
+int GlobalSlot(int ring, int ringSlot) {
+    if (ring < 0 || ring >= static_cast<int>(kRingCapacities.size()) ||
+        ringSlot < 0 || ringSlot >= kRingCapacities[ring]) {
+        return -1;
+    }
+    return kRingStarts[ring] + ringSlot;
+}
+
+float SlotAngleRadians(int ring, int ringSlot, float angleOffsetDegrees = 0.0f) {
+    if (ring < 0 || ring >= static_cast<int>(kRingCapacities.size()) ||
+        kRingCapacities[ring] <= 0) {
+        return -kPi / 2.0f;
+    }
+    const float phase =
+        -kPi / 2.0f -
+        (ring == 0 ? 0.0f
+                   : kPi / static_cast<float>(kRingCapacities[ring]));
+    return phase +
+           2.0f * kPi * static_cast<float>(ringSlot) /
+               static_cast<float>(kRingCapacities[ring]) +
+           angleOffsetDegrees * kPi / 180.0f;
+}
+
+std::array<int, 2> StandardRingCounts(int visibleCount) {
+    visibleCount = std::clamp(visibleCount, 0, kPriorityPlacementSlots);
+    if (visibleCount <= 6) {
+        return {visibleCount, 0};
+    }
+    const int inner = (visibleCount + 1) / 2;
+    return {inner, visibleCount - inner};
+}
+
+float StandardAngleDegrees(int ring, int ringSlot,
+                           int innerCount, int outerCount) {
+    const int count = ring == 0 ? innerCount : outerCount;
+    if (count <= 0) {
+        return -90.0f;
+    }
+    const float offset =
+        ring == 1 && innerCount > 0
+            ? 180.0f / static_cast<float>(innerCount)
+            : 0.0f;
+    return -90.0f + offset +
+           360.0f * static_cast<float>(ringSlot) /
+               static_cast<float>(count);
+}
+
+std::array<int, 2> TemplateRingCounts(LayoutTemplate layout,
+                                      int visibleCount) {
+    visibleCount = std::clamp(visibleCount, 0, kCoreFileCapacity);
+    switch (layout) {
+    case LayoutTemplate::AutoCompact:
+        if (visibleCount <= 6) {
+            return {visibleCount, 0};
+        }
+        if (visibleCount <= 15) {
+            return {std::min(5, visibleCount), visibleCount - 5};
+        }
+        return {6, visibleCount - 6};
+    case LayoutTemplate::CompactDouble:
+        return {std::min(5, visibleCount),
+                std::min(10, std::max(0, visibleCount - 5))};
+    case LayoutTemplate::HighCapacityDouble:
+        return {std::min(6, visibleCount),
+                std::min(12, std::max(0, visibleCount - 6))};
+    case LayoutTemplate::SingleRing:
+        return {std::min(6, visibleCount), 0};
+    default:
+        return {0, 0};
+    }
+}
+
+int TemplateVisibleLimit(LayoutTemplate layout) {
+    switch (layout) {
+    case LayoutTemplate::AutoCompact:
+        return 15;
+    case LayoutTemplate::CompactDouble:
+        return 15;
+    case LayoutTemplate::HighCapacityDouble:
+        return 18;
+    case LayoutTemplate::SingleRing:
+        return 6;
+    default:
+        return 0;
+    }
+}
+
+float TemplateAngleDegrees(LayoutTemplate layout, int ring, int ringSlot,
+                           int innerCount, int outerCount) {
+    if (layout == LayoutTemplate::CompactDouble ||
+        layout == LayoutTemplate::HighCapacityDouble ||
+        layout == LayoutTemplate::AutoCompact) {
+        const int count = ring == 0 ? innerCount : outerCount;
+        if (count <= 0) {
+            return -90.0f;
+        }
+        const float offset = ring == 1 ?
+            180.0f / static_cast<float>(outerCount) : 0.0f;
+        const float spacing = 360.0f / static_cast<float>(count);
+        return -90.0f + offset + spacing * static_cast<float>(ringSlot);
+    }
+    return StandardAngleDegrees(ring, ringSlot, innerCount, outerCount);
+}
+
+int TemplateGlobalSlot(LayoutTemplate layout, int ring, int ringSlot) {
+    if (layout == LayoutTemplate::CompactDouble && ring == 0 &&
+        ringSlot >= 5) {
+        return -1;
+    }
+    return GlobalSlot(ring, ringSlot);
+}
+
+float NormalizeDegrees(float degrees) {
+    degrees = std::fmod(degrees, 360.0f);
+    return degrees < 0.0f ? degrees + 360.0f : degrees;
+}
+
+std::uint64_t StableHash(std::uint64_t id, const std::wstring& path) {
+    std::uint64_t hash = 1469598103934665603ULL ^ id;
+    for (const wchar_t ch : path) {
+        hash ^= static_cast<std::uint64_t>(std::towlower(ch));
+        hash *= 1099511628211ULL;
+    }
+    return hash;
+}
+
+void GenerateStableOffsets(FileItem& item) {
+    const std::uint64_t hash = StableHash(item.id, item.path);
+    item.angleOffsetDegrees =
+        -5.0f + static_cast<float>(hash % 1001ULL) / 1000.0f * 10.0f;
+    item.radiusOffset =
+        -8.0f + static_cast<float>((hash >> 12) % 1001ULL) / 1000.0f * 16.0f;
+}
+
+float TierIconPixels(FileSizeTier tier) {
+    switch (tier) {
+    case FileSizeTier::Important:
+        return 56.0f;
+    case FileSizeTier::Minor:
+        return 40.0f;
+    default:
+        return 48.0f;
+    }
+}
+
+float TierContainerPixels(FileSizeTier tier) {
+    switch (tier) {
+    case FileSizeTier::Important:
+        return 68.0f;
+    case FileSizeTier::Minor:
+        return 52.0f;
+    default:
+        return 60.0f;
+    }
+}
+
+D2D1_SIZE_F TierFootprintPixels(FileSizeTier tier) {
+    switch (tier) {
+    case FileSizeTier::Important:
+        return D2D1::SizeF(104.0f, 112.0f);
+    case FileSizeTier::Minor:
+        return D2D1::SizeF(84.0f, 92.0f);
+    default:
+        return D2D1::SizeF(96.0f, 104.0f);
+    }
+}
+
+bool PathEquals(const std::wstring& first, const std::wstring& second) {
+    return CompareStringOrdinal(first.c_str(), -1, second.c_str(), -1, TRUE) == CSTR_EQUAL;
+}
+
+std::wstring NormalizePath(const std::wstring& path) {
+    const DWORD required = GetFullPathNameW(path.c_str(), 0, nullptr, nullptr);
+    if (required == 0) {
+        return path;
+    }
+    std::wstring normalized(static_cast<std::size_t>(required), L'\0');
+    const DWORD written = GetFullPathNameW(path.c_str(), required, normalized.data(), nullptr);
+    if (written == 0 || written >= required) {
+        return path;
+    }
+    normalized.resize(written);
+    return normalized;
+}
+
+std::int64_t UnixTimeNow() {
+    return std::chrono::duration_cast<std::chrono::seconds>(
+               std::chrono::system_clock::now().time_since_epoch())
+        .count();
+}
+
+std::wstring FormatTimestamp(std::int64_t timestamp) {
+    if (timestamp <= 0) {
+        return L"从未使用";
+    }
+    const std::time_t value = static_cast<std::time_t>(timestamp);
+    std::tm local{};
+    if (localtime_s(&local, &value) != 0) {
+        return L"时间未知";
+    }
+    wchar_t buffer[64]{};
+    if (wcsftime(buffer, std::size(buffer), L"%Y-%m-%d %H:%M", &local) == 0) {
+        return L"时间未知";
+    }
+    return buffer;
+}
+
+std::optional<std::string> ReadUtf8File(const std::filesystem::path& path) {
+    std::ifstream stream(path, std::ios::binary);
+    if (!stream) {
+        return std::nullopt;
+    }
+    return std::string(std::istreambuf_iterator<char>(stream), std::istreambuf_iterator<char>());
+}
+
+bool WriteUtf8Atomic(const std::filesystem::path& target, const std::string& data) {
+    std::error_code error;
+    std::filesystem::create_directories(target.parent_path(), error);
+    if (error) {
+        return false;
+    }
+
+    const std::filesystem::path temporary = target.wstring() + L".tmp";
+    const std::filesystem::path backup = target.wstring() + L".bak";
+    HANDLE file = CreateFileW(temporary.c_str(), GENERIC_WRITE, 0, nullptr, CREATE_ALWAYS,
+                              FILE_ATTRIBUTE_NORMAL | FILE_FLAG_WRITE_THROUGH, nullptr);
+    if (file == INVALID_HANDLE_VALUE) {
+        return false;
+    }
+
+    DWORD written = 0;
+    const bool writeSucceeded =
+        data.size() <= MAXDWORD &&
+        WriteFile(file, data.data(), static_cast<DWORD>(data.size()), &written, nullptr) != FALSE &&
+        written == data.size() && FlushFileBuffers(file) != FALSE;
+    CloseHandle(file);
+    if (!writeSucceeded) {
+        DeleteFileW(temporary.c_str());
+        return false;
+    }
+
+    if (GetFileAttributesW(target.c_str()) != INVALID_FILE_ATTRIBUTES) {
+        if (ReplaceFileW(target.c_str(), temporary.c_str(), backup.c_str(),
+                         REPLACEFILE_WRITE_THROUGH, nullptr, nullptr) != FALSE) {
+            return true;
+        }
+    }
+
+    if (MoveFileExW(temporary.c_str(), target.c_str(),
+                    MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH) != FALSE) {
+        return true;
+    }
+    DeleteFileW(temporary.c_str());
+    return false;
+}
+
+template <typename WriteOperation>
+bool CommitImportedStateWrite(bool& recoveryBlocked,
+                              WriteOperation&& writeOperation) {
+    const bool recoveryWasBlocked = recoveryBlocked;
+    if (!std::forward<WriteOperation>(writeOperation)()) {
+        recoveryBlocked = recoveryWasBlocked;
+        return false;
+    }
+    recoveryBlocked = false;
+    return true;
+}
+
+std::filesystem::path StateFilePath() {
+    const DWORD overrideLength =
+        GetEnvironmentVariableW(L"GRAVITY_DESKTOP_STATE_FILE", nullptr, 0);
+    if (overrideLength > 1) {
+        std::wstring overridePath(static_cast<std::size_t>(overrideLength),
+                                  L'\0');
+        const DWORD written = GetEnvironmentVariableW(
+            L"GRAVITY_DESKTOP_STATE_FILE", overridePath.data(),
+            overrideLength);
+        if (written > 0 && written < overrideLength) {
+            overridePath.resize(written);
+            return std::filesystem::path(overridePath);
+        }
+    }
+    PWSTR localAppData = nullptr;
+    if (FAILED(SHGetKnownFolderPath(FOLDERID_LocalAppData, KF_FLAG_DEFAULT, nullptr,
+                                    &localAppData))) {
+        return std::filesystem::current_path() / L"state.json";
+    }
+    std::filesystem::path path(localAppData);
+    CoTaskMemFree(localAppData);
+    return path / L"GravityDesktop" / L"state.json";
+}
+
+std::wstring BackupTimestamp() {
+    SYSTEMTIME time{};
+    GetLocalTime(&time);
+    wchar_t value[48]{};
+    swprintf_s(value, L"%04u%02u%02u-%02u%02u%02u-%03u",
+              time.wYear, time.wMonth, time.wDay, time.wHour, time.wMinute,
+              time.wSecond, time.wMilliseconds);
+    return value;
+}
+
+std::string SerializeState(const WorkspaceState& state) {
+    std::ostringstream output;
+    output.imbue(std::locale::classic());
+    output << std::setprecision(9);
+    output << "{\n"
+           << "  \"schemaVersion\": 15,\n"
+           << "  \"schema_version\": 15,\n"
+           << "  \"version\": 15,\n"
+           << "  \"next_id\": " << state.nextId << ",\n"
+           << "  \"view\": {\"x\": " << state.viewOffset.x << ", \"y\": "
+           << state.viewOffset.y << ", \"zoom\": " << state.zoom << "},\n"
+           << "  \"settings\": {\"density\": "
+           << static_cast<int>(state.densityMode) << ", \"animation\": "
+           << static_cast<int>(state.animationMode)
+           << ", \"core_selection_effect\": "
+           << static_cast<int>(state.coreSelectionEffect)
+           << ", \"connection_line_width\": "
+           << state.connectionLineWidth
+           << ", \"core_glow_intensity\": "
+           << state.coreGlowIntensity
+           << ", \"workspace_width_ratio\": " << state.workspaceWidthRatio
+           << ", \"workspace_ratio\": " << state.workspaceWidthRatio
+           << ", \"divider_position\": " << state.dividerPosition
+           << ", \"divider_visible\": "
+           << (state.dividerVisible ? "true" : "false")
+           << ", \"divider_style\": " << state.dividerStyle
+           << ", \"workspace_collapsed\": "
+           << (state.workspaceCollapsed ? "true" : "false")
+           << ", \"workspace_paused\": "
+           << (state.workspacePaused ? "true" : "false")
+           << ", \"tutorial_completed\": "
+           << (state.tutorialCompleted ? "true" : "false")
+           << ", \"first_run_completed\": "
+           << (state.firstRunCompleted ? "true" : "false")
+           << ", \"full_screen_work_mode\": "
+           << (state.fullScreenWorkMode ? "true" : "false")
+           << ", \"background_opacity\": " << state.backgroundOpacity
+           << ", \"half_view_x\": " << state.halfScreenViewOffset.x
+           << ", \"half_view_y\": " << state.halfScreenViewOffset.y
+           << ", \"full_view_x\": " << state.fullScreenViewOffset.x
+           << ", \"full_view_y\": " << state.fullScreenViewOffset.y << "},\n"
+           << "  \"cores\": [\n";
+    for (std::size_t coreIndex = 0; coreIndex < state.cores.size(); ++coreIndex) {
+        const Core& core = state.cores[coreIndex];
+        output << "    {\"id\": " << core.id << ", \"name\": " << EscapeJson(core.name)
+               << ", \"x\": " << core.position.x << ", \"y\": " << core.position.y
+               << ", \"expanded\": " << (core.expanded ? "true" : "false")
+               << ", \"display_limit\": " << core.displayLimit
+               << ", \"layout_version\": " << core.layoutVersion
+               << ", \"x_ratio\": " << core.xRatio
+               << ", \"y_ratio\": " << core.yRatio
+               << ", \"monitor_id\": " << EscapeJson(core.monitorId)
+               << ", \"radius_scale\": " << core.radiusScale
+               << ", \"distance_scale\": " << core.distanceScale
+               << ", \"inner_distance_scale\": " << core.innerDistanceScale
+               << ", \"outer_distance_scale\": " << core.outerDistanceScale
+               << ", \"rotation_angle\": " << core.rotationAngle
+               << ", \"user_layout_customized\": "
+               << (core.userLayoutCustomized ? "true" : "false")
+               << ", \"user_adjusted_at\": " << core.userAdjustedAt
+               << ", \"baseline_radius_scale\": " << core.baselineRadiusScale
+               << ", \"baseline_inner_distance_scale\": "
+               << core.baselineInnerDistanceScale
+               << ", \"baseline_outer_distance_scale\": "
+               << core.baselineOuterDistanceScale
+               << ", \"baseline_rotation_angle\": "
+               << core.baselineRotationAngle
+               << ", \"baseline_user_layout_customized\": "
+               << (core.baselineUserLayoutCustomized ? "true" : "false")
+               << ", \"base_inner_radius\": " << core.baseInnerRadius
+               << ", \"base_outer_radius\": " << core.baseOuterRadius
+               << ", \"baseline_base_inner_radius\": "
+               << core.baselineBaseInnerRadius
+               << ", \"baseline_base_outer_radius\": "
+               << core.baselineBaseOuterRadius
+               << ", \"baseline_created_at\": " << core.baselineCreatedAt
+               << ", \"inner_radius\": " << core.innerRadius
+               << ", \"middle_radius\": " << core.middleRadius
+               << ", \"outer_radius\": " << core.outerRadius
+               << ", \"theme_color\": " << core.themeColor
+               << ", \"theme_color_customized\": "
+               << (core.themeColorCustomized ? "true" : "false")
+               << ", \"appearance\": {\"color\": " << core.themeColor
+               << ", \"core_scale\": " << core.appearanceCoreScale
+               << ", \"connection_line_color_mode\": "
+               << static_cast<int>(core.connectionLineColorMode)
+               << ", \"connection_line_custom_color\": "
+               << core.connectionLineCustomColor
+               << "}"
+               << ", \"icon_kind\": " << static_cast<int>(core.iconKind)
+               << ", \"layout_mode\": "
+               << static_cast<int>(core.layoutMode)
+               << ", \"layout_template\": "
+               << static_cast<int>(core.layoutTemplate)
+               << ", \"layout_locked\": "
+               << (core.layoutLocked ? "true" : "false")
+               << ", \"archived\": " << (core.archived ? "true" : "false")
+               << ", \"base_rotation\": "
+               << core.baseRotationDegrees
+               << ", \"growth_direction\": "
+               << core.growthDirectionDegrees
+               << ", \"baseline_layout_mode\": "
+               << static_cast<int>(core.baselineLayoutMode)
+               << ", \"baseline_layout_template\": "
+               << static_cast<int>(core.baselineLayoutTemplate)
+               << ", \"baseline_layout_locked\": "
+               << (core.baselineLayoutLocked ? "true" : "false")
+               << ", \"baseline_base_rotation\": "
+               << core.baselineBaseRotationDegrees
+               << ", \"baseline_growth_direction\": "
+               << core.baselineGrowthDirectionDegrees
+               << ", \"saved_baseline_layout\": [";
+        for (std::size_t baselineIndex = 0;
+             baselineIndex < core.savedBaselineLayout.size(); ++baselineIndex) {
+            const CoreBaselineFileLayout& baseline =
+                core.savedBaselineLayout[baselineIndex];
+            output << "{\"file_id\": " << baseline.fileId
+                   << ", \"slot\": " << baseline.slot
+                   << ", \"ring\": " << baseline.ring
+                   << ", \"ring_slot\": " << baseline.ringSlot
+                   << ", \"angle\": " << baseline.angleDegrees
+                   << ", \"angle_offset\": " << baseline.angleOffsetDegrees
+                   << ", \"radius_offset\": " << baseline.radiusOffset
+                   << ", \"manual_x\": " << baseline.manualOffset.x
+                   << ", \"manual_y\": " << baseline.manualOffset.y
+                   << ", \"manually_moved\": "
+                   << (baseline.manuallyMoved ? "true" : "false")
+                   << ", \"locked_position\": "
+                   << (baseline.lockedPosition ? "true" : "false") << "}";
+            if (baselineIndex + 1 < core.savedBaselineLayout.size()) {
+                output << ", ";
+            }
+        }
+        output << "]"
+               << ", \"files\": [";
+        if (!core.files.empty()) {
+            output << '\n';
+        }
+        for (std::size_t itemIndex = 0; itemIndex < core.files.size(); ++itemIndex) {
+            const FileItem& item = core.files[itemIndex];
+            output << "      {\"id\": " << item.id << ", \"path\": " << EscapeJson(item.path)
+                   << ", \"original_name\": " << EscapeJson(item.originalName)
+                   << ", \"display_name\": " << EscapeJson(item.displayName)
+                   << ", \"slot\": " << item.slot << ", \"ring\": " << item.ring
+                   << ", \"ring_slot\": " << item.ringSlot
+                   << ", \"size_tier\": " << static_cast<int>(item.sizeTier)
+                   << ", \"pinned\": " << (item.pinned ? "true" : "false")
+                   << ", \"manually_moved\": "
+                   << (item.manuallyMoved ? "true" : "false")
+                   << ", \"locked_position\": "
+                   << (item.lockedPosition ? "true" : "false")
+                   << ", \"angle\": " << item.angleDegrees
+                   << ", \"angle_offset\": " << item.angleOffsetDegrees
+                   << ", \"radius_offset\": " << item.radiusOffset
+                   << ", \"manual_x\": " << item.manualOffset.x
+                   << ", \"manual_y\": " << item.manualOffset.y
+                   << ", \"favorite\": "
+                   << (item.favorite ? "true" : "false") << ", \"in_progress\": "
+                   << (item.inProgress ? "true" : "false") << ", \"open_count\": "
+                   << item.openCount << ", \"last_opened\": " << item.lastOpened
+                   << ", \"is_directory\": " << (item.isDirectory ? "true" : "false")
+                   << ", \"missing\": " << (item.missing ? "true" : "false")
+                   << ", \"parent_file_id\": " << item.parentFileId
+                   << ", \"relative_angle\": " << item.relativeAngle
+                   << ", \"relative_radius\": " << item.relativeRadius
+                   << ", \"relative_manual_x\": " << item.relativeManualOffset.x
+                   << ", \"relative_manual_y\": " << item.relativeManualOffset.y
+                   << ", \"relative_manual_lock\": "
+                   << (item.relativeManualLock ? "true" : "false")
+                   << ", \"children_collapsed\": "
+                   << (item.childrenCollapsed ? "true" : "false")
+                   << ", \"family_id\": " << item.familyId
+                   << ", \"detached_from_upper\": "
+                   << (item.detachedFromUpper ? "true" : "false")
+                   << ", \"detached_x\": " << item.detachedWorldPosition.x
+                   << ", \"detached_y\": " << item.detachedWorldPosition.y
+                   << ", \"recent_opens\": [";
+            for (std::size_t openIndex = 0; openIndex < item.recentOpens.size(); ++openIndex) {
+                output << item.recentOpens[openIndex];
+                if (openIndex + 1 < item.recentOpens.size()) {
+                    output << ", ";
+                }
+            }
+            output << "]}";
+            if (itemIndex + 1 < core.files.size()) {
+                output << ',';
+            }
+            output << '\n';
+        }
+        output << "    ]}";
+        if (coreIndex + 1 < state.cores.size()) {
+            output << ',';
+        }
+        output << '\n';
+    }
+    output << "  ],\n  \"families\": [";
+    for (std::size_t index = 0; index < state.families.size(); ++index) {
+        const FileFamily& family = state.families[index];
+        output << "{\"id\": " << family.id << ", \"core_id\": " << family.coreId
+               << ", \"root_file_id\": " << family.rootFileId
+               << ", \"current_file_id\": " << family.currentFileId
+               << ", \"repair_required\": "
+               << (family.repairRequired ? "true" : "false") << "}";
+        if (index + 1 < state.families.size()) output << ", ";
+    }
+    output << "]\n}\n";
+    return output.str();
+}
+
+int FindFreeSlot(const Core& core) {
+    std::set<int> occupied;
+    for (const FileItem& item : core.files) {
+        if (item.slot >= 0) {
+            occupied.insert(item.slot);
+        }
+    }
+    int slot = 0;
+    while (slot < kPriorityPlacementSlots && occupied.contains(slot)) {
+        ++slot;
+    }
+    return slot < kPriorityPlacementSlots ? slot : -1;
+}
+
+int NormalizeDisplayLimit(int value) {
+    (void)value;
+    return kNormalVisibleLimit;
+}
+
+bool DeserializeState(const std::string& json, WorkspaceState& state) {
+    JsonValue rootValue;
+    JsonParser parser(json);
+    if (!parser.Parse(rootValue)) {
+        return false;
+    }
+    const JsonValue::Object* root = rootValue.AsObject();
+    if (root == nullptr) {
+        return false;
+    }
+    const JsonValue* coresValue = FindMember(*root, "cores");
+    const JsonValue::Array* coreArray = coresValue == nullptr ? nullptr : coresValue->AsArray();
+    if (coreArray == nullptr) {
+        return false;
+    }
+
+    WorkspaceState loaded;
+    const int documentVersion = static_cast<int>(NumberMember(
+        *root, "schemaVersion", NumberMember(
+            *root, "schema_version", NumberMember(*root, "version", 1.0))));
+    // Existing users already completed the pre-tutorial product. Only a fresh
+    // v11 state should auto-open the three-step introduction.
+    loaded.tutorialCompleted = documentVersion < 11;
+    loaded.firstRunCompleted = documentVersion < 12;
+    loaded.nextId = static_cast<std::uint64_t>(
+        std::max(2.0, NumberMember(*root, "next_id", 2.0)));
+    if (const JsonValue* viewValue = FindMember(*root, "view")) {
+        if (const JsonValue::Object* view = viewValue->AsObject()) {
+            loaded.viewOffset.x = static_cast<float>(NumberMember(*view, "x", 0.0));
+            loaded.viewOffset.y = static_cast<float>(NumberMember(*view, "y", 0.0));
+            loaded.zoom = std::clamp(static_cast<float>(NumberMember(*view, "zoom", 1.0)),
+                                     0.75f, 1.5f);
+        }
+    }
+    if (const JsonValue* settingsValue = FindMember(*root, "settings")) {
+        if (const JsonValue::Object* settings = settingsValue->AsObject()) {
+            loaded.densityMode = static_cast<DensityMode>(std::clamp(
+                static_cast<int>(NumberMember(*settings, "density", 1.0)),
+                0, 2));
+            loaded.animationMode = static_cast<AnimationMode>(std::clamp(
+                static_cast<int>(NumberMember(*settings, "animation", 2.0)),
+                0, 3));
+            loaded.coreSelectionEffect = static_cast<CoreSelectionEffect>(
+                std::clamp(static_cast<int>(NumberMember(
+                               *settings, "core_selection_effect", 0.0)),
+                           0, 2));
+            loaded.connectionLineWidth = std::clamp(
+                static_cast<float>(NumberMember(
+                    *settings, "connection_line_width",
+                    kConnectionLineWidthStandard)),
+                0.70f, 2.50f);
+            loaded.coreGlowIntensity = std::clamp(
+                static_cast<float>(NumberMember(
+                    *settings, "core_glow_intensity", 1.0)),
+                0.30f, 1.60f);
+            loaded.workspaceWidthRatio = std::clamp(static_cast<float>(
+                NumberMember(*settings, "workspace_ratio",
+                    NumberMember(*settings, "workspace_width_ratio",
+                        NumberMember(*settings, "divider_position", 0.50)))),
+                0.30f, 0.70f);
+            loaded.dividerPosition = loaded.workspaceWidthRatio;
+            loaded.dividerVisible = BoolMember(*settings, "divider_visible", true);
+            loaded.dividerStyle = std::clamp(static_cast<int>(
+                NumberMember(*settings, "divider_style", 0.0)), 0, 1);
+            loaded.workspaceCollapsed = BoolMember(*settings,
+                "workspace_collapsed", false);
+            loaded.workspacePaused = BoolMember(*settings,
+                "workspace_paused", false);
+            loaded.tutorialCompleted = BoolMember(*settings,
+                "tutorial_completed", documentVersion < 11);
+            loaded.firstRunCompleted = BoolMember(*settings,
+                "first_run_completed", loaded.tutorialCompleted || documentVersion < 12);
+            loaded.fullScreenWorkMode = BoolMember(*settings,
+                "full_screen_work_mode", false);
+            loaded.backgroundOpacity = std::clamp(static_cast<float>(
+                NumberMember(*settings, "background_opacity", 0.52)), 0.14f, 0.72f);
+            loaded.halfScreenViewOffset = D2D1::Point2F(
+                static_cast<float>(NumberMember(*settings, "half_view_x", 0.0)),
+                static_cast<float>(NumberMember(*settings, "half_view_y", 0.0)));
+            loaded.fullScreenViewOffset = D2D1::Point2F(
+                static_cast<float>(NumberMember(*settings, "full_view_x", 0.0)),
+                static_cast<float>(NumberMember(*settings, "full_view_y", 0.0)));
+        }
+    }
+
+    std::set<std::uint64_t> ids;
+    std::set<std::wstring> managedPaths;
+    std::uint64_t maximumId = 1;
+    for (const JsonValue& coreValue : *coreArray) {
+        const JsonValue::Object* object = coreValue.AsObject();
+        if (object == nullptr) {
+            continue;
+        }
+        Core core;
+        core.id = static_cast<std::uint64_t>(NumberMember(*object, "id", 0.0));
+        if (core.id == 0 || ids.contains(core.id)) {
+            continue;
+        }
+        ids.insert(core.id);
+        maximumId = std::max(maximumId, core.id);
+        core.name = StringMember(*object, "name", L"核心");
+        core.position.x = static_cast<float>(NumberMember(*object, "x", 360.0));
+        core.position.y = static_cast<float>(NumberMember(*object, "y", 300.0));
+        core.expanded = BoolMember(*object, "expanded", true);
+        core.displayLimit = NormalizeDisplayLimit(
+            static_cast<int>(NumberMember(*object, "display_limit", 16.0)));
+        core.layoutVersion = static_cast<int>(
+            NumberMember(*object, "layout_version",
+                         documentVersion >= 9
+                             ? static_cast<double>(kLayoutVersion)
+                             : (documentVersion >= 2
+                                    ? static_cast<double>(documentVersion)
+                                    : 1.0)));
+        core.xRatio = std::clamp(
+            static_cast<float>(NumberMember(*object, "x_ratio", -1.0)),
+            -1.0f, 1.0f);
+        core.yRatio = std::clamp(
+            static_cast<float>(NumberMember(*object, "y_ratio", -1.0)),
+            -1.0f, 1.0f);
+        core.monitorId = StringMember(*object, "monitor_id", L"");
+        if (documentVersion >= 5) {
+            core.radiusScale = std::clamp(
+                static_cast<float>(
+                    NumberMember(*object, "radius_scale", 1.0)),
+                0.75f, 1.5f);
+        } else {
+            const float legacyInner = static_cast<float>(
+                NumberMember(*object, "inner_radius", 78.0));
+            const float legacyOuter = static_cast<float>(
+                NumberMember(*object, "outer_radius", 142.0));
+            core.radiusScale = std::clamp(
+                (legacyInner / 78.0f + legacyOuter / 142.0f) * 0.5f,
+                0.75f, 1.5f);
+        }
+        core.innerRadius = std::clamp(
+            static_cast<float>(NumberMember(
+                *object, "inner_radius",
+                kDefaultRingRadii[0] * core.radiusScale)),
+            60.0f, 320.0f);
+        core.middleRadius = std::clamp(
+            static_cast<float>(NumberMember(
+                *object, "middle_radius",
+                kDefaultRingRadii[1] * core.radiusScale)),
+            core.innerRadius + 36.0f, 420.0f);
+        core.outerRadius = std::clamp(
+            static_cast<float>(NumberMember(
+                *object, "outer_radius",
+                kDefaultRingRadii[2] * core.radiusScale)),
+            core.middleRadius + 36.0f, 560.0f);
+        core.distanceScale = std::clamp(static_cast<float>(
+            NumberMember(*object, "distance_scale", 1.0)), 0.55f, 1.60f);
+        // v14 had a single scale.  Migrate it symmetrically so an existing
+        // user adjustment remains visible rather than being reset by v15.
+        core.innerDistanceScale = std::clamp(static_cast<float>(
+            NumberMember(*object, "inner_distance_scale", core.distanceScale)),
+            0.60f, 1.40f);
+        core.outerDistanceScale = std::clamp(static_cast<float>(
+            NumberMember(*object, "outer_distance_scale", core.distanceScale)),
+            0.70f, 1.60f);
+        core.rotationAngle = NormalizeDegrees(static_cast<float>(
+            NumberMember(*object, "rotation_angle", 0.0)));
+        core.userLayoutCustomized = BoolMember(*object,
+            "user_layout_customized",
+            std::abs(core.distanceScale - 1.0f) > 0.0001f ||
+            std::abs(core.rotationAngle) > 0.0001f);
+        core.userAdjustedAt = static_cast<std::int64_t>(
+            NumberMember(*object, "user_adjusted_at", 0.0));
+        core.baselineRadiusScale = std::clamp(static_cast<float>(
+            NumberMember(*object, "baseline_radius_scale", 1.0)), 0.35f, 3.00f);
+        core.baselineInnerDistanceScale = std::clamp(static_cast<float>(
+            NumberMember(*object, "baseline_inner_distance_scale",
+                         core.innerDistanceScale)), 0.60f, 1.40f);
+        core.baselineOuterDistanceScale = std::clamp(static_cast<float>(
+            NumberMember(*object, "baseline_outer_distance_scale",
+                         core.outerDistanceScale)), 0.70f, 1.60f);
+        core.baselineRotationAngle = NormalizeDegrees(static_cast<float>(
+            NumberMember(*object, "baseline_rotation_angle",
+                         core.rotationAngle)));
+        core.baselineUserLayoutCustomized = BoolMember(*object,
+            "baseline_user_layout_customized", core.userLayoutCustomized);
+        core.baseInnerRadius = std::clamp(static_cast<float>(
+            NumberMember(*object, "base_inner_radius", core.innerRadius)),
+            30.0f, 640.0f);
+        core.baseOuterRadius = std::clamp(static_cast<float>(
+            NumberMember(*object, "base_outer_radius", core.outerRadius)),
+            core.baseInnerRadius + 20.0f, 960.0f);
+        core.baselineBaseInnerRadius = static_cast<float>(
+            NumberMember(*object, "baseline_base_inner_radius", 0.0));
+        core.baselineBaseOuterRadius = static_cast<float>(
+            NumberMember(*object, "baseline_base_outer_radius", 0.0));
+        if (core.baselineBaseInnerRadius > 0.0f) {
+            core.baselineBaseInnerRadius = std::clamp(
+                core.baselineBaseInnerRadius, 30.0f, 640.0f);
+        }
+        if (core.baselineBaseOuterRadius > 0.0f) {
+            core.baselineBaseOuterRadius = std::clamp(
+                core.baselineBaseOuterRadius,
+                std::max(50.0f, core.baselineBaseInnerRadius + 20.0f),
+                960.0f);
+        }
+        core.baselineCreatedAt = static_cast<std::int64_t>(
+            NumberMember(*object, "baseline_created_at", 0.0));
+        core.themeColor = static_cast<UINT32>(
+            std::max(0.0, NumberMember(*object, "theme_color", 0.0)));
+        core.themeColorCustomized = BoolMember(*object,
+            "theme_color_customized", false);
+        if (const JsonValue* appearanceValue = FindMember(*object, "appearance")) {
+            if (const JsonValue::Object* appearance = appearanceValue->AsObject()) {
+                core.themeColor = static_cast<UINT32>(std::max(0.0,
+                    NumberMember(*appearance, "color", core.themeColor)));
+                core.appearanceCoreScale = std::clamp(static_cast<float>(
+                    NumberMember(*appearance, "core_scale", 1.0)), 0.80f, 1.20f);
+                core.connectionLineColorMode =
+                    static_cast<ConnectionLineColorMode>(std::clamp(
+                        static_cast<int>(NumberMember(
+                            *appearance, "connection_line_color_mode", 0.0)),
+                        0, 3));
+                core.connectionLineCustomColor = static_cast<UINT32>(
+                    std::max(0.0, NumberMember(
+                        *appearance, "connection_line_custom_color",
+                        0x7A8490)));
+            }
+        }
+        core.iconKind = static_cast<CoreIconKind>(std::clamp(
+            static_cast<int>(NumberMember(*object, "icon_kind", 0.0)), 0, 5));
+        core.layoutMode = static_cast<LayoutMode>(std::clamp(
+            static_cast<int>(
+                NumberMember(*object, "layout_mode", 0.0)),
+            0, 3));
+        const int storedTemplate = static_cast<int>(
+            NumberMember(*object, "layout_template", 0.0));
+        if (documentVersion <= 8) {
+            core.layoutTemplate =
+                storedTemplate == 1 ? LayoutTemplate::CompactDouble
+                : storedTemplate == 2 ? LayoutTemplate::SingleRing
+                                      : LayoutTemplate::AutoCompact;
+        } else {
+            core.layoutTemplate = static_cast<LayoutTemplate>(
+                std::clamp(storedTemplate, 0, 3));
+        }
+        core.layoutLocked =
+            BoolMember(*object, "layout_locked", false);
+        core.archived = BoolMember(*object, "archived", false);
+        core.baseRotationDegrees = NormalizeDegrees(
+            static_cast<float>(
+                NumberMember(*object, "base_rotation", 0.0)));
+        core.growthDirectionDegrees = NormalizeDegrees(
+            static_cast<float>(
+                NumberMember(*object, "growth_direction", 0.0)));
+        core.baselineLayoutMode = static_cast<LayoutMode>(std::clamp(
+            static_cast<int>(NumberMember(*object, "baseline_layout_mode",
+                                           static_cast<int>(core.layoutMode))),
+            0, 3));
+        core.baselineLayoutTemplate = static_cast<LayoutTemplate>(std::clamp(
+            static_cast<int>(NumberMember(*object, "baseline_layout_template",
+                                           static_cast<int>(core.layoutTemplate))),
+            0, 3));
+        core.baselineLayoutLocked = BoolMember(*object,
+            "baseline_layout_locked", core.layoutLocked);
+        core.baselineBaseRotationDegrees = NormalizeDegrees(static_cast<float>(
+            NumberMember(*object, "baseline_base_rotation",
+                         core.baseRotationDegrees)));
+        core.baselineGrowthDirectionDegrees = NormalizeDegrees(static_cast<float>(
+            NumberMember(*object, "baseline_growth_direction",
+                         core.growthDirectionDegrees)));
+        if (const JsonValue* baselineValue =
+                FindMember(*object, "saved_baseline_layout")) {
+            if (const JsonValue::Array* baselineArray = baselineValue->AsArray()) {
+                std::set<std::uint64_t> baselineIds;
+                for (const JsonValue& baselineEntry : *baselineArray) {
+                    const JsonValue::Object* baseline = baselineEntry.AsObject();
+                    if (baseline == nullptr) continue;
+                    CoreBaselineFileLayout saved;
+                    saved.fileId = static_cast<std::uint64_t>(
+                        NumberMember(*baseline, "file_id", 0.0));
+                    if (saved.fileId == 0 || baselineIds.contains(saved.fileId)) {
+                        continue;
+                    }
+                    baselineIds.insert(saved.fileId);
+                    saved.slot = static_cast<int>(
+                        NumberMember(*baseline, "slot", -1.0));
+                    saved.ring = static_cast<int>(
+                        NumberMember(*baseline, "ring", -1.0));
+                    saved.ringSlot = static_cast<int>(
+                        NumberMember(*baseline, "ring_slot", -1.0));
+                    saved.angleDegrees = NormalizeDegrees(static_cast<float>(
+                        NumberMember(*baseline, "angle", -90.0)));
+                    saved.angleOffsetDegrees = std::clamp(static_cast<float>(
+                        NumberMember(*baseline, "angle_offset", 0.0)),
+                        -180.0f, 180.0f);
+                    saved.radiusOffset = std::clamp(static_cast<float>(
+                        NumberMember(*baseline, "radius_offset", 0.0)),
+                        -2000.0f, 2000.0f);
+                    saved.manualOffset = D2D1::Point2F(
+                        std::clamp(static_cast<float>(
+                            NumberMember(*baseline, "manual_x", 0.0)),
+                            -2000.0f, 2000.0f),
+                        std::clamp(static_cast<float>(
+                            NumberMember(*baseline, "manual_y", 0.0)),
+                            -2000.0f, 2000.0f));
+                    saved.manuallyMoved = BoolMember(*baseline,
+                        "manually_moved", false);
+                    saved.lockedPosition = BoolMember(*baseline,
+                        "locked_position", saved.manuallyMoved);
+                    core.savedBaselineLayout.push_back(std::move(saved));
+                }
+            }
+        }
+
+        if (const JsonValue* filesValue = FindMember(*object, "files")) {
+            if (const JsonValue::Array* files = filesValue->AsArray()) {
+                std::set<int> occupiedSlots;
+                for (const JsonValue& fileValue : *files) {
+                    const JsonValue::Object* fileObject = fileValue.AsObject();
+                    if (fileObject == nullptr) {
+                        continue;
+                    }
+                    FileItem item;
+                    item.id = static_cast<std::uint64_t>(NumberMember(*fileObject, "id", 0.0));
+                    item.path = StringMember(*fileObject, "path", L"");
+                    if (item.id == 0 || item.path.empty() || ids.contains(item.id)) {
+                        continue;
+                    }
+                    bool duplicatePath = false;
+                    for (const std::wstring& existing : managedPaths) {
+                        if (PathEquals(existing, item.path)) {
+                            duplicatePath = true;
+                            break;
+                        }
+                    }
+                    if (duplicatePath) {
+                        continue;
+                    }
+                    ids.insert(item.id);
+                    managedPaths.insert(item.path);
+                    maximumId = std::max(maximumId, item.id);
+                    item.originalName =
+                        StringMember(*fileObject, "original_name", L"");
+                    item.displayName =
+                        StringMember(*fileObject, "display_name", L"");
+                    item.slot = static_cast<int>(NumberMember(*fileObject, "slot", -1.0));
+                    if (item.slot < 0 || item.slot >= kPriorityPlacementSlots ||
+                        occupiedSlots.contains(item.slot)) {
+                        item.slot = -1;
+                    }
+                    if (item.slot >= 0) {
+                        occupiedSlots.insert(item.slot);
+                    }
+                    item.ring = static_cast<int>(
+                        NumberMember(*fileObject, "ring", RingForSlot(item.slot)));
+                    item.ringSlot = static_cast<int>(
+                        NumberMember(*fileObject, "ring_slot",
+                                     RingSlotForSlot(item.slot)));
+                    item.sizeTier = static_cast<FileSizeTier>(std::clamp(
+                        static_cast<int>(
+                            NumberMember(*fileObject, "size_tier", 1.0)),
+                        0, 2));
+                    item.pinned = BoolMember(*fileObject, "pinned", false);
+                    item.manuallyMoved =
+                        BoolMember(*fileObject, "manually_moved", false);
+                    item.lockedPosition =
+                        BoolMember(*fileObject, "locked_position",
+                                   item.manuallyMoved);
+                    const float fallbackAngle =
+                        item.ring >= 0 && item.ringSlot >= 0
+                            ? SlotAngleRadians(item.ring,
+                                               item.ringSlot) *
+                                  180.0f / kPi
+                            : -90.0f;
+                    item.angleDegrees = NormalizeDegrees(
+                        static_cast<float>(
+                            NumberMember(*fileObject, "angle",
+                                         fallbackAngle)));
+                    item.angleOffsetDegrees = std::clamp(
+                        static_cast<float>(
+                            NumberMember(*fileObject, "angle_offset", 0.0)),
+                        -180.0f, 180.0f);
+                    item.radiusOffset = std::clamp(
+                        static_cast<float>(
+                            NumberMember(*fileObject, "radius_offset", 0.0)),
+                        -2000.0f, 2000.0f);
+                    item.manualOffset.x = std::clamp(
+                        static_cast<float>(
+                            NumberMember(*fileObject, "manual_x", 0.0)),
+                        -2000.0f, 2000.0f);
+                    item.manualOffset.y = std::clamp(
+                        static_cast<float>(
+                            NumberMember(*fileObject, "manual_y", 0.0)),
+                        -2000.0f, 2000.0f);
+                    item.favorite = BoolMember(*fileObject, "favorite", false);
+                    item.inProgress = BoolMember(*fileObject, "in_progress", false);
+                    item.openCount = std::max(
+                        0, static_cast<int>(NumberMember(*fileObject, "open_count", 0.0)));
+                    item.lastOpened = static_cast<std::int64_t>(
+                        NumberMember(*fileObject, "last_opened", 0.0));
+                    item.isDirectory = BoolMember(*fileObject, "is_directory", false);
+                    item.missing = BoolMember(*fileObject, "missing", false);
+                    item.parentFileId = static_cast<std::uint64_t>(
+                        NumberMember(*fileObject, "parent_file_id", 0.0));
+                    item.relativeAngle = NormalizeDegrees(static_cast<float>(
+                        NumberMember(*fileObject, "relative_angle", 90.0)));
+                    item.relativeRadius = std::clamp(static_cast<float>(
+                        NumberMember(*fileObject, "relative_radius", 62.0)),
+                        36.0f, 8192.0f);
+                    item.relativeManualOffset = D2D1::Point2F(
+                        static_cast<float>(NumberMember(*fileObject,
+                            "relative_manual_x", 0.0)),
+                        static_cast<float>(NumberMember(*fileObject,
+                            "relative_manual_y", 0.0)));
+                    item.relativeManualLock = BoolMember(*fileObject,
+                        "relative_manual_lock", false);
+                    item.childrenCollapsed = BoolMember(*fileObject,
+                        "children_collapsed", false);
+                    item.familyId = static_cast<std::uint64_t>(
+                        NumberMember(*fileObject, "family_id", 0.0));
+                    item.detachedFromUpper = BoolMember(*fileObject,
+                        "detached_from_upper", false);
+                    item.detachedWorldPosition = D2D1::Point2F(
+                        static_cast<float>(NumberMember(*fileObject, "detached_x", 0.0)),
+                        static_cast<float>(NumberMember(*fileObject, "detached_y", 0.0)));
+                    if (const JsonValue* opensValue =
+                            FindMember(*fileObject, "recent_opens")) {
+                        if (const JsonValue::Array* opens = opensValue->AsArray()) {
+                            for (const JsonValue& openValue : *opens) {
+                                if (const double* timestamp = openValue.AsNumber()) {
+                                    item.recentOpens.push_back(
+                                        static_cast<std::int64_t>(*timestamp));
+                                }
+                            }
+                        }
+                    }
+                    const std::int64_t cutoff = UnixTimeNow() - 30LL * 24 * 60 * 60;
+                    item.recentOpens.erase(
+                        std::remove_if(item.recentOpens.begin(), item.recentOpens.end(),
+                                       [cutoff](std::int64_t timestamp) {
+                                           return timestamp < cutoff;
+                                       }),
+                        item.recentOpens.end());
+                    if (item.recentOpens.size() > 64) {
+                        item.recentOpens.erase(
+                            item.recentOpens.begin(),
+                            item.recentOpens.end() - static_cast<std::ptrdiff_t>(64));
+                    }
+                    core.files.push_back(std::move(item));
+                }
+            }
+        }
+        if (core.files.empty()) {
+            core.layoutVersion = documentVersion >= 4 ? kLayoutVersion
+                                                       : core.layoutVersion;
+        }
+        loaded.cores.push_back(std::move(core));
+    }
+
+    if (const JsonValue* familiesValue = FindMember(*root, "families")) {
+        if (const JsonValue::Array* families = familiesValue->AsArray()) {
+            for (const JsonValue& familyValue : *families) {
+                const JsonValue::Object* object = familyValue.AsObject();
+                if (object == nullptr) continue;
+                FileFamily family;
+                family.id = static_cast<std::uint64_t>(NumberMember(*object, "id", 0.0));
+                family.coreId = static_cast<std::uint64_t>(NumberMember(*object, "core_id", 0.0));
+                family.rootFileId = static_cast<std::uint64_t>(NumberMember(*object, "root_file_id", 0.0));
+                family.currentFileId = static_cast<std::uint64_t>(NumberMember(*object, "current_file_id", 0.0));
+                family.repairRequired = BoolMember(*object, "repair_required", false);
+                if (family.id != 0) {
+                    maximumId = std::max(maximumId, family.id);
+                    loaded.families.push_back(std::move(family));
+                }
+            }
+        }
+    }
+
+    loaded.nextId = std::max(loaded.nextId, maximumId + 1);
+    auto unclassified = std::find_if(
+        loaded.cores.begin(), loaded.cores.end(),
+        [](const Core& core) { return core.id == kUnclassifiedCoreId; });
+    if (unclassified == loaded.cores.end()) {
+        Core core;
+        core.id = kUnclassifiedCoreId;
+        core.name = L"未分类";
+        core.position = D2D1::Point2F(360.0f, 300.0f);
+        loaded.cores.insert(loaded.cores.begin(), std::move(core));
+    } else {
+        unclassified->name = L"未分类";
+        unclassified->archived = false;
+    }
+    state = std::move(loaded);
+    return true;
+}
+
+D2D1_POINT_2F SlotPosition(const Core& core, int slot) {
+    const int ring = RingForSlot(slot);
+    const int ringSlot = RingSlotForSlot(slot);
+    if (ring < 0 || ringSlot < 0) {
+        return core.position;
+    }
+    const float angle = SlotAngleRadians(ring, ringSlot) +
+        core.rotationAngle * kPi / 180.0f;
+    const float radius =
+        (ring == 0 ? core.innerRadius
+                   : (ring == 1 ? core.middleRadius : core.outerRadius)) *
+        (ring == 0 ? core.innerDistanceScale : core.outerDistanceScale);
+    return D2D1::Point2F(core.position.x + std::cos(angle) * radius,
+                         core.position.y + std::sin(angle) * radius);
+}
+
+bool IconFullyOutsideViewport(D2D1_POINT_2F screen, float iconHalf,
+                              const D2D1_SIZE_F& client) {
+    return screen.x + iconHalf <= 0.0f ||
+           screen.x - iconHalf >= client.width ||
+           screen.y + iconHalf <= 0.0f ||
+           screen.y - iconHalf >= client.height;
+}
+
+class GravityApp {
+public:
+    explicit GravityApp(bool benchmarkMode = false) : benchmarkMode_(benchmarkMode) {}
+
+    friend bool RunSelfTest();
+
+    void AttachWindow(HWND window) { window_ = window; }
+    void AttachInteractionWindow(HWND window) {
+        interactionWindow_ = window;
+    }
+    void AttachLifecycleWindow(HWND window) {
+        lifecycleWindow_ = window;
+        if (lifecycleWindow_ != nullptr) {
+            shellHookRegistered_ =
+                RegisterShellHookWindow(lifecycleWindow_) != FALSE;
+            SetTimer(
+                lifecycleWindow_, kDesktopHostWatchTimer,
+                kDesktopHostWatchIntervalMs, nullptr);
+        }
+    }
+
+    bool IsInitialized() const {
+        return initialized_;
+    }
+
+    bool Initialize(HWND window) {
+        window_ = window;
+        dpi_ = static_cast<float>(GetDpiForWindow(window_));
+        RefreshWindowsVisualProfile();
+        // The full-size window is now a visual-only layered surface.  File
+        // drops are accepted exclusively by the region-clipped interaction
+        // window created below.
+        DragAcceptFiles(window_, FALSE);
+
+        if (FAILED(D2D1CreateFactory(D2D1_FACTORY_TYPE_SINGLE_THREADED,
+                                     factory_.ReleaseAndGetAddressOf()))) {
+            return false;
+        }
+        if (FAILED(DWriteCreateFactory(
+                DWRITE_FACTORY_TYPE_SHARED, __uuidof(IDWriteFactory),
+                reinterpret_cast<IUnknown**>(writeFactory_.ReleaseAndGetAddressOf())))) {
+            return false;
+        }
+        if (FAILED(CoCreateInstance(CLSID_WICImagingFactory, nullptr, CLSCTX_INPROC_SERVER,
+                                    IID_PPV_ARGS(wicFactory_.ReleaseAndGetAddressOf())))) {
+            return false;
+        }
+        if (benchmarkMode_) {
+            CreateBenchmarkWorkspace();
+        } else {
+            LoadState();
+        }
+        NormalizeStateModel();
+        // Pause is a runtime tray state. An explicit process launch must not
+        // show a fully rendered workspace whose input path immediately exits.
+        if (!benchmarkMode_) {
+            state_.workspacePaused = false;
+        }
+        tutorialActive_ = !benchmarkMode_ && !state_.firstRunCompleted;
+        ApplyCompanionWorkspaceFrame();
+        if (!CreateInteractionWindow()) {
+            return false;
+        }
+        AddTrayIcon();
+        if (!benchmarkMode_) SetTimer(window_, kReferenceCheckTimer, 1800, nullptr);
+        RefreshResponsiveMetrics(false);
+        const HRESULT textResult = CreateTextResources();
+        if (SUCCEEDED(textResult)) {
+            initialized_ = true;
+            workspaceVisible_ =
+                IsWindowVisible(window_) != FALSE;
+            EnsureInteractionWindowPresented();
+        }
+        return SUCCEEDED(textResult);
+    }
+
+    void Shutdown() {
+        shuttingDown_ = true;
+        if (lifecycleWindow_ != nullptr) {
+            KillTimer(
+                lifecycleWindow_, kDesktopHostWatchTimer);
+            KillTimer(
+                lifecycleWindow_, kDesktopReconnectTimer);
+            KillTimer(
+                lifecycleWindow_, kInteractionLayerRepairTimer);
+            if (shellHookRegistered_) {
+                DeregisterShellHookWindow(lifecycleWindow_);
+                shellHookRegistered_ = false;
+            }
+        }
+        EndRename(false);
+        DestroyInteractionWindow();
+        if (window_ != nullptr) {
+            KillTimer(window_, kCoreSelectionHaloTimer);
+            KillTimer(window_, kSelectionDismissTimer);
+        }
+        if (!benchmarkMode_) {
+            SaveState();
+        }
+        RemoveTrayIcon();
+        iconCache_.clear();
+        iconShadowCache_.clear();
+        DiscardDeviceResources();
+        tooltipBodyFormat_.Reset();
+        tooltipFormat_.Reset();
+        tutorialButtonFormat_.Reset();
+        tutorialBodyFormat_.Reset();
+        tutorialStepFormat_.Reset();
+        tutorialTitleFormat_.Reset();
+        fileMinorFormat_.Reset();
+        fileMarqueeFormat_.Reset();
+        fileImportantFormat_.Reset();
+        fileNameFormat_.Reset();
+        bodyFormat_.Reset();
+        coreFormat_.Reset();
+        hudFormat_.Reset();
+        wicFactory_.Reset();
+        writeFactory_.Reset();
+        factory_.Reset();
+    }
+
+    LRESULT HandleShellLifecycleMessage(
+        HWND source, UINT message, WPARAM wParam, LPARAM lParam) {
+        if (message == TaskbarCreatedMessage()) {
+            BeginDesktopReconnect(true);
+            return 0;
+        }
+        if (message == ShellHookMessage()) {
+            const UINT shellEvent =
+                static_cast<UINT>(wParam) & 0x7FFFU;
+            if (shellEvent == HSHELL_ACTIVATESHELLWINDOW ||
+                shellEvent == HSHELL_WINDOWACTIVATED ||
+                shellEvent == HSHELL_WINDOWCREATED ||
+                shellEvent == HSHELL_WINDOWDESTROYED) {
+                PostMessageW(
+                    source, kRefreshInteractionLayerMessage,
+                    0, 0);
+                // Win+D performs a second desktop-band reorder after the
+                // activation notification. Repair once after that transition
+                // instead of polling or touching layout state.
+                SetTimer(
+                    source, kInteractionLayerRepairTimer,
+                    kInteractionLayerRepairDelayMs, nullptr);
+            }
+            return 0;
+        }
+        switch (message) {
+        case WM_TIMER:
+            HandleDesktopLifecycleTimer(wParam);
+            return 0;
+        case kTrayCallbackMessage:
+            HandleTrayCallback(lParam);
+            return 0;
+        case kRestoreExistingInstanceMessage:
+            state_.workspacePaused = false;
+            SetWorkspaceVisible(true);
+            return 0;
+        case kRefreshInteractionLayerMessage:
+            EnsureInteractionWindowPresented();
+            return 0;
+        case WM_NCDESTROY:
+            if (shellHookRegistered_) {
+                DeregisterShellHookWindow(source);
+                shellHookRegistered_ = false;
+            }
+            if (lifecycleWindow_ == source) {
+                lifecycleWindow_ = nullptr;
+            }
+            SetWindowLongPtrW(source, GWLP_USERDATA, 0);
+            break;
+        default:
+            break;
+        }
+        return DefWindowProcW(
+            source, message, wParam, lParam);
+    }
+
+    LRESULT HandleInteractionMessage(
+        HWND source, UINT message, WPARAM wParam, LPARAM lParam) {
+        switch (message) {
+        case WM_PAINT: {
+            PAINTSTRUCT paint{};
+            BeginPaint(source, &paint);
+            EndPaint(source, &paint);
+            return 0;
+        }
+        case WM_ERASEBKGND:
+            return 1;
+        case WM_NCHITTEST:
+            return HTCLIENT;
+        case WM_MOUSEACTIVATE:
+            return MA_NOACTIVATE;
+        case WM_LBUTTONDOWN:
+            OnLeftButtonDown(GET_X_LPARAM(lParam), GET_Y_LPARAM(lParam));
+            return 0;
+        case WM_LBUTTONUP:
+            OnLeftButtonUp(GET_X_LPARAM(lParam), GET_Y_LPARAM(lParam));
+            return 0;
+        case WM_LBUTTONDBLCLK:
+            OnDoubleClick(GET_X_LPARAM(lParam), GET_Y_LPARAM(lParam));
+            return 0;
+        case WM_MBUTTONDOWN:
+            BeginPan(GET_X_LPARAM(lParam), GET_Y_LPARAM(lParam));
+            return 0;
+        case WM_MBUTTONUP:
+            EndPointerOperation();
+            return 0;
+        case WM_MOUSEMOVE:
+            OnMouseMove(GET_X_LPARAM(lParam), GET_Y_LPARAM(lParam));
+            return 0;
+        case WM_MOUSELEAVE:
+            OnPointerLeave();
+            return 0;
+        case WM_CANCELMODE:
+            CancelPointerOperation();
+            return 0;
+        case WM_CAPTURECHANGED:
+            if (reinterpret_cast<HWND>(lParam) != window_) {
+                CancelPointerOperation();
+            }
+            return 0;
+        case WM_MOUSEWHEEL:
+            OnMouseWheel(GET_X_LPARAM(lParam), GET_Y_LPARAM(lParam),
+                         GET_WHEEL_DELTA_WPARAM(wParam));
+            return 0;
+        case WM_RBUTTONUP:
+            OnContextMenu(GET_X_LPARAM(lParam), GET_Y_LPARAM(lParam));
+            return 0;
+        case WM_DROPFILES:
+            OnDropFiles(reinterpret_cast<HDROP>(wParam));
+            return 0;
+        case WM_SETCURSOR:
+            if (LOWORD(lParam) == HTCLIENT) {
+                SetInteractionCursor(source);
+                return TRUE;
+            }
+            break;
+        case WM_NCDESTROY:
+            if (interactionWindow_ == source) {
+                interactionWindow_ = nullptr;
+            }
+            SetWindowLongPtrW(source, GWLP_USERDATA, 0);
+            break;
+        default:
+            break;
+        }
+        return DefWindowProcW(source, message, wParam, lParam);
+    }
+
+    LRESULT HandleMessage(
+        HWND source, UINT message, WPARAM wParam, LPARAM lParam) {
+        switch (message) {
+        case WM_PAINT:
+            Paint();
+            return 0;
+        case WM_ERASEBKGND:
+            return 1;
+        case WM_SIZE:
+            if (wParam != SIZE_MINIMIZED &&
+                !desktopReconnectInProgress_) {
+                Resize();
+            }
+            return 0;
+        case WM_SHOWWINDOW:
+            if (wParam != FALSE && initialized_ &&
+                !state_.workspacePaused) {
+                workspaceVisible_ = true;
+                if (lifecycleWindow_ != nullptr) {
+                    PostMessageW(
+                        lifecycleWindow_,
+                        kRefreshInteractionLayerMessage,
+                        0, 0);
+                }
+            }
+            break;
+        case WM_WINDOWPOSCHANGED:
+            if (initialized_ && workspaceVisible_ &&
+                !state_.workspacePaused &&
+                lifecycleWindow_ != nullptr) {
+                PostMessageW(
+                    lifecycleWindow_,
+                    kRefreshInteractionLayerMessage,
+                    0, 0);
+            }
+            break;
+        case WM_DISPLAYCHANGE:
+            ApplyCompanionWorkspaceFrame();
+            Resize();
+            return 0;
+        case WM_EXITSIZEMOVE:
+            RememberWorkspaceWidth();
+            return 0;
+        case WM_NCHITTEST:
+            return HitTestCompanionFrame(lParam);
+        case WM_DPICHANGED:
+            OnDpiChanged(wParam, lParam);
+            return 0;
+        case WM_SETTINGCHANGE:
+        case WM_THEMECHANGED:
+        case WM_SYSCOLORCHANGE:
+            RefreshWindowsVisualProfile();
+            iconCache_.clear();
+            iconShadowCache_.clear();
+            RefreshResponsiveMetrics(true);
+            Invalidate();
+            return 0;
+        case WM_SYSCOMMAND:
+            if ((wParam & 0xFFF0) == SC_MINIMIZE ||
+                (wParam & 0xFFF0) == SC_MAXIMIZE) {
+                return 0;
+            }
+            break;
+        case WM_CLOSE:
+            RequestExit();
+            return 0;
+        case WM_DROPFILES:
+            OnDropFiles(reinterpret_cast<HDROP>(wParam));
+            return 0;
+        case WM_LBUTTONDOWN:
+            OnLeftButtonDown(GET_X_LPARAM(lParam), GET_Y_LPARAM(lParam));
+            return 0;
+        case WM_LBUTTONUP:
+            OnLeftButtonUp(GET_X_LPARAM(lParam), GET_Y_LPARAM(lParam));
+            return 0;
+        case WM_LBUTTONDBLCLK:
+            OnDoubleClick(GET_X_LPARAM(lParam), GET_Y_LPARAM(lParam));
+            return 0;
+        case WM_MBUTTONDOWN:
+            BeginPan(GET_X_LPARAM(lParam), GET_Y_LPARAM(lParam));
+            return 0;
+        case WM_MBUTTONUP:
+            EndPointerOperation();
+            return 0;
+        case WM_MOUSEMOVE:
+            OnMouseMove(GET_X_LPARAM(lParam), GET_Y_LPARAM(lParam));
+            return 0;
+        case WM_MOUSELEAVE:
+            OnPointerLeave();
+            return 0;
+        case WM_CANCELMODE:
+            CancelPointerOperation();
+            return 0;
+        case WM_CAPTURECHANGED:
+            if (reinterpret_cast<HWND>(lParam) != window_) {
+                CancelPointerOperation();
+            }
+            return 0;
+        case WM_MOUSEWHEEL:
+            OnMouseWheel(GET_X_LPARAM(lParam), GET_Y_LPARAM(lParam),
+                         GET_WHEEL_DELTA_WPARAM(wParam));
+            return 0;
+        case WM_RBUTTONUP:
+            OnContextMenu(GET_X_LPARAM(lParam), GET_Y_LPARAM(lParam));
+            return 0;
+        case WM_KEYDOWN:
+            OnKeyDown(wParam);
+            return 0;
+        case WM_TIMER:
+            OnTimer(wParam);
+            return 0;
+        case kTrayCallbackMessage:
+            HandleTrayCallback(lParam);
+            return 0;
+        case kRestoreExistingInstanceMessage:
+            state_.workspacePaused = false;
+            SetWorkspaceVisible(true);
+            return 0;
+        case WM_SETCURSOR:
+            if (LOWORD(lParam) == HTCLIENT) {
+                SetInteractionCursor(window_);
+                return TRUE;
+            }
+            break;
+        case WM_MOUSEACTIVATE:
+            // A desktop companion may process its own mouse interaction, but
+            // must never become the foreground application or move above a
+            // normal window that happens to overlap the right-side workspace.
+            return MA_NOACTIVATE;
+        case kCommitRenameMessage:
+            EndRename(wParam != 0);
+            return 0;
+        case WM_GETMINMAXINFO: {
+            auto* info = reinterpret_cast<MINMAXINFO*>(lParam);
+            const UINT dpi = window_ == nullptr ? 96 : GetDpiForWindow(window_);
+            const D2D1_SIZE_F work = MonitorWorkAreaDip();
+            const float minimumWidth = state_.workspaceCollapsed
+                ? 44.0f
+                : std::max(280.0f, work.width * 0.28f);
+            info->ptMinTrackSize.x = MulDiv(static_cast<int>(std::round(minimumWidth)),
+                                            static_cast<int>(dpi), 96);
+            info->ptMinTrackSize.y = MulDiv(360, static_cast<int>(dpi), 96);
+            return 0;
+        }
+        case WM_DESTROY:
+            if (window_ == source) {
+                window_ = nullptr;
+            }
+            if (exitRequested_ || shuttingDown_) {
+                PostQuitMessage(0);
+            } else {
+                BeginDesktopReconnect(false);
+            }
+            return 0;
+        case WM_NCDESTROY:
+            if (window_ == source) {
+                window_ = nullptr;
+            }
+            SetWindowLongPtrW(source, GWLP_USERDATA, 0);
+            break;
+        default:
+            break;
+        }
+        return DefWindowProcW(
+            source, message, wParam, lParam);
+    }
+
+private:
+    class InteractionDropTarget final : public IDropTarget {
+    public:
+        explicit InteractionDropTarget(GravityApp* owner) : owner_(owner) {}
+
+        HRESULT STDMETHODCALLTYPE QueryInterface(
+            REFIID iid, void** object) override {
+            if (object == nullptr) {
+                return E_POINTER;
+            }
+            *object = nullptr;
+            if (iid == IID_IUnknown || iid == IID_IDropTarget) {
+                *object = static_cast<IDropTarget*>(this);
+                AddRef();
+                return S_OK;
+            }
+            return E_NOINTERFACE;
+        }
+
+        ULONG STDMETHODCALLTYPE AddRef() override {
+            return ++references_;
+        }
+
+        ULONG STDMETHODCALLTYPE Release() override {
+            const ULONG remaining = --references_;
+            if (remaining == 0) {
+                delete this;
+            }
+            return remaining;
+        }
+
+        HRESULT STDMETHODCALLTYPE DragEnter(
+            IDataObject* data, DWORD, POINTL point,
+            DWORD* effect) override {
+            hasFiles_ = owner_ != nullptr &&
+                        owner_->ExternalDropDataHasFiles(data);
+            const bool accepted =
+                owner_ != nullptr &&
+                owner_->UpdateExternalDropPreview(point, hasFiles_);
+            SetEffect(effect, accepted);
+            return S_OK;
+        }
+
+        HRESULT STDMETHODCALLTYPE DragOver(
+            DWORD, POINTL point, DWORD* effect) override {
+            const bool accepted =
+                owner_ != nullptr &&
+                owner_->UpdateExternalDropPreview(point, hasFiles_);
+            SetEffect(effect, accepted);
+            return S_OK;
+        }
+
+        HRESULT STDMETHODCALLTYPE DragLeave() override {
+            if (owner_ != nullptr) {
+                owner_->ClearExternalDropPreview();
+            }
+            hasFiles_ = false;
+            return S_OK;
+        }
+
+        HRESULT STDMETHODCALLTYPE Drop(
+            IDataObject* data, DWORD, POINTL point,
+            DWORD* effect) override {
+            const bool accepted =
+                owner_ != nullptr &&
+                owner_->UpdateExternalDropPreview(point, hasFiles_) &&
+                owner_->DropExternalFiles(data, point);
+            if (owner_ != nullptr) {
+                owner_->ClearExternalDropPreview();
+            }
+            hasFiles_ = false;
+            SetEffect(effect, accepted);
+            return S_OK;
+        }
+
+    private:
+        static void SetEffect(DWORD* effect, bool accepted) {
+            if (effect == nullptr) {
+                return;
+            }
+            if (!accepted) {
+                *effect = DROPEFFECT_NONE;
+                return;
+            }
+            const DWORD allowed = *effect;
+            *effect = (allowed & DROPEFFECT_LINK) != 0
+                ? DROPEFFECT_LINK
+                : ((allowed & DROPEFFECT_COPY) != 0
+                       ? DROPEFFECT_COPY
+                       : DROPEFFECT_NONE);
+        }
+
+        std::atomic<ULONG> references_{1};
+        GravityApp* owner_ = nullptr;
+        bool hasFiles_ = false;
+    };
+
+    static LRESULT CALLBACK EditWindowProc(HWND window, UINT message, WPARAM wParam,
+                                            LPARAM lParam) {
+        auto* app = reinterpret_cast<GravityApp*>(
+            GetWindowLongPtrW(window, GWLP_USERDATA));
+        if (app != nullptr) {
+            if (message == WM_KEYDOWN && wParam == VK_RETURN) {
+                PostMessageW(app->window_, kCommitRenameMessage, TRUE, 0);
+                return 0;
+            }
+            if (message == WM_KEYDOWN && wParam == VK_ESCAPE) {
+                PostMessageW(app->window_, kCommitRenameMessage, FALSE, 0);
+                return 0;
+            }
+            if (message == WM_KILLFOCUS && app->editWindow_ == window) {
+                PostMessageW(app->window_, kCommitRenameMessage, TRUE, 0);
+            }
+            return CallWindowProcW(app->oldEditProc_, window, message, wParam, lParam);
+        }
+        return DefWindowProcW(window, message, wParam, lParam);
+    }
+
+    D2D1_SIZE_F MonitorWorkAreaDip() const {
+        HMONITOR monitor = MonitorFromWindow(window_, MONITOR_DEFAULTTONEAREST);
+        MONITORINFOEXW info{sizeof(info)};
+        if (monitor == nullptr ||
+            !GetMonitorInfoW(monitor, reinterpret_cast<MONITORINFO*>(&info))) {
+            return ClientDipSize();
+        }
+        const float scale = std::max(0.1f, dpi_ / 96.0f);
+        return D2D1::SizeF(
+            static_cast<float>(info.rcWork.right - info.rcWork.left) / scale,
+            static_cast<float>(info.rcWork.bottom - info.rcWork.top) / scale);
+    }
+
+    RECT MonitorWorkAreaPixels() const {
+        MONITORINFOEXW info{sizeof(info)};
+        HMONITOR monitor = MonitorFromWindow(window_, MONITOR_DEFAULTTONEAREST);
+        if (monitor != nullptr &&
+            GetMonitorInfoW(monitor, reinterpret_cast<MONITORINFO*>(&info))) {
+            return info.rcWork;
+        }
+        return RECT{0, 0, GetSystemMetrics(SM_CXSCREEN), GetSystemMetrics(SM_CYSCREEN)};
+    }
+
+    int DipToPixels(float dip) const {
+        return static_cast<int>(std::round(dip * std::max(0.1f, dpi_ / 96.0f)));
+    }
+
+    void RefreshWindowsVisualProfile() {
+        systemUiFontFamily_ = L"Segoe UI";
+        desktopIconFontFamily_ = systemUiFontFamily_;
+        desktopIconSizeDip_ = 48.0f;
+        desktopFileFontSizeDip_ = 12.0f;
+
+        DWORD desktopIconSize = 0;
+        DWORD desktopIconSizeBytes =
+            sizeof(desktopIconSize);
+        if (RegGetValueW(
+                HKEY_CURRENT_USER,
+                L"Software\\Microsoft\\Windows\\Shell\\Bags\\1\\Desktop",
+                L"IconSize", RRF_RT_REG_DWORD, nullptr,
+                &desktopIconSize,
+                &desktopIconSizeBytes) == ERROR_SUCCESS &&
+            desktopIconSize >= 16 &&
+            desktopIconSize <= 256) {
+            desktopIconSizeDip_ =
+                static_cast<float>(desktopIconSize);
+        }
+
+        NONCLIENTMETRICSW nonClient{sizeof(nonClient)};
+        if (SystemParametersInfoW(
+                SPI_GETNONCLIENTMETRICS, sizeof(nonClient),
+                &nonClient, 0) &&
+            nonClient.lfMessageFont.lfFaceName[0] != L'\0') {
+            systemUiFontFamily_ =
+                nonClient.lfMessageFont.lfFaceName;
+        }
+
+        LOGFONTW iconFont{};
+        if (SystemParametersInfoW(
+                SPI_GETICONTITLELOGFONT, sizeof(iconFont),
+                &iconFont, 0)) {
+            if (iconFont.lfFaceName[0] != L'\0') {
+                desktopIconFontFamily_ = iconFont.lfFaceName;
+            }
+            const float fontPixels =
+                static_cast<float>(std::abs(iconFont.lfHeight));
+            if (fontPixels > 0.0f) {
+                desktopFileFontSizeDip_ = std::clamp(
+                    fontPixels * 96.0f /
+                        std::max(96.0f, dpi_),
+                    12.0f, 13.0f);
+            }
+        }
+
+        const HWND host = FindDesktopViewHost();
+        const HWND shellView =
+            host == nullptr
+                ? nullptr
+                : FindWindowExW(
+                      host, nullptr,
+                      L"SHELLDLL_DefView", nullptr);
+        const HWND listView =
+            shellView == nullptr
+                ? nullptr
+                : FindWindowExW(
+                      shellView, nullptr,
+                      L"SysListView32", nullptr);
+        if (listView != nullptr) {
+            const HIMAGELIST imageList =
+                reinterpret_cast<HIMAGELIST>(
+                    SendMessageW(
+                        listView, LVM_GETIMAGELIST,
+                        LVSIL_NORMAL, 0));
+            int width = 0;
+            int height = 0;
+            if (imageList != nullptr &&
+                ImageList_GetIconSize(
+                    imageList, &width, &height) &&
+                width > 0 && height > 0) {
+                desktopIconSizeDip_ = std::clamp(
+                    static_cast<float>(
+                        std::min(width, height)) *
+                        96.0f /
+                        std::max(96.0f, dpi_),
+                    40.0f, 60.0f);
+            }
+        }
+    }
+
+    bool CreateInteractionWindow(bool showWindow = true) {
+        if (interactionWindow_ != nullptr &&
+            IsWindow(interactionWindow_) != FALSE) {
+            return true;
+        }
+        interactionWindow_ = nullptr;
+        interactionDropTargetRegistered_ = false;
+        constexpr DWORD interactionStyle =
+            WS_POPUP | WS_CLIPCHILDREN;
+        constexpr DWORD interactionExStyle =
+            WS_EX_TOOLWINDOW | WS_EX_LAYERED |
+            WS_EX_NOACTIVATE;
+        HWND interaction = CreateWindowExW(
+            interactionExStyle, kInteractionWindowClass, L"",
+            interactionStyle, 0, 0, 1, 1, nullptr, nullptr,
+            GetModuleHandleW(nullptr), this);
+        if (interaction == nullptr) {
+            return false;
+        }
+        interactionWindow_ = interaction;
+        HRGN emptyRegion = CreateRectRgn(0, 0, 0, 0);
+        if (emptyRegion == nullptr ||
+            SetWindowRgn(interactionWindow_, emptyRegion, FALSE) == 0) {
+            if (emptyRegion != nullptr) {
+                DeleteObject(emptyRegion);
+            }
+            DestroyWindow(interactionWindow_);
+            interactionWindow_ = nullptr;
+            return false;
+        }
+        InteractionDropTarget* target =
+            new InteractionDropTarget(this);
+        const HRESULT registration =
+            RegisterDragDrop(interactionWindow_, target);
+        target->Release();
+        if (FAILED(registration)) {
+            DestroyWindow(interactionWindow_);
+            interactionWindow_ = nullptr;
+            return false;
+        }
+        interactionDropTargetRegistered_ = true;
+        AttachInteractionWindowToCompanionLayer();
+        SyncInteractionWindowFrame();
+        if (showWindow) {
+            ShowWindow(
+                interactionWindow_, SW_SHOWNOACTIVATE);
+        }
+        return true;
+    }
+
+    void DiscardInteractionSurface() {
+        if (interactionDeviceContext_ != nullptr &&
+            interactionPreviousBitmap_ != nullptr) {
+            SelectObject(
+                interactionDeviceContext_,
+                interactionPreviousBitmap_);
+        }
+        interactionPreviousBitmap_ = nullptr;
+        if (interactionBitmap_ != nullptr) {
+            DeleteObject(interactionBitmap_);
+        }
+        interactionBitmap_ = nullptr;
+        if (interactionDeviceContext_ != nullptr) {
+            DeleteDC(interactionDeviceContext_);
+        }
+        interactionDeviceContext_ = nullptr;
+        interactionBits_ = nullptr;
+        interactionPixelSize_ = SIZE{0, 0};
+    }
+
+    bool EnsureInteractionSurface(int width, int height) {
+        width = std::max(1, width);
+        height = std::max(1, height);
+        if (interactionDeviceContext_ != nullptr &&
+            interactionBitmap_ != nullptr &&
+            interactionBits_ != nullptr &&
+            interactionPixelSize_.cx == width &&
+            interactionPixelSize_.cy == height) {
+            return true;
+        }
+        DiscardInteractionSurface();
+        BITMAPINFO bitmapInfo{};
+        bitmapInfo.bmiHeader.biSize = sizeof(BITMAPINFOHEADER);
+        bitmapInfo.bmiHeader.biWidth = width;
+        bitmapInfo.bmiHeader.biHeight = -height;
+        bitmapInfo.bmiHeader.biPlanes = 1;
+        bitmapInfo.bmiHeader.biBitCount = 32;
+        bitmapInfo.bmiHeader.biCompression = BI_RGB;
+        interactionDeviceContext_ = CreateCompatibleDC(nullptr);
+        interactionBitmap_ = CreateDIBSection(
+            interactionDeviceContext_, &bitmapInfo,
+            DIB_RGB_COLORS, &interactionBits_, nullptr, 0);
+        if (interactionDeviceContext_ == nullptr ||
+            interactionBitmap_ == nullptr ||
+            interactionBits_ == nullptr) {
+            DiscardInteractionSurface();
+            return false;
+        }
+        interactionPreviousBitmap_ = SelectObject(
+            interactionDeviceContext_, interactionBitmap_);
+        interactionPixelSize_ = SIZE{width, height};
+        std::fill_n(
+            static_cast<std::uint32_t*>(interactionBits_),
+            static_cast<std::size_t>(width) *
+                static_cast<std::size_t>(height),
+            0x01000000u);
+        return true;
+    }
+
+    bool PresentInteractionSurface(const RECT& bounds) {
+        const int width = std::max(1L, bounds.right - bounds.left);
+        const int height = std::max(1L, bounds.bottom - bounds.top);
+        if (interactionWindow_ == nullptr ||
+            !EnsureInteractionSurface(width, height)) {
+            return false;
+        }
+        POINT destination{bounds.left, bounds.top};
+        POINT source{0, 0};
+        SIZE size{width, height};
+        BLENDFUNCTION blend{
+            AC_SRC_OVER, 0, 255, AC_SRC_ALPHA};
+        return UpdateLayeredWindow(
+                   interactionWindow_, nullptr,
+                   &destination, &size,
+                   interactionDeviceContext_, &source,
+                   0, &blend, ULW_ALPHA) != FALSE;
+    }
+
+    bool ScreenPointInsideInteractionIsland(
+        POINT screenPoint) const {
+        const HWND windowAtPoint = WindowFromPoint(screenPoint);
+        const bool interactionReceivesPoint =
+            windowAtPoint == interactionWindow_ ||
+            (interactionWindow_ != nullptr &&
+             IsChild(interactionWindow_, windowAtPoint) != FALSE) ||
+            windowAtPoint == editWindow_ ||
+            (editWindow_ != nullptr &&
+             IsChild(editWindow_, windowAtPoint) != FALSE);
+        if (!interactionReceivesPoint) {
+            return false;
+        }
+        bool insideInteractionIsland = false;
+        if (interactionWindow_ != nullptr &&
+            IsWindowVisible(interactionWindow_) != FALSE) {
+            RECT frame{};
+            if (GetWindowRect(interactionWindow_, &frame) != FALSE) {
+                HRGN region = CreateRectRgn(0, 0, 0, 0);
+                if (region != nullptr) {
+                    const int regionKind =
+                        GetWindowRgn(interactionWindow_, region);
+                    insideInteractionIsland =
+                        regionKind != ERROR &&
+                        PtInRegion(
+                            region,
+                            screenPoint.x - frame.left,
+                            screenPoint.y - frame.top) != FALSE;
+                    DeleteObject(region);
+                }
+            }
+        }
+        return insideInteractionIsland;
+    }
+
+    void SyncSelectionDismissTimer() {
+        if (window_ == nullptr) {
+            return;
+        }
+        const bool shouldRun =
+            selected_.kind != HitKind::None ||
+            focusedCoreId_ != 0 ||
+            FocusAnimationActive() ||
+            CoreDistanceSliderOpen() ||
+            CoreAppearancePanelOpen();
+        if (shouldRun && !selectionDismissTimerActive_) {
+            selectionDismissButtonsDown_ =
+                (GetAsyncKeyState(VK_LBUTTON) & 0x8000) != 0 ||
+                (GetAsyncKeyState(VK_RBUTTON) & 0x8000) != 0 ||
+                (GetAsyncKeyState(VK_MBUTTON) & 0x8000) != 0;
+            SetTimer(
+                window_, kSelectionDismissTimer,
+                32, nullptr);
+            selectionDismissTimerActive_ = true;
+        } else if (!shouldRun &&
+                   selectionDismissTimerActive_) {
+            KillTimer(window_, kSelectionDismissTimer);
+            selectionDismissTimerActive_ = false;
+            selectionDismissButtonsDown_ = false;
+        }
+    }
+
+    bool AnyMouseButtonDown() const {
+        return (GetAsyncKeyState(VK_LBUTTON) & 0x8000) != 0 ||
+               (GetAsyncKeyState(VK_RBUTTON) & 0x8000) != 0 ||
+               (GetAsyncKeyState(VK_MBUTTON) & 0x8000) != 0;
+    }
+
+    UINT TrackPopupMenuPreservingSelection(
+        HMENU menu, UINT flags, int screenX, int screenY) {
+        popupMenuOpen_ = true;
+        const UINT command = TrackPopupMenu(
+            menu, flags, screenX, screenY, 0, window_, nullptr);
+        popupMenuOpen_ = false;
+        selectionDismissButtonsDown_ = AnyMouseButtonDown();
+        return command;
+    }
+
+    void PollSelectionDismissal() {
+        SyncSelectionDismissTimer();
+        if (!selectionDismissTimerActive_) {
+            return;
+        }
+        const bool buttonDown = AnyMouseButtonDown();
+        if (popupMenuOpen_) {
+            selectionDismissButtonsDown_ = buttonDown;
+            return;
+        }
+        const bool pressedNow =
+            buttonDown && !selectionDismissButtonsDown_;
+        selectionDismissButtonsDown_ = buttonDown;
+        if (!pressedNow) {
+            return;
+        }
+        if (draggingCore_ || draggingItem_ || draggingDivider_ ||
+            draggingCoreDistancePanel_ ||
+            draggingCoreDistanceSlider_ ||
+            draggingCoreAppearancePanel_ ||
+            draggingCoreAppearanceSlider_) {
+            return;
+        }
+        POINT screenPoint{};
+        GetCursorPos(&screenPoint);
+        if (ScreenPointInsideInteractionIsland(screenPoint)) {
+            return;
+        }
+        CloseTransientPanels();
+        EndRename(true);
+        if (focusedCoreId_ != 0) {
+            BeginUnfocusTransition();
+        }
+        ClearSelection();
+        hover_ = {};
+        UpdateMarqueeTimerForHover();
+        Invalidate();
+    }
+
+    void DestroyInteractionWindow() {
+        if (interactionWindow_ == nullptr) {
+            return;
+        }
+        if (interactionDropTargetRegistered_) {
+            RevokeDragDrop(interactionWindow_);
+            interactionDropTargetRegistered_ = false;
+        }
+        HWND interaction = interactionWindow_;
+        interactionWindow_ = nullptr;
+        DiscardInteractionSurface();
+        DestroyWindow(interaction);
+        interactionShapes_.clear();
+    }
+
+    void AttachInteractionWindowToCompanionLayer() {
+        if (interactionWindow_ == nullptr || desktopHost_ == nullptr) {
+            return;
+        }
+        const LONG_PTR style =
+            GetWindowLongPtrW(interactionWindow_, GWL_STYLE);
+        bool frameChanged = false;
+        // Keep the OLE drop target in this process's stable popup HWND.
+        // Explorer owns only the popup relationship, not the HWND lifetime,
+        // so a Shell restart cannot orphan RegisterDragDrop's marshaled
+        // HWNDInterface sections.
+        if ((style & WS_CHILD) != 0) {
+            SetWindowLongPtrW(
+                interactionWindow_, GWL_STYLE,
+                (style & ~static_cast<LONG_PTR>(WS_CHILD)) |
+                    static_cast<LONG_PTR>(
+                        WS_POPUP | WS_CLIPCHILDREN));
+            SetParent(interactionWindow_, nullptr);
+            frameChanged = true;
+        }
+        if (GetWindow(
+                interactionWindow_, GW_OWNER) !=
+            desktopHost_) {
+            SetWindowLongPtrW(
+                interactionWindow_, GWLP_HWNDPARENT,
+                reinterpret_cast<LONG_PTR>(
+                    desktopHost_));
+            frameChanged = true;
+        }
+        if (frameChanged) {
+            SetWindowPos(
+                interactionWindow_, nullptr, 0, 0, 0, 0,
+                SWP_FRAMECHANGED | SWP_NOMOVE | SWP_NOSIZE |
+                    SWP_NOACTIVATE | SWP_NOZORDER |
+                    SWP_NOREDRAW);
+        }
+    }
+
+    HWND DesktopCompanionInsertAfter() const {
+        HWND previous = HWND_TOP;
+        for (HWND candidate = GetTopWindow(nullptr);
+             candidate != nullptr;
+             candidate = GetWindow(candidate, GW_HWNDNEXT)) {
+            if (candidate == interactionWindow_) {
+                continue;
+            }
+            if (candidate == window_) {
+                return previous;
+            }
+            if (IsWindowVisible(candidate) == FALSE) {
+                previous = candidate;
+                continue;
+            }
+            wchar_t className[32]{};
+            GetClassNameW(
+                candidate, className,
+                static_cast<int>(std::size(className)));
+            if (wcscmp(className, L"Progman") == 0 ||
+                wcscmp(className, L"WorkerW") == 0) {
+                return previous;
+            }
+            previous = candidate;
+        }
+        return desktopHost_;
+    }
+
+    void EnsureInteractionWindowPresented() {
+        if (state_.workspacePaused ||
+            window_ == nullptr ||
+            interactionWindow_ == nullptr ||
+            desktopHost_ == nullptr ||
+            IsWindow(window_) == FALSE ||
+            IsWindowVisible(window_) == FALSE ||
+            IsWindow(interactionWindow_) == FALSE ||
+            IsWindow(desktopHost_) == FALSE) {
+            return;
+        }
+        workspaceVisible_ = true;
+        AttachInteractionWindowToCompanionLayer();
+        ShowWindow(interactionWindow_, SW_SHOWNOACTIVATE);
+        // Shell foreground changes can demote this non-activating popup while
+        // its visual sibling remains visible. Keep it below ordinary windows
+        // but immediately above the visible Explorer desktop band.
+        SetWindowPos(
+            interactionWindow_, DesktopCompanionInsertAfter(),
+            0, 0, 0, 0,
+            SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE |
+                SWP_NOOWNERZORDER | SWP_NOREDRAW |
+                SWP_SHOWWINDOW);
+    }
+
+    void SyncInteractionWindowFrame() {
+        if (interactionWindow_ == nullptr || window_ == nullptr) {
+            return;
+        }
+        AttachInteractionWindowToCompanionLayer();
+        RECT bounds{};
+        if (GetWindowRect(window_, &bounds) == FALSE) {
+            return;
+        }
+        POINT origin{bounds.left, bounds.top};
+        SetWindowPos(
+            interactionWindow_,
+            DesktopCompanionInsertAfter(),
+            origin.x, origin.y,
+            std::max(1L, bounds.right - bounds.left),
+            std::max(1L, bounds.bottom - bounds.top),
+            SWP_NOACTIVATE | SWP_NOOWNERZORDER |
+                SWP_NOREDRAW);
+        PresentInteractionSurface(bounds);
+        interactionShapes_.clear();
+    }
+
+    void ApplyCompanionWorkspaceFrame() {
+        if (window_ == nullptr) return;
+        AttachToDesktopCompanionLayer();
+        const RECT work = MonitorWorkAreaPixels();
+        const int workWidth = std::max(1L, work.right - work.left);
+        const int workHeight = std::max(1L, work.bottom - work.top);
+        const bool fullScreen = state_.fullScreenWorkMode;
+        const float ratio = std::clamp(state_.workspaceWidthRatio, 0.30f, 0.70f);
+        const int width = fullScreen
+            ? workWidth
+            : std::clamp(static_cast<int>(std::round(workWidth * ratio)),
+                         1, workWidth);
+        const int x = fullScreen ? work.left : work.right - width;
+        POINT parentOrigin{x, work.top};
+        if (desktopChildHosted_ && desktopHost_ != nullptr) {
+            ScreenToClient(desktopHost_, &parentOrigin);
+        }
+        applyingWorkspaceFrame_ = true;
+        // This is a child in Explorer's desktop host, not an owned popup.  Its
+        // z-order is therefore only among desktop children; ordinary top-level
+        // applications still cover it, while Win+D never minimizes it.
+        SetWindowPos(window_, desktopChildHosted_ ? HWND_TOP : HWND_BOTTOM,
+                     parentOrigin.x, parentOrigin.y, width, workHeight,
+                     SWP_NOACTIVATE | SWP_SHOWWINDOW | SWP_NOOWNERZORDER);
+        SyncInteractionWindowFrame();
+        applyingWorkspaceFrame_ = false;
+    }
+
+    void AttachToDesktopCompanionLayer() {
+        if (window_ == nullptr) return;
+        HWND desktopHost = FindDesktopViewHost();
+        if (desktopHost == nullptr) return;
+        if (desktopHost == desktopHost_ && desktopHostAttachmentAttempted_) {
+            AttachInteractionWindowToCompanionLayer();
+            return;
+        }
+        desktopHost_ = desktopHost;
+        desktopHostAttachmentAttempted_ = true;
+        desktopChildHosted_ = false;
+
+        // Modern Explorer commonly places SHELLDLL_DefView under a visible
+        // WorkerW while Progman remains behind it. Parenting to Progman in
+        // that state produces a nominally visible window that is completely
+        // covered by the real desktop. The resolved host is the window that
+        // actually owns SHELLDLL_DefView.
+        const LONG_PTR originalStyle = GetWindowLongPtrW(window_, GWL_STYLE);
+        SetWindowLongPtrW(window_, GWL_STYLE,
+            (originalStyle & ~static_cast<LONG_PTR>(WS_POPUP)) |
+            static_cast<LONG_PTR>(WS_CHILD | WS_CLIPCHILDREN));
+        SetLastError(ERROR_SUCCESS);
+        SetParent(window_, desktopHost);
+        const LONG_PTR childStyle = GetWindowLongPtrW(window_, GWL_STYLE);
+        if (GetParent(window_) == desktopHost &&
+            (childStyle & static_cast<LONG_PTR>(WS_CHILD)) != 0) {
+            desktopChildHosted_ = true;
+            SetWindowPos(window_, nullptr, 0, 0, 0, 0,
+                SWP_FRAMECHANGED | SWP_NOMOVE | SWP_NOSIZE |
+                SWP_NOACTIVATE | SWP_NOZORDER);
+            return;
+        }
+
+        // UIPI may reject cross-integrity child parenting. In that case keep
+        // a non-activating popup owned by the same resolved desktop host.
+        SetWindowLongPtrW(window_, GWL_STYLE,
+            (originalStyle & ~static_cast<LONG_PTR>(WS_CHILD)) |
+            static_cast<LONG_PTR>(WS_POPUP | WS_CLIPCHILDREN));
+        SetParent(window_, nullptr);
+        SetWindowLongPtrW(window_, GWLP_HWNDPARENT,
+            reinterpret_cast<LONG_PTR>(desktopHost));
+        SetWindowPos(window_, nullptr, 0, 0, 0, 0,
+            SWP_FRAMECHANGED | SWP_NOMOVE | SWP_NOSIZE |
+            SWP_NOACTIVATE | SWP_NOZORDER);
+    }
+
+    bool DesktopHostReady(HWND desktopHost) const {
+        return desktopHost != nullptr &&
+               IsWindow(desktopHost) != FALSE &&
+               FindWindowExW(
+                   desktopHost, nullptr,
+                   L"SHELLDLL_DefView", nullptr) != nullptr;
+    }
+
+    bool DesktopSurfacesHealthy() const {
+        if (window_ == nullptr ||
+            interactionWindow_ == nullptr ||
+            desktopHost_ == nullptr ||
+            IsWindow(window_) == FALSE ||
+            IsWindow(interactionWindow_) == FALSE ||
+            IsWindow(desktopHost_) == FALSE) {
+            return false;
+        }
+        const HWND currentDesktopHost =
+            FindDesktopViewHost();
+        if (!DesktopHostReady(currentDesktopHost) ||
+            currentDesktopHost != desktopHost_) {
+            return false;
+        }
+        if (desktopChildHosted_) {
+            return GetParent(window_) == desktopHost_ &&
+                   (GetWindowLongPtrW(
+                        interactionWindow_,
+                        GWL_STYLE) & WS_CHILD) == 0 &&
+                   GetWindow(
+                       interactionWindow_,
+                       GW_OWNER) == desktopHost_;
+        }
+        return (GetWindowLongPtrW(
+                    window_, GWL_STYLE) & WS_CHILD) == 0 &&
+               (GetWindowLongPtrW(
+                    interactionWindow_,
+                    GWL_STYLE) & WS_CHILD) == 0 &&
+               GetWindow(window_, GW_OWNER) == desktopHost_ &&
+               GetWindow(interactionWindow_, GW_OWNER) ==
+                   desktopHost_;
+    }
+
+    RECT PrimaryWorkAreaPixels() const {
+        RECT workArea{};
+        if (SystemParametersInfoW(
+                SPI_GETWORKAREA, 0, &workArea, 0) != FALSE) {
+            return workArea;
+        }
+        return RECT{
+            0, 0,
+            GetSystemMetrics(SM_CXSCREEN),
+            GetSystemMetrics(SM_CYSCREEN)};
+    }
+
+    bool CreateVisualWindowForReconnect() {
+        if (window_ != nullptr &&
+            IsWindow(window_) != FALSE) {
+            return true;
+        }
+        window_ = nullptr;
+        const RECT workArea = PrimaryWorkAreaPixels();
+        const int workWidth =
+            std::max(1L, workArea.right - workArea.left);
+        const int workHeight =
+            std::max(1L, workArea.bottom - workArea.top);
+        const int width = state_.fullScreenWorkMode
+            ? workWidth
+            : std::clamp(
+                  static_cast<int>(std::round(
+                      workWidth *
+                      std::clamp(
+                          state_.workspaceWidthRatio,
+                          0.30f, 0.70f))),
+                  1, workWidth);
+        const int x = state_.fullScreenWorkMode
+            ? workArea.left
+            : workArea.right - width;
+        constexpr DWORD windowStyle =
+            WS_POPUP | WS_CLIPCHILDREN;
+        constexpr DWORD windowExStyle =
+            WS_EX_TOOLWINDOW | WS_EX_LAYERED |
+            WS_EX_TRANSPARENT | WS_EX_NOACTIVATE;
+        HWND replacement = CreateWindowExW(
+            windowExStyle, kWindowClass, kWindowTitle,
+            windowStyle, x, workArea.top, width, workHeight,
+            nullptr, nullptr, GetModuleHandleW(nullptr), this);
+        return replacement != nullptr &&
+               window_ == replacement;
+    }
+
+    void ResetDestroyedDesktopSurfaces() {
+        if (interactionWindow_ != nullptr &&
+            IsWindow(interactionWindow_) == FALSE) {
+            if (interactionDropTargetRegistered_) {
+                RevokeDragDrop(interactionWindow_);
+            }
+            interactionWindow_ = nullptr;
+            interactionDropTargetRegistered_ = false;
+            DiscardInteractionSurface();
+            interactionShapes_.clear();
+            editWindow_ = nullptr;
+            oldEditProc_ = nullptr;
+            editingCoreId_ = 0;
+        }
+        if (window_ != nullptr &&
+            IsWindow(window_) == FALSE) {
+            window_ = nullptr;
+            DiscardDeviceResources();
+        }
+    }
+
+    bool PositionDesktopSurfacesForReconnect() {
+        if (window_ == nullptr ||
+            interactionWindow_ == nullptr ||
+            desktopHost_ == nullptr) {
+            return false;
+        }
+        const RECT work = PrimaryWorkAreaPixels();
+        const int workWidth =
+            std::max(1L, work.right - work.left);
+        const int workHeight =
+            std::max(1L, work.bottom - work.top);
+        const bool fullScreen = state_.fullScreenWorkMode;
+        const float ratio = std::clamp(
+            state_.workspaceWidthRatio, 0.30f, 0.70f);
+        const int width = fullScreen
+            ? workWidth
+            : std::clamp(
+                  static_cast<int>(
+                      std::round(workWidth * ratio)),
+                  1, workWidth);
+        const int x =
+            fullScreen ? work.left : work.right - width;
+        POINT parentOrigin{x, work.top};
+        if (desktopChildHosted_) {
+            ScreenToClient(
+                desktopHost_, &parentOrigin);
+        }
+        SetWindowPos(
+            window_,
+            desktopChildHosted_ ? HWND_TOP : HWND_BOTTOM,
+            parentOrigin.x, parentOrigin.y,
+            width, workHeight,
+            SWP_NOACTIVATE | SWP_NOOWNERZORDER |
+                SWP_NOREDRAW);
+        SyncInteractionWindowFrame();
+        return DesktopSurfacesHealthy();
+    }
+
+    void RestoreWindowTimersAfterReconnect() {
+        if (window_ == nullptr) {
+            return;
+        }
+        selectionDismissTimerActive_ = false;
+        SyncSelectionDismissTimer();
+        SyncCoreSelectionRippleTimer();
+        if (dirty_) {
+            SetTimer(window_, kSaveTimer, 600, nullptr);
+        }
+        if (!status_.empty()) {
+            SetTimer(window_, kStatusTimer, 3600, nullptr);
+        }
+    }
+
+    bool TryReconnectDesktopSurfaces() {
+        if (shuttingDown_ || exitRequested_ ||
+            !initialized_) {
+            return false;
+        }
+        ResetDestroyedDesktopSurfaces();
+        const HWND currentDesktopHost =
+            FindDesktopViewHost();
+        if (!DesktopHostReady(currentDesktopHost)) {
+            return false;
+        }
+
+        desktopReconnectInProgress_ = true;
+        desktopHost_ = currentDesktopHost;
+        desktopHostAttachmentAttempted_ = false;
+        desktopChildHosted_ = false;
+
+        if (!CreateVisualWindowForReconnect()) {
+            desktopReconnectInProgress_ = false;
+            return false;
+        }
+        AttachToDesktopCompanionLayer();
+        if (desktopHost_ != currentDesktopHost ||
+            !CreateInteractionWindow(false) ||
+            !PositionDesktopSurfacesForReconnect()) {
+            desktopReconnectInProgress_ = false;
+            return false;
+        }
+
+        interactionShapes_.clear();
+        RECT client{};
+        GetClientRect(window_, &client);
+        const int clientWidth =
+            std::max(1L, client.right - client.left);
+        const int clientHeight =
+            std::max(1L, client.bottom - client.top);
+        if (layeredPixelSize_.cx != clientWidth ||
+            layeredPixelSize_.cy != clientHeight) {
+            DiscardDeviceResources();
+        }
+        InvalidateRect(window_, nullptr, FALSE);
+        UpdateWindow(window_);
+
+        const bool shouldShow =
+            workspaceVisible_ && !state_.workspacePaused;
+        if (shouldShow) {
+            ShowWindow(window_, SW_SHOWNOACTIVATE);
+            ShowWindow(
+                interactionWindow_, SW_SHOWNOACTIVATE);
+            EnsureInteractionWindowPresented();
+        } else {
+            ShowWindow(interactionWindow_, SW_HIDE);
+            ShowWindow(window_, SW_HIDE);
+        }
+        desktopReconnectInProgress_ = false;
+        desktopReconnectPending_ = false;
+        desktopReconnectAttempts_ = 0;
+        if (lifecycleWindow_ != nullptr) {
+            KillTimer(
+                lifecycleWindow_,
+                kDesktopReconnectTimer);
+        }
+        if (trayRebuildPending_) {
+            trayIconAdded_ = false;
+            AddTrayIcon();
+            trayRebuildPending_ = false;
+        }
+        RestoreWindowTimersAfterReconnect();
+        return true;
+    }
+
+    void BeginDesktopReconnect(bool taskbarRecreated) {
+        if (taskbarRecreated) {
+            trayIconAdded_ = false;
+            trayRebuildPending_ = true;
+        }
+        if (shuttingDown_ || exitRequested_ ||
+            lifecycleWindow_ == nullptr) {
+            return;
+        }
+        if (DesktopSurfacesHealthy()) {
+            if (trayRebuildPending_) {
+                AddTrayIcon();
+                trayRebuildPending_ = false;
+            }
+            return;
+        }
+        if (!desktopReconnectPending_) {
+            desktopReconnectPending_ = true;
+            desktopReconnectAttempts_ = 0;
+        }
+        if (TryReconnectDesktopSurfaces()) {
+            return;
+        }
+        SetTimer(
+            lifecycleWindow_, kDesktopReconnectTimer,
+            kDesktopReconnectIntervalMs, nullptr);
+    }
+
+    void HandleDesktopLifecycleTimer(WPARAM timer) {
+        if (timer == kInteractionLayerRepairTimer) {
+            KillTimer(
+                lifecycleWindow_,
+                kInteractionLayerRepairTimer);
+            EnsureInteractionWindowPresented();
+            return;
+        }
+        if (timer == kDesktopHostWatchTimer) {
+            if (initialized_ && !shuttingDown_ &&
+                !exitRequested_ &&
+                !desktopReconnectPending_) {
+                if (!DesktopSurfacesHealthy()) {
+                    BeginDesktopReconnect(false);
+                } else {
+                    EnsureInteractionWindowPresented();
+                }
+            }
+            return;
+        }
+        if (timer != kDesktopReconnectTimer ||
+            !desktopReconnectPending_) {
+            return;
+        }
+        if (TryReconnectDesktopSurfaces()) {
+            return;
+        }
+        ++desktopReconnectAttempts_;
+        if (desktopReconnectAttempts_ >=
+            kDesktopReconnectAttemptLimit) {
+            KillTimer(
+                lifecycleWindow_,
+                kDesktopReconnectTimer);
+            desktopReconnectPending_ = false;
+            desktopReconnectAttempts_ = 0;
+        }
+    }
+
+    void RememberWorkspaceWidth() {
+        if (window_ == nullptr || state_.fullScreenWorkMode) return;
+        RECT work = MonitorWorkAreaPixels();
+        RECT bounds{};
+        GetWindowRect(window_, &bounds);
+        const int workWidth = std::max(1L, work.right - work.left);
+        state_.workspaceWidthRatio = std::clamp(
+            static_cast<float>(bounds.right - bounds.left) /
+                static_cast<float>(workWidth),
+            0.30f, 0.70f);
+    }
+
+    LRESULT HitTestCompanionFrame(LPARAM lParam) const {
+        (void)lParam;
+        // This HWND is the visual canvas only.  The separate region-clipped
+        // interaction window owns every valid node hit area.
+        return HTTRANSPARENT;
+    }
+
+    void ToggleFullScreenWorkMode() {
+        if (state_.fullScreenWorkMode) {
+            state_.fullScreenViewOffset = state_.viewOffset;
+            state_.fullScreenWorkMode = false;
+            state_.viewOffset = state_.halfScreenViewOffset;
+        } else {
+            state_.halfScreenViewOffset = state_.viewOffset;
+            state_.fullScreenWorkMode = true;
+            state_.viewOffset = state_.fullScreenViewOffset;
+        }
+        ApplyCompanionWorkspaceFrame();
+        RefreshResponsiveMetrics(true);
+        ScheduleSave();
+    }
+
+    void SetWorkspaceCollapsed(bool collapsed) {
+        if (state_.workspaceCollapsed == collapsed) return;
+        state_.workspaceCollapsed = collapsed;
+        if (!collapsed) state_.workspacePaused = false;
+        ApplyCompanionWorkspaceFrame();
+        ScheduleSave();
+        SyncCoreSelectionRippleTimer();
+        Invalidate();
+    }
+
+    void SetWorkspaceVisible(bool visible) {
+        if (visible) {
+            workspaceVisible_ = true;
+            if (state_.workspacePaused) state_.workspacePaused = false;
+            if (window_ == nullptr ||
+                IsWindow(window_) == FALSE) {
+                BeginDesktopReconnect(false);
+                return;
+            }
+            ShowWindow(window_, SW_SHOWNOACTIVATE);
+            ApplyCompanionWorkspaceFrame();
+            if (interactionWindow_ != nullptr) {
+                ShowWindow(interactionWindow_, SW_SHOWNOACTIVATE);
+            }
+            EnsureInteractionWindowPresented();
+            SyncCoreSelectionRippleTimer();
+            Invalidate();
+        } else {
+            if (window_ == nullptr ||
+                IsWindow(window_) == FALSE) {
+                workspaceVisible_ = false;
+                return;
+            }
+            if (SaveState()) {
+                workspaceVisible_ = false;
+                hidingToTray_ = true;
+                if (interactionWindow_ != nullptr) {
+                    ShowWindow(interactionWindow_, SW_HIDE);
+                }
+                ShowWindow(window_, SW_HIDE);
+                hidingToTray_ = false;
+                KillTimer(window_, kCoreSelectionHaloTimer);
+            }
+        }
+    }
+
+    void RequestExit() {
+        if (SaveState()) {
+            exitRequested_ = true;
+            if (window_ != nullptr &&
+                IsWindow(window_) != FALSE) {
+                DestroyWindow(window_);
+            } else {
+                PostQuitMessage(0);
+            }
+        } else {
+            MessageBoxW(window_, L"当前布局未能可靠保存，程序不会退出。\n\n请先处理保存失败后再退出。",
+                        L"引力桌面", MB_OK | MB_ICONWARNING);
+        }
+    }
+
+    void ToggleWorkspacePause() {
+        state_.workspacePaused = !state_.workspacePaused;
+        if (state_.workspacePaused) {
+            workspaceVisible_ = false;
+            hidingToTray_ = true;
+            if (interactionWindow_ != nullptr) {
+                ShowWindow(interactionWindow_, SW_HIDE);
+            }
+            if (window_ != nullptr) {
+                ShowWindow(window_, SW_HIDE);
+            }
+            hidingToTray_ = false;
+        } else {
+            workspaceVisible_ = true;
+            if (window_ == nullptr ||
+                IsWindow(window_) == FALSE) {
+                BeginDesktopReconnect(false);
+            } else {
+                ShowWindow(window_, SW_SHOWNOACTIVATE);
+                ApplyCompanionWorkspaceFrame();
+                if (interactionWindow_ != nullptr) {
+                    ShowWindow(interactionWindow_, SW_SHOWNOACTIVATE);
+                }
+                EnsureInteractionWindowPresented();
+            }
+        }
+        ScheduleSave();
+        SyncCoreSelectionRippleTimer();
+    }
+
+    HWND TrayOwnerWindow() const {
+        if (lifecycleWindow_ != nullptr &&
+            IsWindow(lifecycleWindow_) != FALSE) {
+            return lifecycleWindow_;
+        }
+        return window_;
+    }
+
+    void AddTrayIcon() {
+        const HWND owner = TrayOwnerWindow();
+        if (owner == nullptr || trayIconAdded_) return;
+        NOTIFYICONDATAW icon{};
+        icon.cbSize = sizeof(icon);
+        icon.hWnd = owner;
+        icon.uID = kTrayIconId;
+        icon.uFlags = NIF_MESSAGE | NIF_ICON | NIF_TIP;
+        icon.uCallbackMessage = kTrayCallbackMessage;
+        icon.hIcon = LoadIconW(nullptr, IDI_APPLICATION);
+        wcsncpy_s(icon.szTip, L"引力桌面工作区", _TRUNCATE);
+        trayIconAdded_ = Shell_NotifyIconW(NIM_ADD, &icon) != FALSE;
+    }
+
+    void RemoveTrayIcon() {
+        const HWND owner = TrayOwnerWindow();
+        if (!trayIconAdded_ || owner == nullptr) return;
+        NOTIFYICONDATAW icon{};
+        icon.cbSize = sizeof(icon);
+        icon.hWnd = owner;
+        icon.uID = kTrayIconId;
+        Shell_NotifyIconW(NIM_DELETE, &icon);
+        trayIconAdded_ = false;
+    }
+
+    void ShowTrayMenu() {
+        HMENU menu = CreatePopupMenu();
+        if (menu == nullptr) return;
+        std::vector<std::uint64_t> archivedCoreIds;
+        const bool visible =
+            window_ != nullptr &&
+            IsWindowVisible(window_) != FALSE;
+        AppendMenuW(menu, MF_STRING, MenuTrayShowHide,
+                    visible ? L"隐藏工作区" : L"显示工作区");
+        AppendMenuW(menu, MF_STRING, MenuTrayPauseResume,
+                    state_.workspacePaused ? L"恢复工作区" : L"暂停工作区");
+        HMENU archivedMenu = CreatePopupMenu();
+        constexpr UINT firstRestoreCommand = 42000;
+        for (const Core& core : state_.cores) {
+            if (!core.archived) continue;
+            archivedCoreIds.push_back(core.id);
+            AppendMenuW(archivedMenu, MF_STRING,
+                        firstRestoreCommand + static_cast<UINT>(archivedCoreIds.size() - 1),
+                        core.name.c_str());
+        }
+        if (archivedCoreIds.empty()) {
+            AppendMenuW(archivedMenu, MF_STRING | MF_GRAYED, 0, L"没有归档核心");
+        }
+        AppendMenuW(menu, MF_POPUP, reinterpret_cast<UINT_PTR>(archivedMenu), L"恢复归档核心");
+        AppendMenuW(menu, MF_SEPARATOR, 0, nullptr);
+        AppendMenuW(menu, MF_STRING, MenuTrayTutorial, L"重新打开使用教程");
+        AppendMenuW(menu, MF_STRING, MenuRefreshReferences, L"检查失效文件引用");
+        AppendMenuW(menu, MF_STRING, MenuExportLayout, L"导出布局备份");
+        AppendMenuW(menu, MF_STRING, MenuImportLayout, L"导入布局备份");
+        AppendMenuW(menu, MF_SEPARATOR, 0, nullptr);
+        AppendMenuW(menu, MF_STRING, MenuTrayExit, L"退出引力桌面");
+        POINT point{};
+        GetCursorPos(&point);
+        const UINT command = TrackPopupMenuPreservingSelection(menu,
+            TPM_RETURNCMD | TPM_RIGHTBUTTON | TPM_NONOTIFY,
+            point.x, point.y);
+        DestroyMenu(menu);
+        if (command >= firstRestoreCommand &&
+            command < firstRestoreCommand + archivedCoreIds.size()) {
+            RestoreCore(archivedCoreIds[command - firstRestoreCommand]);
+        } else {
+            ExecuteMenuCommand(command);
+        }
+        const HWND menuOwner = TrayOwnerWindow();
+        if (menuOwner != nullptr) {
+            PostMessageW(menuOwner, WM_NULL, 0, 0);
+        }
+    }
+
+    void HandleTrayCallback(LPARAM event) {
+        if (event == WM_RBUTTONUP || event == WM_CONTEXTMENU) {
+            ShowTrayMenu();
+        } else if (event == WM_LBUTTONUP || event == WM_LBUTTONDBLCLK) {
+            SetWorkspaceVisible(
+                window_ == nullptr ||
+                IsWindowVisible(window_) == FALSE);
+        }
+    }
+
+    std::wstring CurrentMonitorId() const {
+        HMONITOR monitor = MonitorFromWindow(window_, MONITOR_DEFAULTTONEAREST);
+        MONITORINFOEXW info{sizeof(info)};
+        if (monitor != nullptr &&
+            GetMonitorInfoW(monitor, reinterpret_cast<MONITORINFO*>(&info))) {
+            return info.szDevice;
+        }
+        return L"";
+    }
+
+    ResponsiveMetrics CalculateResponsiveMetrics() const {
+        ResponsiveMetrics metrics;
+        const D2D1_SIZE_F client = ClientDipSize();
+        const D2D1_SIZE_F workArea = MonitorWorkAreaDip();
+        metrics.workspaceWidth =
+            std::max(1.0f, std::min(client.width, workArea.width));
+        metrics.workspaceHeight =
+            std::max(1.0f, std::min(client.height, workArea.height));
+        metrics.shortSide =
+            std::min(metrics.workspaceWidth, metrics.workspaceHeight);
+
+        float fontAdjustment = 0.0f;
+        metrics.spacingScale = 1.0f;
+        metrics.densityVisibleFactor = 1.0f;
+        if (state_.densityMode == DensityMode::Compact) {
+            metrics.spacingScale = 0.90f;
+            metrics.densityVisibleFactor = 1.20f;
+        } else if (state_.densityMode == DensityMode::Clear) {
+            fontAdjustment = 1.0f;
+            metrics.spacingScale = 1.12f;
+            metrics.densityVisibleFactor = 0.80f;
+        }
+
+        metrics.normalIconSize = std::round(std::clamp(
+            desktopIconSizeDip_, 32.0f, 96.0f));
+        metrics.importantIconSize = std::round(std::clamp(
+            metrics.normalIconSize * 1.15f, 36.0f, 110.0f));
+        metrics.minorIconSize = std::round(std::clamp(
+            metrics.normalIconSize * 0.85f, 28.0f, 82.0f));
+        metrics.coreSize = std::round(std::clamp(
+            metrics.normalIconSize * 1.33f, 56.0f, 80.0f));
+
+        metrics.fileFontSize = std::round(std::clamp(
+            desktopFileFontSizeDip_ + fontAdjustment,
+            12.0f, 14.0f));
+        metrics.coreFontSize = std::round(std::clamp(
+            metrics.fileFontSize + 2.0f, 14.0f, 17.0f));
+        metrics.helperFontSize = std::round(std::clamp(
+            metrics.fileFontSize - 1.0f, 11.0f, 13.0f));
+        // Tutorial typography is expressed in DIPs.  It scales only with the
+        // logical work area, then the D2D target handles Windows DPI scaling.
+        metrics.tutorialTitleSize = std::round(std::clamp(
+            30.0f * metrics.shortSide / 1080.0f, 28.0f, 32.0f));
+        metrics.tutorialStepSize = std::round(std::clamp(
+            24.0f * metrics.shortSide / 1080.0f, 22.0f, 26.0f));
+        metrics.tutorialBodySize = std::round(std::clamp(
+            17.0f * metrics.shortSide / 1080.0f, 16.0f, 18.0f));
+        metrics.tutorialButtonSize = std::round(std::clamp(
+            15.5f * metrics.shortSide / 1080.0f, 15.0f, 16.0f));
+        metrics.labelWidth = std::round(std::clamp(
+            metrics.normalIconSize * 2.0f, 84.0f, 120.0f));
+        metrics.minimumGap =
+            std::round(std::clamp(8.0f * metrics.spacingScale,
+                                  7.0f, 12.0f));
+
+        const int coreCount = std::max(1, static_cast<int>(std::count_if(
+            state_.cores.begin(), state_.cores.end(),
+            [](const Core& core) { return !core.archived; })));
+        if (coreCount == 1) {
+            metrics.gridColumns = 1;
+            metrics.gridRows = 1;
+        } else if (coreCount == 2) {
+            metrics.gridColumns =
+                metrics.workspaceWidth >= metrics.workspaceHeight ? 2 : 1;
+            metrics.gridRows = metrics.gridColumns == 2 ? 1 : 2;
+        } else if (coreCount <= 4) {
+            metrics.gridColumns = 2;
+            metrics.gridRows = 2;
+        } else if (coreCount <= 6) {
+            metrics.gridColumns = 3;
+            metrics.gridRows = 2;
+        } else if (coreCount <= 8) {
+            metrics.gridColumns =
+                metrics.workspaceWidth / metrics.workspaceHeight >= 1.55f
+                    ? 4
+                    : 3;
+            metrics.gridRows = metrics.gridColumns == 4 ? 2 : 3;
+        } else {
+            metrics.gridColumns =
+                std::max(3, static_cast<int>(std::ceil(
+                                std::sqrt(static_cast<float>(coreCount) *
+                                          metrics.workspaceWidth /
+                                          metrics.workspaceHeight))));
+            metrics.gridRows =
+                static_cast<int>(std::ceil(
+                    static_cast<float>(coreCount) /
+                    static_cast<float>(metrics.gridColumns)));
+        }
+
+        const float iconContainer = metrics.normalIconSize + 12.0f;
+        const float lineHeight = std::ceil(metrics.fileFontSize * 1.35f);
+        const float nodeWidth =
+            std::max(iconContainer, metrics.labelWidth);
+        const float nodeHeight =
+            iconContainer + 6.0f + lineHeight * 2.0f + 8.0f;
+        const float nodeRadius = std::max(nodeWidth, nodeHeight) / 2.0f;
+        const float safeMargin =
+            std::max(20.0f, metrics.normalIconSize * 0.55f);
+        const float cellWidth =
+            metrics.workspaceWidth / metrics.gridColumns;
+        const float cellHeight =
+            metrics.workspaceHeight / metrics.gridRows;
+
+        const std::array<float, 3> baseRadii{
+            metrics.normalIconSize * 2.2f,
+            metrics.normalIconSize * 3.6f,
+            metrics.normalIconSize * 5.0f};
+        const float availableRadius =
+            std::max(0.0f, std::min(cellWidth, cellHeight) / 2.0f -
+                               safeMargin - nodeRadius);
+        const float requiredRadius = baseRadii[1] + nodeRadius;
+        const float rawSpread =
+            requiredRadius > 0.0f ? availableRadius / requiredRadius : 1.0f;
+        metrics.spreadScale =
+            std::clamp(std::min(1.0f, rawSpread), 0.82f, 1.0f);
+
+        const auto calculateRings =
+            [&](float available, float raw, float spread,
+                std::array<float, 3>& radii,
+                std::array<int, 3>& capacities) {
+                for (int ring = 0; ring < 3; ++ring) {
+                    radii[ring] = std::round(
+                        baseRadii[ring] * metrics.spacingScale * spread);
+                    capacities[ring] = std::clamp(
+                        static_cast<int>(std::floor(
+                            2.0f * kPi * radii[ring] /
+                            (nodeWidth + metrics.minimumGap))),
+                        0, kRingCapacities[ring]);
+                }
+                if (raw < 0.82f) {
+                    capacities[2] = 0;
+                    if (available <
+                        baseRadii[1] * 0.82f + nodeRadius) {
+                        capacities[1] = 0;
+                    }
+                }
+            };
+        calculateRings(availableRadius, rawSpread, metrics.spreadScale,
+                       metrics.ringRadii, metrics.ringCapacities);
+
+        constexpr float focusScale = 1.0f;
+        const float focusedAvailable =
+            std::max(0.0f, metrics.shortSide / 2.0f -
+                               safeMargin - nodeRadius);
+        const float focusedRaw = requiredRadius > 0.0f
+                                     ? focusedAvailable /
+                                           (requiredRadius * focusScale)
+                                     : 1.0f;
+        const float focusedSpread =
+            std::clamp(std::min(1.0f, focusedRaw), 0.82f, 1.0f);
+        calculateRings(focusedAvailable, focusedRaw, focusedSpread,
+                       metrics.focusedRingRadii,
+                       metrics.focusedRingCapacities);
+
+        int suggestedNormal = 18;
+        int suggestedFocused = 18;
+        if (metrics.shortSide >= 1260.0f) {
+            suggestedNormal = 18;
+            suggestedFocused = 18;
+        } else if (metrics.shortSide >= 900.0f) {
+            suggestedNormal = 18;
+            suggestedFocused = 18;
+        }
+        const int normalSlotCapacity =
+            metrics.ringCapacities[0] + metrics.ringCapacities[1] +
+            metrics.ringCapacities[2];
+        const int focusedSlotCapacity =
+            metrics.focusedRingCapacities[0] +
+            metrics.focusedRingCapacities[1] +
+            metrics.focusedRingCapacities[2];
+        metrics.normalVisibleLimit = std::min(
+            normalSlotCapacity,
+            std::clamp(static_cast<int>(std::round(
+                           suggestedNormal *
+                           metrics.densityVisibleFactor)),
+                       6, kNormalVisibleLimit));
+        metrics.focusedVisibleLimit = std::min(
+            focusedSlotCapacity,
+            std::clamp(static_cast<int>(std::round(
+                           suggestedFocused *
+                           metrics.densityVisibleFactor)),
+                       6, kPriorityPlacementSlots));
+        return metrics;
+    }
+
+    float TierIconPixels(FileSizeTier tier) const {
+        if (tier == FileSizeTier::Important) {
+            return metrics_.importantIconSize;
+        }
+        if (tier == FileSizeTier::Minor) {
+            return metrics_.minorIconSize;
+        }
+        return metrics_.normalIconSize;
+    }
+
+    float TierContainerPixels(FileSizeTier tier) const {
+        return TierIconPixels(tier) + 12.0f;
+    }
+
+    D2D1_SIZE_F TierFootprintPixels(FileSizeTier tier) const {
+        const float container = TierContainerPixels(tier);
+        const float lineHeight = std::ceil(metrics_.fileFontSize * 1.35f);
+        return D2D1::SizeF(
+            std::max(container, metrics_.labelWidth),
+            container + 6.0f + lineHeight * 2.0f + 8.0f);
+    }
+
+    bool ShouldShowFileLabel(const FileItem& item) const {
+        (void)item;
+        return true;
+    }
+
+    static std::wstring MarqueeSourceName(const FileItem& item) {
+        if (!item.originalName.empty()) {
+            return item.originalName;
+        }
+        return FileDisplayName(item.path);
+    }
+
+    static bool NeedsMarquee(const FileItem& item) {
+        return MarqueeSourceName(item).size() > 12;
+    }
+
+    AnimationMode EffectiveAnimationMode() const {
+        BOOL animationsEnabled = TRUE;
+        if (!SystemParametersInfoW(SPI_GETCLIENTAREAANIMATION, 0,
+                                   &animationsEnabled, 0) ||
+            animationsEnabled == FALSE) {
+            return state_.animationMode == AnimationMode::Off
+                       ? AnimationMode::Off
+                       : AnimationMode::Simple;
+        }
+        return state_.animationMode;
+    }
+
+    void RefreshResponsiveMetrics(bool recreateText) {
+        metrics_ = CalculateResponsiveMetrics();
+        layoutDirty_ = true;
+        if (recreateText && writeFactory_ != nullptr) {
+            CreateTextResources();
+        }
+    }
+
+    HRESULT CreateTextResources() {
+        const wchar_t* uiFont = systemUiFontFamily_.empty()
+            ? L"Segoe UI" : systemUiFontFamily_.c_str();
+        const wchar_t* iconFont = desktopIconFontFamily_.empty()
+            ? uiFont : desktopIconFontFamily_.c_str();
+        HRESULT result = writeFactory_->CreateTextFormat(
+            uiFont, nullptr, DWRITE_FONT_WEIGHT_NORMAL, DWRITE_FONT_STYLE_NORMAL,
+            DWRITE_FONT_STRETCH_NORMAL, metrics_.helperFontSize, L"zh-CN",
+            bodyFormat_.ReleaseAndGetAddressOf());
+        if (FAILED(result)) {
+            return result;
+        }
+        bodyFormat_->SetTextAlignment(DWRITE_TEXT_ALIGNMENT_CENTER);
+        bodyFormat_->SetParagraphAlignment(DWRITE_PARAGRAPH_ALIGNMENT_CENTER);
+        bodyFormat_->SetWordWrapping(DWRITE_WORD_WRAPPING_NO_WRAP);
+
+        result = writeFactory_->CreateTextFormat(
+            uiFont, nullptr, DWRITE_FONT_WEIGHT_SEMI_BOLD, DWRITE_FONT_STYLE_NORMAL,
+            DWRITE_FONT_STRETCH_NORMAL, metrics_.coreFontSize, L"zh-CN",
+            coreFormat_.ReleaseAndGetAddressOf());
+        if (FAILED(result)) {
+            return result;
+        }
+        coreFormat_->SetTextAlignment(DWRITE_TEXT_ALIGNMENT_CENTER);
+        coreFormat_->SetParagraphAlignment(DWRITE_PARAGRAPH_ALIGNMENT_CENTER);
+        coreFormat_->SetWordWrapping(DWRITE_WORD_WRAPPING_NO_WRAP);
+
+        result = writeFactory_->CreateTextFormat(
+            uiFont, nullptr, DWRITE_FONT_WEIGHT_NORMAL, DWRITE_FONT_STYLE_NORMAL,
+            DWRITE_FONT_STRETCH_NORMAL, metrics_.helperFontSize, L"zh-CN",
+            hudFormat_.ReleaseAndGetAddressOf());
+        if (FAILED(result)) {
+            return result;
+        }
+        hudFormat_->SetTextAlignment(DWRITE_TEXT_ALIGNMENT_LEADING);
+        hudFormat_->SetParagraphAlignment(DWRITE_PARAGRAPH_ALIGNMENT_CENTER);
+        hudFormat_->SetWordWrapping(DWRITE_WORD_WRAPPING_NO_WRAP);
+
+        result = writeFactory_->CreateTextFormat(
+            iconFont, nullptr, DWRITE_FONT_WEIGHT_NORMAL,
+            DWRITE_FONT_STYLE_NORMAL, DWRITE_FONT_STRETCH_NORMAL,
+            metrics_.fileFontSize,
+            L"zh-CN", fileNameFormat_.ReleaseAndGetAddressOf());
+        if (FAILED(result)) {
+            return result;
+        }
+        fileNameFormat_->SetTextAlignment(DWRITE_TEXT_ALIGNMENT_CENTER);
+        fileNameFormat_->SetParagraphAlignment(DWRITE_PARAGRAPH_ALIGNMENT_CENTER);
+        fileNameFormat_->SetWordWrapping(DWRITE_WORD_WRAPPING_WRAP);
+
+        result = writeFactory_->CreateTextFormat(
+            iconFont, nullptr, DWRITE_FONT_WEIGHT_NORMAL,
+            DWRITE_FONT_STYLE_NORMAL, DWRITE_FONT_STRETCH_NORMAL,
+            metrics_.fileFontSize,
+            L"zh-CN", fileImportantFormat_.ReleaseAndGetAddressOf());
+        if (FAILED(result)) {
+            return result;
+        }
+        fileImportantFormat_->SetTextAlignment(DWRITE_TEXT_ALIGNMENT_CENTER);
+        fileImportantFormat_->SetParagraphAlignment(
+            DWRITE_PARAGRAPH_ALIGNMENT_CENTER);
+        fileImportantFormat_->SetWordWrapping(DWRITE_WORD_WRAPPING_WRAP);
+
+        result = writeFactory_->CreateTextFormat(
+            iconFont, nullptr, DWRITE_FONT_WEIGHT_NORMAL,
+            DWRITE_FONT_STYLE_NORMAL, DWRITE_FONT_STRETCH_NORMAL,
+            metrics_.fileFontSize,
+            L"zh-CN", fileMinorFormat_.ReleaseAndGetAddressOf());
+        if (FAILED(result)) {
+            return result;
+        }
+        fileMinorFormat_->SetTextAlignment(DWRITE_TEXT_ALIGNMENT_CENTER);
+        fileMinorFormat_->SetParagraphAlignment(DWRITE_PARAGRAPH_ALIGNMENT_CENTER);
+        fileMinorFormat_->SetWordWrapping(DWRITE_WORD_WRAPPING_WRAP);
+
+        result = writeFactory_->CreateTextFormat(
+            iconFont, nullptr, DWRITE_FONT_WEIGHT_NORMAL,
+            DWRITE_FONT_STYLE_NORMAL, DWRITE_FONT_STRETCH_NORMAL,
+            metrics_.fileFontSize,
+            L"zh-CN", fileMarqueeFormat_.ReleaseAndGetAddressOf());
+        if (FAILED(result)) {
+            return result;
+        }
+        fileMarqueeFormat_->SetTextAlignment(DWRITE_TEXT_ALIGNMENT_LEADING);
+        fileMarqueeFormat_->SetParagraphAlignment(
+            DWRITE_PARAGRAPH_ALIGNMENT_CENTER);
+        fileMarqueeFormat_->SetWordWrapping(DWRITE_WORD_WRAPPING_NO_WRAP);
+        marqueeWidthCache_.clear();
+
+        result = writeFactory_->CreateTextFormat(
+            uiFont, nullptr, DWRITE_FONT_WEIGHT_SEMI_BOLD,
+            DWRITE_FONT_STYLE_NORMAL, DWRITE_FONT_STRETCH_NORMAL, 16.0f,
+            L"zh-CN", tooltipFormat_.ReleaseAndGetAddressOf());
+        if (FAILED(result)) {
+            return result;
+        }
+        tooltipFormat_->SetTextAlignment(DWRITE_TEXT_ALIGNMENT_LEADING);
+        tooltipFormat_->SetParagraphAlignment(DWRITE_PARAGRAPH_ALIGNMENT_NEAR);
+        tooltipFormat_->SetWordWrapping(DWRITE_WORD_WRAPPING_WRAP);
+
+        result = writeFactory_->CreateTextFormat(
+            uiFont, nullptr, DWRITE_FONT_WEIGHT_NORMAL,
+            DWRITE_FONT_STYLE_NORMAL, DWRITE_FONT_STRETCH_NORMAL, 13.0f,
+            L"zh-CN", tooltipBodyFormat_.ReleaseAndGetAddressOf());
+        if (FAILED(result)) return result;
+        tooltipBodyFormat_->SetTextAlignment(DWRITE_TEXT_ALIGNMENT_LEADING);
+        tooltipBodyFormat_->SetParagraphAlignment(
+            DWRITE_PARAGRAPH_ALIGNMENT_NEAR);
+        tooltipBodyFormat_->SetWordWrapping(DWRITE_WORD_WRAPPING_WRAP);
+
+        result = writeFactory_->CreateTextFormat(
+            uiFont, nullptr, DWRITE_FONT_WEIGHT_BOLD,
+            DWRITE_FONT_STYLE_NORMAL, DWRITE_FONT_STRETCH_NORMAL,
+            metrics_.tutorialTitleSize, L"zh-CN",
+            tutorialTitleFormat_.ReleaseAndGetAddressOf());
+        if (FAILED(result)) return result;
+        tutorialTitleFormat_->SetTextAlignment(DWRITE_TEXT_ALIGNMENT_LEADING);
+        tutorialTitleFormat_->SetParagraphAlignment(DWRITE_PARAGRAPH_ALIGNMENT_NEAR);
+        tutorialTitleFormat_->SetWordWrapping(DWRITE_WORD_WRAPPING_WRAP);
+
+        result = writeFactory_->CreateTextFormat(
+            uiFont, nullptr, DWRITE_FONT_WEIGHT_SEMI_BOLD,
+            DWRITE_FONT_STYLE_NORMAL, DWRITE_FONT_STRETCH_NORMAL,
+            metrics_.tutorialStepSize, L"zh-CN",
+            tutorialStepFormat_.ReleaseAndGetAddressOf());
+        if (FAILED(result)) return result;
+        tutorialStepFormat_->SetTextAlignment(DWRITE_TEXT_ALIGNMENT_LEADING);
+        tutorialStepFormat_->SetParagraphAlignment(DWRITE_PARAGRAPH_ALIGNMENT_NEAR);
+        tutorialStepFormat_->SetWordWrapping(DWRITE_WORD_WRAPPING_WRAP);
+
+        result = writeFactory_->CreateTextFormat(
+            uiFont, nullptr, DWRITE_FONT_WEIGHT_NORMAL,
+            DWRITE_FONT_STYLE_NORMAL, DWRITE_FONT_STRETCH_NORMAL,
+            metrics_.tutorialBodySize, L"zh-CN",
+            tutorialBodyFormat_.ReleaseAndGetAddressOf());
+        if (FAILED(result)) return result;
+        tutorialBodyFormat_->SetTextAlignment(DWRITE_TEXT_ALIGNMENT_LEADING);
+        tutorialBodyFormat_->SetParagraphAlignment(DWRITE_PARAGRAPH_ALIGNMENT_NEAR);
+        tutorialBodyFormat_->SetWordWrapping(DWRITE_WORD_WRAPPING_WRAP);
+
+        result = writeFactory_->CreateTextFormat(
+            uiFont, nullptr, DWRITE_FONT_WEIGHT_SEMI_BOLD,
+            DWRITE_FONT_STYLE_NORMAL, DWRITE_FONT_STRETCH_NORMAL,
+            metrics_.tutorialButtonSize, L"zh-CN",
+            tutorialButtonFormat_.ReleaseAndGetAddressOf());
+        if (FAILED(result)) return result;
+        tutorialButtonFormat_->SetTextAlignment(DWRITE_TEXT_ALIGNMENT_CENTER);
+        tutorialButtonFormat_->SetParagraphAlignment(DWRITE_PARAGRAPH_ALIGNMENT_CENTER);
+        tutorialButtonFormat_->SetWordWrapping(DWRITE_WORD_WRAPPING_NO_WRAP);
+        return result;
+    }
+
+    HRESULT EnsureDeviceResources() {
+        if (renderTarget_ != nullptr) {
+            return S_OK;
+        }
+        RECT client{};
+        GetClientRect(window_, &client);
+        const UINT width = static_cast<UINT>(std::max(1L, client.right));
+        const UINT height = static_cast<UINT>(std::max(1L, client.bottom));
+        HRESULT result = wicFactory_->CreateBitmap(
+            width, height, GUID_WICPixelFormat32bppPBGRA,
+            WICBitmapCacheOnLoad, layeredSurface_.ReleaseAndGetAddressOf());
+        if (FAILED(result)) return result;
+        D2D1_RENDER_TARGET_PROPERTIES properties = D2D1::RenderTargetProperties(
+            D2D1_RENDER_TARGET_TYPE_DEFAULT,
+            D2D1::PixelFormat(DXGI_FORMAT_B8G8R8A8_UNORM,
+                               D2D1_ALPHA_MODE_PREMULTIPLIED));
+        properties.dpiX = dpi_;
+        properties.dpiY = dpi_;
+        result = factory_->CreateWicBitmapRenderTarget(
+            layeredSurface_.Get(), properties, renderTarget_.ReleaseAndGetAddressOf());
+        if (FAILED(result)) {
+            return result;
+        }
+        BITMAPINFO bitmapInfo{};
+        bitmapInfo.bmiHeader.biSize = sizeof(BITMAPINFOHEADER);
+        bitmapInfo.bmiHeader.biWidth = static_cast<LONG>(width);
+        bitmapInfo.bmiHeader.biHeight = -static_cast<LONG>(height);
+        bitmapInfo.bmiHeader.biPlanes = 1;
+        bitmapInfo.bmiHeader.biBitCount = 32;
+        bitmapInfo.bmiHeader.biCompression = BI_RGB;
+        layeredDeviceContext_ = CreateCompatibleDC(nullptr);
+        layeredBitmap_ = CreateDIBSection(layeredDeviceContext_, &bitmapInfo,
+            DIB_RGB_COLORS, &layeredBits_, nullptr, 0);
+        if (layeredDeviceContext_ == nullptr || layeredBitmap_ == nullptr ||
+            layeredBits_ == nullptr) {
+            DiscardDeviceResources();
+            return E_OUTOFMEMORY;
+        }
+        layeredPreviousBitmap_ = SelectObject(layeredDeviceContext_, layeredBitmap_);
+        layeredPixelSize_ = SIZE{static_cast<LONG>(width), static_cast<LONG>(height)};
+        result = renderTarget_->CreateSolidColorBrush(
+            D2D1::ColorF(0xFFFFFF), brush_.ReleaseAndGetAddressOf());
+        return result;
+    }
+
+    void DiscardDeviceResources() {
+        iconCache_.clear();
+        iconShadowCache_.clear();
+        brush_.Reset();
+        renderTarget_.Reset();
+        layeredSurface_.Reset();
+        if (layeredDeviceContext_ != nullptr && layeredPreviousBitmap_ != nullptr) {
+            SelectObject(layeredDeviceContext_, layeredPreviousBitmap_);
+        }
+        layeredPreviousBitmap_ = nullptr;
+        if (layeredBitmap_ != nullptr) DeleteObject(layeredBitmap_);
+        layeredBitmap_ = nullptr;
+        if (layeredDeviceContext_ != nullptr) DeleteDC(layeredDeviceContext_);
+        layeredDeviceContext_ = nullptr;
+        layeredBits_ = nullptr;
+        layeredPixelSize_ = SIZE{0, 0};
+    }
+
+    bool PresentLayeredSurface() {
+        if (layeredSurface_ == nullptr || layeredDeviceContext_ == nullptr ||
+            layeredBits_ == nullptr || window_ == nullptr) return false;
+        WICRect sourceRect{0, 0, layeredPixelSize_.cx, layeredPixelSize_.cy};
+        ComPtr<IWICBitmapLock> lock;
+        if (FAILED(layeredSurface_->Lock(&sourceRect, WICBitmapLockRead,
+                                         lock.ReleaseAndGetAddressOf()))) {
+            return false;
+        }
+        UINT bufferSize = 0;
+        UINT stride = 0;
+        BYTE* pixels = nullptr;
+        if (FAILED(lock->GetStride(&stride)) || FAILED(lock->GetDataPointer(
+                &bufferSize, &pixels)) || pixels == nullptr) {
+            return false;
+        }
+        const std::size_t bytesPerRow = static_cast<std::size_t>(layeredPixelSize_.cx) * 4;
+        if (stride < bytesPerRow || bufferSize < stride * layeredPixelSize_.cy) return false;
+        auto* destination = static_cast<BYTE*>(layeredBits_);
+        for (LONG row = 0; row < layeredPixelSize_.cy; ++row) {
+            std::memcpy(destination + bytesPerRow * row,
+                        pixels + static_cast<std::size_t>(stride) * row, bytesPerRow);
+        }
+        RECT frame{};
+        GetWindowRect(window_, &frame);
+        POINT destinationPoint{frame.left, frame.top};
+        POINT sourcePoint{0, 0};
+        SIZE size{layeredPixelSize_.cx, layeredPixelSize_.cy};
+        BLENDFUNCTION blend{AC_SRC_OVER, 0, 255, AC_SRC_ALPHA};
+        return UpdateLayeredWindow(window_, nullptr, &destinationPoint, &size,
+                                   layeredDeviceContext_, &sourcePoint, 0,
+                                   &blend, ULW_ALPHA) != FALSE;
+    }
+
+    int PriorityScore(const Core& core, const FileItem& item) const {
+        int score = 1'000;
+        if (item.pinned) {
+            score += 7'000'000;
+        } else if (item.inProgress) {
+            score += 6'000'000;
+        } else if (item.favorite) {
+            score += 5'000'000;
+        }
+        const std::int64_t now = UnixTimeNow();
+        const std::int64_t age = item.lastOpened > 0 ? now - item.lastOpened : INT64_MAX;
+        constexpr std::int64_t day = 24 * 60 * 60;
+        if (age <= day) {
+            score += 4'000'000;
+        } else if (age <= 3 * day) {
+            score += 3'800'000;
+        } else if (age <= 7 * day) {
+            score += 3'600'000;
+        } else if (age <= 30 * day) {
+            score += 3'200'000;
+        } else if (age > 180 * day) {
+            score -= 500'000;
+        }
+
+        int recentCount = static_cast<int>(std::count_if(
+            item.recentOpens.begin(), item.recentOpens.end(),
+            [now](std::int64_t timestamp) { return timestamp >= now - 30LL * 24 * 60 * 60; }));
+        if (item.recentOpens.empty() && item.openCount > 0) {
+            recentCount = std::min(item.openCount, 3);
+        }
+        score += std::min(recentCount, 99) * 4'000;
+        score += std::min(item.openCount, 999) * 10;
+        if (item.missing) {
+            score -= 100;
+        }
+        (void)core;
+        return score;
+    }
+
+    static float PreferredAngleDegrees(const FileItem& item) {
+        if (item.isDirectory) {
+            return -90.0f;
+        }
+        std::wstring extension = PathFindExtensionW(item.path.c_str());
+        std::transform(extension.begin(), extension.end(), extension.begin(),
+                       [](wchar_t ch) { return static_cast<wchar_t>(std::towlower(ch)); });
+        if (extension == L".lnk" || extension == L".exe" || extension == L".msi") {
+            return 90.0f;
+        }
+        if (extension == L".doc" || extension == L".docx" || extension == L".pdf" ||
+            extension == L".txt" || extension == L".md" || extension == L".rtf") {
+            return 180.0f;
+        }
+        if (extension == L".png" || extension == L".jpg" || extension == L".jpeg" ||
+            extension == L".webp" || extension == L".gif" || extension == L".bmp" ||
+            extension == L".psd" || extension == L".svg") {
+            return -45.0f;
+        }
+        if (extension == L".xls" || extension == L".xlsx" || extension == L".csv" ||
+            extension == L".tsv" || extension == L".db" || extension == L".sqlite") {
+            return 0.0f;
+        }
+        if (extension == L".cpp" || extension == L".h" || extension == L".cs" ||
+            extension == L".js" || extension == L".ts" || extension == L".py" ||
+            extension == L".html" || extension == L".css" || extension == L".json") {
+            return 90.0f;
+        }
+        if (extension == L".mp3" || extension == L".wav" || extension == L".flac" ||
+            extension == L".mp4" || extension == L".mov" || extension == L".mkv") {
+            return -45.0f;
+        }
+        return 135.0f;
+    }
+
+    float ClusterRadiusForLimit(int limit, bool expanded = true) const {
+        if (!expanded) {
+            return metrics_.coreSize / 2.0f;
+        }
+        if (limit <= 0) {
+            return metrics_.coreSize / 2.0f;
+        }
+        if (limit <= metrics_.ringCapacities[0]) {
+            return metrics_.ringRadii[0] +
+                   TierFootprintPixels(FileSizeTier::Normal).width / 2.0f;
+        }
+        if (limit <= metrics_.ringCapacities[0] +
+                         metrics_.ringCapacities[1]) {
+            return metrics_.ringRadii[1] +
+                   TierFootprintPixels(FileSizeTier::Normal).width / 2.0f;
+        }
+        return metrics_.ringRadii[2] +
+               TierFootprintPixels(FileSizeTier::Normal).width / 2.0f;
+    }
+
+    int EffectiveDisplayLimit(const Core& core) const {
+        if (!core.expanded && focusedCoreId_ != core.id) {
+            return 0;
+        }
+        const bool focused = focusedCoreId_ == core.id;
+        const std::array<int, 3> capacities =
+            ActiveRingCapacities(core);
+        const int available = capacities[0] + capacities[1] + capacities[2];
+        const int limit = focused
+            ? std::min(kFocusedVisibleLimit, available)
+            : std::min(TemplateVisibleLimit(core.layoutTemplate), available);
+        return static_cast<int>(std::min<std::size_t>(
+            AttachedFileCount(core), static_cast<std::size_t>(limit)));
+    }
+
+    std::array<int, 3> ActiveRingCapacities(
+        const Core& core) const {
+        if (focusedCoreId_ == core.id) {
+            return kRingCapacities;
+        }
+        const std::array<int, 2> templateCounts =
+            TemplateRingCounts(core.layoutTemplate,
+                               TemplateVisibleLimit(core.layoutTemplate));
+        return {templateCounts[0], templateCounts[1], 0};
+    }
+
+    float EstimatedShortTitleWidth(const FileItem& item) const {
+        const std::wstring title = item.displayName.empty()
+            ? MakeDisplayName(item.path, item.isDirectory)
+            : item.displayName;
+        float units = 0.0f;
+        for (const wchar_t character : title) {
+            units += character >= 0x2E80 ? 1.0f
+                                         : (std::iswspace(character) ? 0.35f
+                                                                      : 0.58f);
+        }
+        return std::clamp(
+            units * metrics_.fileFontSize + 14.0f,
+            44.0f, metrics_.labelWidth);
+    }
+
+    float NodePitchForCore(const Core& core) const {
+        float titleWidth = 44.0f;
+        bool usesTwoLines = false;
+        for (const FileItem& item : core.files) {
+            titleWidth = std::max(titleWidth,
+                                  EstimatedShortTitleWidth(item));
+            const std::wstring& title = item.displayName.empty()
+                ? item.originalName : item.displayName;
+            usesTwoLines = usesTwoLines || title.size() > 6;
+        }
+        const float iconContainer = metrics_.normalIconSize + 12.0f;
+        const float pitch =
+            std::max(iconContainer, titleWidth) + metrics_.minimumGap;
+        return usesTwoLines ? pitch * 1.11f : pitch;
+    }
+
+    static float OuterBaselineRadius(int outerCount) {
+        if (outerCount <= 6) {
+            return 130.0f;
+        }
+        if (outerCount <= 8) {
+            return 133.0f;
+        }
+        if (outerCount == 9) {
+            return 136.0f;
+        }
+        if (outerCount == 10) {
+            return 136.0f;
+        }
+        if (outerCount == 11) {
+            return 142.0f;
+        }
+        return outerCount == 12 ? 146.0f : 158.0f;
+    }
+
+    float EffectiveCoreRotationDegrees(const Core& core) const {
+        return NormalizeDegrees(core.baseRotationDegrees + core.rotationAngle);
+    }
+
+    float RingDistanceScale(const Core& core, int ring) const {
+        return ring <= 0 ? core.innerDistanceScale : core.outerDistanceScale;
+    }
+
+    float RingRadiusForCore(const Core& core, int ring) const {
+        // User mode never regenerates a base radius from responsive metrics.
+        // The base snapshot is immutable until the user explicitly runs an
+        // organizer or saves a new default.  Applying the two user scales here
+        // exactly once prevents post-panel cumulative contraction.
+        if (core.userLayoutCustomized) {
+            const float base = ring <= 0 ? core.baseInnerRadius
+                                         : core.baseOuterRadius;
+            return base * RingDistanceScale(core, ring);
+        }
+        // Focus may reveal additional nodes, but it is not a layout command.
+        // The canonical radii always come from the persisted template, never
+        // from a temporary focused template.
+        const LayoutTemplate layout = core.layoutTemplate;
+        const int visibleCount = std::min(
+            TemplateVisibleLimit(layout),
+            static_cast<int>(AttachedFileCount(core)));
+        const std::array<int, 2> counts =
+            TemplateRingCounts(layout, visibleCount);
+        const float scale = metrics_.normalIconSize / 48.0f;
+        const float pitch = NodePitchForCore(core);
+        const bool hasTwoLineTitle = std::any_of(
+            core.files.begin(), core.files.end(),
+            [](const FileItem& item) {
+                const std::wstring& title = item.displayName.empty()
+                    ? item.originalName : item.displayName;
+                return title.size() > 6;
+            });
+
+        const int innerCount = counts[0];
+        const float innerCircular = innerCount > 1
+            ? pitch / (2.0f * std::sin(kPi / innerCount))
+            : 0.0f;
+        float innerRadius = std::max(
+            innerCircular,
+            (innerCount >= 6 ? 74.0f : 64.0f) * scale);
+        if (hasTwoLineTitle) {
+            innerRadius *= 1.10f;
+        }
+
+        if (ring <= 0) {
+            return innerRadius * core.radiusScale *
+                   core.baselineRadiusScale * core.innerDistanceScale;
+        }
+
+        // An explicitly placed outer-ring item must keep an outer-ring
+        // distance even while the automatic template would otherwise use a
+        // single ring (for example, the first file dropped from Explorer).
+        // Six is the smallest useful outer-ring capacity and yields the
+        // established 130 DIP baseline instead of incorrectly reusing the
+        // inner radius.
+        const int outerCount = std::max(6, counts[1]);
+        const float outerCircular = pitch /
+            (2.0f * std::sin(kPi / outerCount));
+        float safetyRadius = 0.0f;
+        const float requiredCenterDistance = pitch;
+        for (int innerSlot = 0; innerSlot < innerCount; ++innerSlot) {
+            const float innerAngle = TemplateAngleDegrees(
+                layout, 0, innerSlot, innerCount, outerCount) *
+                kPi / 180.0f;
+            for (int outerSlot = 0; outerSlot < outerCount; ++outerSlot) {
+                const float outerAngle = TemplateAngleDegrees(
+                    layout, 1, outerSlot, innerCount, outerCount) *
+                    kPi / 180.0f;
+                const float delta = std::abs(std::atan2(
+                    std::sin(outerAngle - innerAngle),
+                    std::cos(outerAngle - innerAngle)));
+                const float perpendicular = innerRadius * std::sin(delta);
+                const float discriminant = requiredCenterDistance *
+                        requiredCenterDistance - perpendicular * perpendicular;
+                if (discriminant > 0.0f) {
+                    safetyRadius = std::max(
+                        safetyRadius,
+                        innerRadius * std::cos(delta) +
+                            std::sqrt(discriminant));
+                }
+            }
+        }
+        float outerRadius = std::max(
+            {outerCircular, safetyRadius,
+             OuterBaselineRadius(outerCount) * scale});
+        if (hasTwoLineTitle) {
+            outerRadius *= 1.10f;
+        }
+        return outerRadius * core.radiusScale *
+               core.baselineRadiusScale * core.outerDistanceScale;
+    }
+
+    float ClusterRadiusForCore(const Core& core) const {
+        if (!core.expanded || core.files.empty()) {
+            return metrics_.coreSize * CoreFormalLayoutScale(core) / 2.0f;
+        }
+        float radius =
+            metrics_.coreSize * CoreFormalLayoutScale(core) / 2.0f;
+        for (const FileItem& item : core.files) {
+            if (item.parentFileId != 0 || item.detachedFromUpper ||
+                item.slot < 0) {
+                continue;
+            }
+            const int ring =
+                item.ring >= 0 ? item.ring : RingForSlot(item.slot);
+            if (ring < 0) {
+                continue;
+            }
+            const float manualLength = std::sqrt(
+                item.manualOffset.x * item.manualOffset.x +
+                item.manualOffset.y * item.manualOffset.y);
+            const D2D1_SIZE_F footprint =
+                TierFootprintPixels(item.sizeTier);
+            const float footprintRadius =
+                std::sqrt(footprint.width * footprint.width +
+                          footprint.height * footprint.height) /
+                2.0f;
+            radius = std::max(
+                radius,
+                std::max(0.0f,
+                         RingRadiusForCore(core, ring) +
+                             item.radiusOffset) +
+                    manualLength + footprintRadius);
+        }
+        return radius;
+    }
+
+    float ItemVisualScale(const Core& core, const FileItem& item) const {
+        float scale =
+            1.0f / std::max(0.01f, state_.zoom);
+        const bool selected =
+            selected_.kind == HitKind::Item &&
+            selected_.coreId == core.id &&
+            selected_.itemId == item.id;
+        const bool hovered = hover_.kind == HitKind::Item && hover_.coreId == core.id &&
+                             hover_.itemId == item.id;
+        if (selected) {
+            scale *= 1.10f;
+        } else if (hovered) {
+            scale *= 1.07f;
+        }
+        return scale;
+    }
+
+    float ItemIconSize(const Core& core, const FileItem& item) const {
+        const float effectiveIcon =
+            TierIconPixels(item.sizeTier);
+        return effectiveIcon * ItemVisualScale(core, item);
+    }
+
+    float ItemHitHalfSize(const Core& core, const FileItem& item) const {
+        return TierContainerPixels(item.sizeTier) *
+               ItemVisualScale(core, item) / 2.0f;
+    }
+
+    float ScreenItemIconSize(const Core& core, const FileItem& item) const {
+        return ItemIconSize(core, item) * state_.zoom;
+    }
+
+    float ScreenLayoutIconSize(const Core& core) const {
+        (void)core;
+        return metrics_.normalIconSize;
+    }
+
+    D2D1_POINT_2F BaseDisplayItemPosition(const Core& core,
+                                          const FileItem& item) const {
+        const int ring = item.ring >= 0 ? item.ring : RingForSlot(item.slot);
+        const int ringSlot =
+            item.ringSlot >= 0 ? item.ringSlot : RingSlotForSlot(item.slot);
+        if (ring < 0 || ringSlot < 0) {
+            return core.position;
+        }
+        const float angle =
+            (item.angleDegrees +
+             EffectiveCoreRotationDegrees(core) +
+             item.angleOffsetDegrees) *
+            kPi / 180.0f;
+        const float ringRadius = RingRadiusForCore(core, ring);
+        const float radius =
+            (ringRadius + item.radiusOffset) * state_.zoom;
+        const D2D1_POINT_2F center =
+            WorldToScreen(DisplayCoreWorld(core));
+        const D2D1_POINT_2F screen =
+            D2D1::Point2F(center.x + std::cos(angle) * radius +
+                              item.manualOffset.x * state_.zoom,
+                          center.y + std::sin(angle) * radius +
+                              item.manualOffset.y * state_.zoom);
+        return ScreenToWorld(screen);
+    }
+
+    static D2D1_POINT_2F NormalizeVector(D2D1_POINT_2F vector,
+                                         D2D1_POINT_2F fallback) {
+        const float length =
+            std::sqrt(vector.x * vector.x + vector.y * vector.y);
+        if (length < 0.001f) {
+            return fallback;
+        }
+        return D2D1::Point2F(vector.x / length, vector.y / length);
+    }
+
+    static bool RectanglesIntersect(const D2D1_RECT_F& first, const D2D1_RECT_F& second) {
+        return first.left < second.right && first.right > second.left &&
+               first.top < second.bottom && first.bottom > second.top;
+    }
+
+    struct LayoutNode {
+        const Core* core = nullptr;
+        const FileItem* item = nullptr;
+        D2D1_POINT_2F screen = D2D1::Point2F();
+        D2D1_POINT_2F preferred = D2D1::Point2F();
+        D2D1_POINT_2F growth = D2D1::Point2F(1.0f, 0.0f);
+        bool redirected = false;
+    };
+
+    using LayoutMap = std::map<std::uint64_t, std::vector<ItemLayout>>;
+
+    bool IsIconFullyOutside(D2D1_POINT_2F screen, float iconHalf,
+                            const D2D1_SIZE_F& client) const {
+        return IconFullyOutsideViewport(screen, iconHalf, client);
+    }
+
+    D2D1_RECT_F NodeFootprint(const LayoutNode& node, float padding = 7.0f) const {
+        const float iconHalf =
+            ScreenLayoutIconSize(*node.core) / 2.0f + 6.0f;
+        const D2D1_RECT_F label = LabelRectangle(node);
+        return D2D1::RectF(std::min(node.screen.x - iconHalf, label.left) - padding,
+                           std::min(node.screen.y - iconHalf, label.top) - padding,
+                           std::max(node.screen.x + iconHalf, label.right) + padding,
+                           std::max(node.screen.y + iconHalf, label.bottom) + padding);
+    }
+
+    D2D1_RECT_F LabelRectangle(const LayoutNode& node) const {
+        const float iconHalf =
+            ScreenLayoutIconSize(*node.core) / 2.0f + 6.0f;
+        const std::array<D2D1_RECT_F, 4> options{
+            D2D1::RectF(node.screen.x - 49.0f,
+                        node.screen.y + iconHalf + 5.0f,
+                        node.screen.x + 49.0f,
+                        node.screen.y + iconHalf + 41.0f),
+            D2D1::RectF(node.screen.x - 49.0f,
+                        node.screen.y - iconHalf - 41.0f,
+                        node.screen.x + 49.0f,
+                        node.screen.y - iconHalf - 5.0f),
+            D2D1::RectF(node.screen.x + iconHalf + 5.0f,
+                        node.screen.y - 18.0f,
+                        node.screen.x + iconHalf + 103.0f,
+                        node.screen.y + 18.0f),
+            D2D1::RectF(node.screen.x - iconHalf - 103.0f,
+                        node.screen.y - 18.0f,
+                        node.screen.x - iconHalf - 5.0f,
+                        node.screen.y + 18.0f)};
+        const D2D1_SIZE_F client = renderTarget_ != nullptr
+                                       ? renderTarget_->GetSize()
+                                       : D2D1::SizeF(1200.0f, 760.0f);
+        D2D1_RECT_F best = options[0];
+        float bestPenalty = FLT_MAX;
+        for (const D2D1_RECT_F& option : options) {
+            const float penalty =
+                std::max(0.0f, -option.left) +
+                std::max(0.0f, -option.top) +
+                std::max(0.0f, option.right - client.width) +
+                std::max(0.0f, option.bottom - client.height);
+            if (penalty < bestPenalty) {
+                bestPenalty = penalty;
+                best = option;
+            }
+        }
+        return best;
+    }
+
+    std::vector<LayoutNode> BuildPreferredNodes() const {
+        std::vector<LayoutNode> nodes;
+        const D2D1_SIZE_F client = renderTarget_ != nullptr
+                                       ? renderTarget_->GetSize()
+                                       : D2D1::SizeF(1200.0f, 760.0f);
+        const D2D1_POINT_2F viewportCenter =
+            D2D1::Point2F(client.width / 2.0f, client.height / 2.0f);
+
+        for (const Core& core : state_.cores) {
+            if (core.archived) continue;
+            if (!CoreContentVisible(core)) {
+                continue;
+            }
+
+            std::vector<const FileItem*> items;
+            items.reserve(core.files.size());
+            for (const FileItem& item : core.files) {
+                if (item.slot >= 0) {
+                    items.push_back(&item);
+                }
+            }
+            std::sort(items.begin(), items.end(),
+                      [](const FileItem* first, const FileItem* second) {
+                          return first->slot < second->slot;
+                      });
+
+            const D2D1_POINT_2F coreScreen = WorldToScreen(core.position);
+            const D2D1_POINT_2F inward = NormalizeVector(
+                D2D1::Point2F(viewportCenter.x - coreScreen.x,
+                              viewportCenter.y - coreScreen.y),
+                D2D1::Point2F(1.0f, 0.0f));
+            const D2D1_POINT_2F perpendicular =
+                D2D1::Point2F(-inward.y, inward.x);
+            int redirectedCount = 0;
+            for (const FileItem* item : items) {
+                const D2D1_POINT_2F world =
+                    BaseDisplayItemPosition(core, *item);
+                D2D1_POINT_2F screen = WorldToScreen(world);
+                D2D1_POINT_2F growth = NormalizeVector(
+                    D2D1::Point2F(screen.x - coreScreen.x,
+                                  screen.y - coreScreen.y),
+                    inward);
+                const float iconHalf =
+                    ScreenLayoutIconSize(core) / 2.0f + 6.0f;
+                bool redirected = false;
+                if (IsIconFullyOutside(screen, iconHalf, client)) {
+                    const int branch = redirectedCount % 3 - 1;
+                    const int depth = redirectedCount / 3;
+                    const float forward = 132.0f + static_cast<float>(depth) * 96.0f;
+                    const float lateral =
+                        static_cast<float>(branch) * (102.0f + depth * 4.0f);
+                    screen = D2D1::Point2F(
+                        coreScreen.x + inward.x * forward +
+                            perpendicular.x * lateral,
+                        coreScreen.y + inward.y * forward +
+                            perpendicular.y * lateral);
+                    growth = NormalizeVector(
+                        D2D1::Point2F(inward.x + perpendicular.x * branch * 0.30f,
+                                      inward.y + perpendicular.y * branch * 0.30f),
+                        inward);
+                    redirected = true;
+                    ++redirectedCount;
+                }
+
+                nodes.push_back(
+                    {&core, item, screen, screen, growth, redirected});
+            }
+        }
+        return nodes;
+    }
+
+    LayoutMap BuildAllLayouts() const {
+        std::vector<LayoutNode> nodes = BuildPreferredNodes();
+        const D2D1_SIZE_F client = renderTarget_ != nullptr
+                                       ? renderTarget_->GetSize()
+                                       : D2D1::SizeF(1200.0f, 760.0f);
+
+        for (int iteration = 0; iteration < 96; ++iteration) {
+            bool changed = false;
+            for (std::size_t first = 0; first < nodes.size(); ++first) {
+                for (std::size_t second = first + 1; second < nodes.size(); ++second) {
+                    D2D1_RECT_F firstBounds = NodeFootprint(nodes[first]);
+                    D2D1_RECT_F secondBounds = NodeFootprint(nodes[second]);
+                    if (!RectanglesIntersect(firstBounds, secondBounds)) {
+                        continue;
+                    }
+                    changed = true;
+                    const float overlapX =
+                        std::min(firstBounds.right, secondBounds.right) -
+                        std::max(firstBounds.left, secondBounds.left);
+                    const float overlapY =
+                        std::min(firstBounds.bottom, secondBounds.bottom) -
+                        std::max(firstBounds.top, secondBounds.top);
+                    const float step = std::max(3.0f, std::min(overlapX, overlapY) / 2.0f +
+                                                         2.0f);
+                    if (nodes[first].core->id == nodes[second].core->id) {
+                        LayoutNode& later =
+                            nodes[first].item->slot > nodes[second].item->slot
+                                ? nodes[first]
+                                : nodes[second];
+                        later.screen.x += later.growth.x * step * 1.8f;
+                        later.screen.y += later.growth.y * step * 1.8f;
+                    } else {
+                        const D2D1_POINT_2F firstCore =
+                            WorldToScreen(nodes[first].core->position);
+                        const D2D1_POINT_2F secondCore =
+                            WorldToScreen(nodes[second].core->position);
+                        const D2D1_POINT_2F separation = NormalizeVector(
+                            D2D1::Point2F(firstCore.x - secondCore.x,
+                                          firstCore.y - secondCore.y),
+                            NormalizeVector(
+                                D2D1::Point2F(nodes[first].screen.x -
+                                                  nodes[second].screen.x,
+                                              nodes[first].screen.y -
+                                                  nodes[second].screen.y),
+                                D2D1::Point2F(1.0f, 0.0f)));
+                        nodes[first].screen.x += separation.x * step;
+                        nodes[first].screen.y += separation.y * step;
+                        nodes[second].screen.x -= separation.x * step;
+                        nodes[second].screen.y -= separation.y * step;
+                    }
+                }
+            }
+
+            for (LayoutNode& node : nodes) {
+                for (const Core& other : state_.cores) {
+                    if (other.id == node.core->id) {
+                        continue;
+                    }
+                    const D2D1_POINT_2F otherCenter =
+                        WorldToScreen(other.position);
+                    const float otherRadius =
+                        (focusedCoreId_ == other.id ? 68.0f : 50.0f) *
+                        state_.zoom;
+                    const D2D1_RECT_F obstacle =
+                        D2D1::RectF(otherCenter.x - otherRadius - 8.0f,
+                                    otherCenter.y - otherRadius - 8.0f,
+                                    otherCenter.x + otherRadius + 8.0f,
+                                    otherCenter.y + otherRadius + 8.0f);
+                    if (RectanglesIntersect(NodeFootprint(node), obstacle)) {
+                        const D2D1_POINT_2F away = NormalizeVector(
+                            D2D1::Point2F(node.screen.x - otherCenter.x,
+                                          node.screen.y - otherCenter.y),
+                            node.growth);
+                        node.screen.x += away.x * 12.0f;
+                        node.screen.y += away.y * 12.0f;
+                        changed = true;
+                    }
+                }
+
+                const float iconHalf =
+                    ScreenLayoutIconSize(*node.core) / 2.0f + 6.0f;
+                if (IsIconFullyOutside(node.screen, iconHalf, client)) {
+                    const D2D1_POINT_2F inward = NormalizeVector(
+                        D2D1::Point2F(client.width / 2.0f - node.screen.x,
+                                      client.height / 2.0f - node.screen.y),
+                        node.growth);
+                    node.screen.x += inward.x * 18.0f;
+                    node.screen.y += inward.y * 18.0f;
+                    node.growth = inward;
+                    node.redirected = true;
+                    changed = true;
+                }
+            }
+            if (!changed) {
+                break;
+            }
+        }
+
+        std::vector<LayoutNode> placed;
+        placed.reserve(nodes.size());
+        const auto canPlace = [this, &placed, &client](const LayoutNode& candidate) {
+            const float iconHalf =
+                ScreenLayoutIconSize(*candidate.core) / 2.0f + 6.0f;
+            if (IsIconFullyOutside(candidate.screen, iconHalf, client)) {
+                return false;
+            }
+            const D2D1_RECT_F bounds = NodeFootprint(candidate);
+            for (const LayoutNode& existing : placed) {
+                if (RectanglesIntersect(bounds, NodeFootprint(existing))) {
+                    return false;
+                }
+            }
+            for (const Core& core : state_.cores) {
+                if (core.archived) continue;
+                const D2D1_POINT_2F center = WorldToScreen(core.position);
+                const float radius =
+                    (focusedCoreId_ == core.id ? 68.0f : 50.0f) * state_.zoom;
+                const D2D1_RECT_F obstacle =
+                    D2D1::RectF(center.x - radius - 10.0f,
+                                center.y - radius - 10.0f,
+                                center.x + radius + 10.0f,
+                                center.y + radius + 10.0f);
+                if (RectanglesIntersect(bounds, obstacle)) {
+                    return false;
+                }
+            }
+            return true;
+        };
+
+        for (LayoutNode node : nodes) {
+            if (!canPlace(node)) {
+                const D2D1_POINT_2F perpendicular =
+                    D2D1::Point2F(-node.growth.y, node.growth.x);
+                bool resolved = false;
+                constexpr std::array<int, 7> branchOrder{0, -1, 1, -2, 2, -3, 3};
+                for (int depth = 0; depth < 72 && !resolved; ++depth) {
+                    for (const int branch : branchOrder) {
+                        LayoutNode candidate = node;
+                        const float forward = static_cast<float>(depth) * 86.0f;
+                        const float lateral = static_cast<float>(branch) * 104.0f;
+                        candidate.screen =
+                            D2D1::Point2F(node.screen.x + node.growth.x * forward +
+                                             perpendicular.x * lateral,
+                                         node.screen.y + node.growth.y * forward +
+                                             perpendicular.y * lateral);
+                        if (canPlace(candidate)) {
+                            node = candidate;
+                            resolved = true;
+                            break;
+                        }
+                    }
+                }
+
+                if (!resolved) {
+                    float bestDistance = FLT_MAX;
+                    std::optional<LayoutNode> best;
+                    for (float y = 38.0f; y < client.height - 38.0f; y += 82.0f) {
+                        for (float x = 55.0f; x < client.width - 55.0f; x += 112.0f) {
+                            LayoutNode candidate = node;
+                            candidate.screen = D2D1::Point2F(x, y);
+                            if (!canPlace(candidate)) {
+                                continue;
+                            }
+                            const float deltaX = x - node.preferred.x;
+                            const float deltaY = y - node.preferred.y;
+                            const float distance = deltaX * deltaX + deltaY * deltaY;
+                            if (distance < bestDistance) {
+                                bestDistance = distance;
+                                best = candidate;
+                            }
+                        }
+                    }
+                    if (best.has_value()) {
+                        node = *best;
+                    }
+                }
+            }
+            placed.push_back(node);
+        }
+        nodes = std::move(placed);
+
+        LayoutMap layouts;
+        for (const LayoutNode& node : nodes) {
+            layouts[node.core->id].push_back(
+                {node.item, ScreenToWorld(node.screen), LabelRectangle(node), true});
+        }
+        for (auto& [coreId, layout] : layouts) {
+            std::sort(layout.begin(), layout.end(),
+                      [](const ItemLayout& first, const ItemLayout& second) {
+                          return first.item->slot < second.item->slot;
+                      });
+        }
+        return layouts;
+    }
+
+    static bool ContainsText(const std::wstring& text, const wchar_t* needle) {
+        return FindStringOrdinal(FIND_FROMSTART, text.c_str(), -1, needle, -1,
+                                 TRUE) >= 0;
+    }
+
+    static CoreIconKind InferCoreIconKind(const Core& core) {
+        if (core.id == kUnclassifiedCoreId || ContainsText(core.name, L"未分类")) {
+            return CoreIconKind::Unclassified;
+        }
+        if (ContainsText(core.name, L"游戏")) {
+            return CoreIconKind::Games;
+        }
+        if (ContainsText(core.name, L"学习") || ContainsText(core.name, L"课程")) {
+            return CoreIconKind::Study;
+        }
+        if (ContainsText(core.name, L"文档") || ContainsText(core.name, L"写作")) {
+            return CoreIconKind::Documents;
+        }
+        if (ContainsText(core.name, L"文件") || ContainsText(core.name, L"资料") ||
+            ContainsText(core.name, L"文件夹")) {
+            return CoreIconKind::Folder;
+        }
+        int folders = 0;
+        int documents = 0;
+        int programs = 0;
+        int gameSignals = 0;
+        for (const FileItem& item : core.files) {
+            if (item.isDirectory) {
+                ++folders;
+            }
+            std::wstring extension = PathFindExtensionW(item.path.c_str());
+            std::transform(extension.begin(), extension.end(), extension.begin(),
+                           [](wchar_t ch) {
+                               return static_cast<wchar_t>(std::towlower(ch));
+                           });
+            if (extension == L".doc" || extension == L".docx" ||
+                extension == L".pdf" || extension == L".txt" ||
+                extension == L".md" || extension == L".rtf") {
+                ++documents;
+            }
+            if (extension == L".lnk" || extension == L".exe") {
+                ++programs;
+            }
+            const std::wstring identity =
+                item.originalName.empty() ? item.path : item.originalName;
+            constexpr std::array<const wchar_t*, 10> gameWords{
+                L"steam", L"game", L"war ", L"red dead", L"荒野",
+                L"战", L"帝国", L"turmoil", L"iratus", L"permafrost"};
+            if (std::any_of(
+                    gameWords.begin(), gameWords.end(),
+                    [&identity](const wchar_t* word) {
+                        return ContainsText(identity, word);
+                    })) {
+                ++gameSignals;
+            }
+        }
+        const int count = static_cast<int>(AttachedFileCount(core));
+        if (gameSignals >= 2 ||
+            (count >= 4 && programs * 3 >= count * 2)) {
+            return CoreIconKind::Games;
+        }
+        if (count > 0 && folders * 2 >= count) {
+            return CoreIconKind::Folder;
+        }
+        if (count > 0 && documents * 2 >= count) {
+            return CoreIconKind::Documents;
+        }
+        return CoreIconKind::General;
+    }
+
+    static UINT32 DefaultCoreColor(CoreIconKind kind) {
+        switch (kind) {
+        case CoreIconKind::Documents:
+            return 0x3978D3;
+        case CoreIconKind::Games:
+            return 0xC05A70;
+        case CoreIconKind::Folder:
+            return 0xC48735;
+        case CoreIconKind::Study:
+            return 0x3B9B82;
+        case CoreIconKind::Unclassified:
+            return 0x7E69DA;
+        default:
+            return 0x5577B8;
+        }
+    }
+
+    static void RefreshAutomaticCoreIdentity(Core& core) {
+        if (core.id == kUnclassifiedCoreId) {
+            core.iconKind = CoreIconKind::Unclassified;
+            if (!core.themeColorCustomized) {
+                core.themeColor = DefaultCoreColor(core.iconKind);
+            }
+            return;
+        }
+        if (core.iconKind == CoreIconKind::General ||
+            ContainsText(core.name, L"新核心")) {
+            core.iconKind = InferCoreIconKind(core);
+            if (!core.themeColorCustomized) {
+                core.themeColor = DefaultCoreColor(core.iconKind);
+            }
+        }
+    }
+
+    static FileSizeTier InferSizeTier(const FileItem& item) {
+        if (item.pinned || item.inProgress || item.favorite) {
+            return FileSizeTier::Important;
+        }
+        constexpr std::int64_t day = 24 * 60 * 60;
+        const std::int64_t age =
+            item.lastOpened > 0 ? UnixTimeNow() - item.lastOpened : INT64_MAX;
+        if (item.lastOpened > 0 && item.openCount <= 1 && age > 180 * day) {
+            return FileSizeTier::Minor;
+        }
+        return FileSizeTier::Normal;
+    }
+
+    static int PreferredRing(const FileItem& item) {
+        if (item.pinned || item.inProgress) {
+            return 0;
+        }
+        if (item.favorite || item.lastOpened > 0 || item.openCount > 0) {
+            return 1;
+        }
+        return 2;
+    }
+
+    void NormalizeStateModel() {
+        bool changed = false;
+        // v13 remains a desktop companion: the divider may alter the saved
+        // right-side ratio, but this is never a free floating resize.
+        const float safeWorkspaceRatio = std::clamp(
+            state_.workspaceWidthRatio, 0.30f, 0.70f);
+        if (std::abs(state_.workspaceWidthRatio - safeWorkspaceRatio) > 0.0001f) {
+            state_.workspaceWidthRatio = safeWorkspaceRatio;
+            changed = true;
+        }
+        if (std::abs(state_.dividerPosition - state_.workspaceWidthRatio) > 0.0001f) {
+            state_.dividerPosition = state_.workspaceWidthRatio;
+            changed = true;
+        }
+        if (state_.workspaceCollapsed) {
+            state_.workspaceCollapsed = false;
+            changed = true;
+        }
+        const D2D1_SIZE_F workspace = ClientDipSize();
+        const std::wstring monitorId = CurrentMonitorId();
+        for (std::size_t coreIndex = 0; coreIndex < state_.cores.size();
+             ++coreIndex) {
+            Core& core = state_.cores[coreIndex];
+            // v15 added persisted per-ring controls; v16 changes only the
+            // ownership of manual positions. Re-running the legacy organizer
+            // would discard a user's saved distance, so only truly old slot
+            // models are organized during migration.
+            const bool migrateLayout = core.layoutVersion < 14;
+            const bool legacyWithoutStableOffsets = core.layoutVersion < 3;
+            const bool migrateManualRotation =
+                core.layoutVersion >= 14 &&
+                core.layoutVersion < kLayoutVersion;
+            if (core.displayLimit != kNormalVisibleLimit) {
+                core.displayLimit = kNormalVisibleLimit;
+                changed = true;
+            }
+            if (core.themeColor == 0) {
+                core.iconKind = InferCoreIconKind(core);
+                core.themeColor = DefaultCoreColor(core.iconKind);
+                core.themeColorCustomized = false;
+                changed = true;
+            }
+            if (core.xRatio < 0.0f || core.yRatio < 0.0f) {
+                const D2D1_POINT_2F screen =
+                    WorldToScreen(core.position);
+                core.xRatio = std::clamp(
+                    screen.x / std::max(1.0f, workspace.width),
+                    0.04f, 0.96f);
+                core.yRatio = std::clamp(
+                    screen.y / std::max(1.0f, workspace.height),
+                    0.06f, 0.92f);
+                changed = true;
+            } else {
+                core.position = ScreenToWorld(D2D1::Point2F(
+                    core.xRatio * workspace.width,
+                    core.yRatio * workspace.height));
+            }
+            if (core.monitorId.empty()) {
+                core.monitorId = monitorId;
+                changed = true;
+            }
+            const float safeDistanceScale = std::clamp(
+                core.distanceScale, 0.55f, 1.60f);
+            if (std::abs(core.distanceScale - safeDistanceScale) > 0.0001f) {
+                core.distanceScale = safeDistanceScale;
+                changed = true;
+            }
+            const float safeInnerDistance = std::clamp(
+                core.innerDistanceScale, 0.60f, 1.40f);
+            if (std::abs(core.innerDistanceScale - safeInnerDistance) > 0.0001f) {
+                core.innerDistanceScale = safeInnerDistance;
+                changed = true;
+            }
+            const float safeOuterDistance = std::clamp(
+                core.outerDistanceScale, 0.70f, 1.60f);
+            if (std::abs(core.outerDistanceScale - safeOuterDistance) > 0.0001f) {
+                core.outerDistanceScale = safeOuterDistance;
+                changed = true;
+            }
+            const float safeRotation = NormalizeDegrees(core.rotationAngle);
+            if (std::abs(core.rotationAngle - safeRotation) > 0.0001f) {
+                core.rotationAngle = safeRotation;
+                changed = true;
+            }
+            const float safeBaselineRadiusScale = std::clamp(
+                core.baselineRadiusScale, 0.35f, 3.00f);
+            if (std::abs(core.baselineRadiusScale - safeBaselineRadiusScale) >
+                0.0001f) {
+                core.baselineRadiusScale = safeBaselineRadiusScale;
+                changed = true;
+            }
+            core.innerRadius =
+                kDefaultRingRadii[0] * core.radiusScale *
+                core.baselineRadiusScale;
+            core.middleRadius =
+                kDefaultRingRadii[1] * core.radiusScale *
+                core.baselineRadiusScale;
+            core.outerRadius =
+                kDefaultRingRadii[2] * core.radiusScale *
+                core.baselineRadiusScale;
+            if (migrateLayout && state_.cores.size() > 8 &&
+                coreIndex >= 8 && core.expanded) {
+                core.expanded = false;
+                changed = true;
+            }
+
+            if (migrateManualRotation) {
+                const float legacyRotation =
+                    EffectiveCoreRotationDegrees(core);
+                for (CoreBaselineFileLayout& baseline :
+                     core.savedBaselineLayout) {
+                    if (baseline.manuallyMoved ||
+                        baseline.lockedPosition) {
+                        baseline.angleDegrees = NormalizeDegrees(
+                            baseline.angleDegrees -
+                            core.baselineBaseRotationDegrees -
+                            core.baselineRotationAngle);
+                    }
+                }
+                for (FileItem& item : core.files) {
+                    if (item.manuallyMoved || item.lockedPosition) {
+                        item.angleDegrees = NormalizeDegrees(
+                            item.angleDegrees - legacyRotation);
+                    }
+                }
+                changed = true;
+            }
+
+            for (FileItem& item : core.files) {
+                if (item.originalName.empty()) {
+                    item.originalName = FileDisplayName(item.path);
+                    changed = true;
+                }
+                if (item.displayName.empty()) {
+                    item.displayName = MakeDisplayName(item.path, item.isDirectory);
+                    changed = true;
+                }
+                if (migrateLayout) {
+                    if (legacyWithoutStableOffsets) {
+                        item.sizeTier = InferSizeTier(item);
+                        GenerateStableOffsets(item);
+                        item.manualOffset = D2D1::Point2F();
+                        item.manuallyMoved = false;
+                        item.lockedPosition = false;
+                    }
+                    changed = true;
+                } else {
+                    const int expectedRing = RingForSlot(item.slot);
+                    const int expectedRingSlot = RingSlotForSlot(item.slot);
+                    if (item.slot >= 0 &&
+                        (item.ring != expectedRing ||
+                         item.ringSlot != expectedRingSlot)) {
+                        item.ring = expectedRing;
+                        item.ringSlot = expectedRingSlot;
+                        changed = true;
+                    }
+                }
+            }
+
+            if (migrateLayout) {
+                OptimizeCoreLayout(core, true);
+                changed = true;
+            }
+            if (core.layoutVersion != kLayoutVersion) {
+                core.layoutVersion = kLayoutVersion;
+                changed = true;
+            }
+            // "My default" is user-owned data.  Do not silently manufacture
+            // it from an automatic or migration layout.
+        }
+        layoutDirty_ = true;
+        if (changed && !benchmarkMode_) {
+            dirty_ = true;
+            if (window_ != nullptr) {
+                SetTimer(window_, kSaveTimer, 600, nullptr);
+            }
+        }
+    }
+
+    void ApplyCoreRatiosToWorkspace() {
+        const D2D1_SIZE_F workspace = ClientDipSize();
+        for (Core& core : state_.cores) {
+            if (core.xRatio >= 0.0f && core.yRatio >= 0.0f) {
+                core.position = ScreenToWorld(D2D1::Point2F(
+                    core.xRatio * workspace.width,
+                    core.yRatio * workspace.height));
+            }
+        }
+    }
+
+    void UpdateCoreRatios() {
+        const D2D1_SIZE_F workspace = ClientDipSize();
+        const std::wstring monitorId = CurrentMonitorId();
+        for (Core& core : state_.cores) {
+            const D2D1_POINT_2F screen =
+                WorldToScreen(core.position);
+            core.xRatio = std::clamp(
+                screen.x / std::max(1.0f, workspace.width),
+                0.0f, 1.0f);
+            core.yRatio = std::clamp(
+                screen.y / std::max(1.0f, workspace.height),
+                0.0f, 1.0f);
+            core.monitorId = monitorId;
+        }
+    }
+
+    D2D1_SIZE_F ClientDipSize() const {
+        if (renderTarget_ != nullptr) {
+            return renderTarget_->GetSize();
+        }
+        RECT client{};
+        GetClientRect(window_, &client);
+        const float scale = std::max(0.1f, dpi_ / 96.0f);
+        return D2D1::SizeF(std::max(1L, client.right) / scale,
+                           std::max(1L, client.bottom) / scale);
+    }
+
+    D2D1_POINT_2F DisplayCoreWorld(const Core& core) const {
+        const auto found = coreDisplayPositions_.find(core.id);
+        return found == coreDisplayPositions_.end() ? core.position
+                                                     : found->second;
+    }
+
+    D2D1_RECT_F StableLabelRectangle(D2D1_POINT_2F screen,
+                                     FileSizeTier tier,
+                                     float clusterScale = 1.0f) const {
+        const float width = metrics_.labelWidth;
+        const float containerHalf =
+            TierContainerPixels(tier) * clusterScale / 2.0f;
+        const float lineHeight = std::ceil(metrics_.fileFontSize * 1.35f);
+        return D2D1::RectF(screen.x - width / 2.0f,
+                           screen.y + containerHalf + 3.0f,
+                           screen.x + width / 2.0f,
+                           screen.y + containerHalf + lineHeight * 2.0f + 6.0f);
+    }
+
+    D2D1_RECT_F StableFootprint(D2D1_POINT_2F screen,
+                                FileSizeTier tier,
+                                float clusterScale = 1.0f,
+                                bool labelVisible = true) const {
+        const float container =
+            TierContainerPixels(tier) * clusterScale;
+        const float lineHeight = std::ceil(metrics_.fileFontSize * 1.35f);
+        const D2D1_SIZE_F size = D2D1::SizeF(
+            labelVisible ? std::max(container, metrics_.labelWidth)
+                         : container + 8.0f,
+            labelVisible
+                ? container + 6.0f + lineHeight * 2.0f + 8.0f
+                : container + 8.0f);
+        const float containerHalf = container / 2.0f;
+        const float top = screen.y - containerHalf - 4.0f;
+        return D2D1::RectF(screen.x - size.width / 2.0f, top,
+                           screen.x + size.width / 2.0f, top + size.height);
+    }
+
+    static D2D1_RECT_F InflateRectangle(D2D1_RECT_F rectangle, float amount) {
+        rectangle.left -= amount;
+        rectangle.top -= amount;
+        rectangle.right += amount;
+        rectangle.bottom += amount;
+        return rectangle;
+    }
+
+    D2D1_POINT_2F RedirectFullyHiddenItem(
+        const Core& core, const FileItem& item, D2D1_POINT_2F original,
+        const std::vector<D2D1_RECT_F>& occupied) const {
+        const D2D1_SIZE_F client = ClientDipSize();
+        const float iconHalf = TierIconPixels(item.sizeTier) / 2.0f;
+        if (!IconFullyOutsideViewport(original, iconHalf, client)) {
+            return original;
+        }
+
+        const D2D1_POINT_2F center = WorldToScreen(core.position);
+        const D2D1_POINT_2F inward = NormalizeVector(
+            D2D1::Point2F(client.width / 2.0f - center.x,
+                          client.height / 2.0f - center.y),
+            D2D1::Point2F(1.0f, 0.0f));
+        const D2D1_POINT_2F perpendicular =
+            D2D1::Point2F(-inward.y, inward.x);
+        const int ring = item.ring >= 0 ? item.ring : RingForSlot(item.slot);
+        const int safeRing = std::clamp(ring, 0, 1);
+        const float baseRadius =
+            RingRadiusForCore(core, safeRing) +
+            std::clamp(item.radiusOffset, -8.0f, 8.0f);
+        constexpr std::array<int, 9> branches{0, -1, 1, -2, 2, -3, 3, -4, 4};
+        const D2D1_SIZE_F footprint = TierFootprintPixels(item.sizeTier);
+        for (int depth = 0; depth < 3; ++depth) {
+            for (const int branch : branches) {
+                const float forward =
+                    baseRadius + static_cast<float>(depth) * 72.0f;
+                const float lateral =
+                    static_cast<float>(branch) * (footprint.width + 12.0f);
+                const D2D1_POINT_2F candidate =
+                    D2D1::Point2F(center.x + inward.x * forward +
+                                      perpendicular.x * lateral,
+                                  center.y + inward.y * forward +
+                                      perpendicular.y * lateral);
+                if (IconFullyOutsideViewport(candidate, iconHalf, client)) {
+                    continue;
+                }
+                const D2D1_RECT_F bounds =
+                    StableFootprint(
+                        candidate, item.sizeTier, 1.0f);
+                if (std::none_of(
+                        occupied.begin(), occupied.end(),
+                        [&bounds](const D2D1_RECT_F& existing) {
+                            return RectanglesIntersect(bounds, existing);
+                        })) {
+                    return candidate;
+                }
+            }
+        }
+        return original;
+    }
+
+    void RebuildLayoutCache() {
+        metrics_ = CalculateResponsiveMetrics();
+        layoutCache_.clear();
+        coreDisplayPositions_.clear();
+        const D2D1_SIZE_F client = ClientDipSize();
+        std::vector<std::pair<std::uint64_t, D2D1_RECT_F>> globalFootprints;
+        struct CoreBoundary {
+            std::uint64_t coreId = 0;
+            D2D1_POINT_2F center = D2D1::Point2F();
+            float radius = 0.0f;
+        };
+        std::vector<CoreBoundary> coreBoundaries;
+
+        const float coreHalfBase =
+            metrics_.coreSize * state_.zoom / 2.0f;
+        const float coreLabelHalf = std::max(
+            coreHalfBase + 8.0f, metrics_.labelWidth / 2.0f);
+        const float coreBottom =
+            coreHalfBase + metrics_.coreFontSize + 18.0f;
+        const auto clampCore =
+            [&client, coreLabelHalf, coreHalfBase,
+             coreBottom](D2D1_POINT_2F point) {
+            point.x = std::clamp(
+                point.x, coreLabelHalf + 8.0f,
+                std::max(coreLabelHalf + 8.0f,
+                         client.width - coreLabelHalf - 8.0f));
+            point.y = std::clamp(
+                point.y, coreHalfBase + 8.0f,
+                std::max(coreHalfBase + 8.0f,
+                client.height - coreBottom - 8.0f));
+            return point;
+        };
+        std::vector<Core*> corePlacementOrder;
+        corePlacementOrder.reserve(state_.cores.size());
+        for (Core& core : state_.cores) {
+            if (core.archived || !CoreBodyVisible(core)) continue;
+            corePlacementOrder.push_back(&core);
+        }
+        const std::uint64_t anchoredCoreId =
+            draggingCore_ && dragCoreId_ != 0
+                ? dragCoreId_
+                : focusedCoreId_;
+        if (anchoredCoreId != 0) {
+            std::stable_sort(
+                corePlacementOrder.begin(), corePlacementOrder.end(),
+                [anchoredCoreId](const Core* first,
+                                 const Core* second) {
+                    return first->id == anchoredCoreId &&
+                           second->id != anchoredCoreId;
+                });
+        }
+        for (Core* corePointer : corePlacementOrder) {
+            Core& core = *corePointer;
+            // Core movement is a last-stage hard-body rule.  File extents are
+            // intentionally excluded: cross-cluster file collisions are
+            // resolved below by sliding files into nearby free space.
+            const float coreCollisionRadius =
+                (metrics_.coreSize / 2.0f + 8.0f) * state_.zoom;
+            D2D1_POINT_2F preferred =
+                clampCore(WorldToScreen(core.position));
+            D2D1_POINT_2F resolved = preferred;
+            bool placed = false;
+            for (int shell = 0; shell <= 50 && !placed; ++shell) {
+                const int directions = shell == 0 ? 1 : 24;
+                for (int direction = 0; direction < directions; ++direction) {
+                    const float angle =
+                        2.0f * kPi * static_cast<float>(direction) /
+                        static_cast<float>(directions);
+                    const float distance = static_cast<float>(shell) * 12.0f;
+                    const D2D1_POINT_2F candidate = clampCore(
+                        D2D1::Point2F(preferred.x + std::cos(angle) * distance,
+                                      preferred.y + std::sin(angle) * distance));
+                    const bool coreCollision = std::any_of(
+                        coreBoundaries.begin(), coreBoundaries.end(),
+                        [&candidate, coreCollisionRadius](
+                            const CoreBoundary& existing) {
+                            const float required =
+                                coreCollisionRadius + existing.radius +
+                                24.0f;
+                            return DistanceSquared(candidate,
+                                                   existing.center) <
+                                   required * required;
+                        });
+                    if (!coreCollision) {
+                        resolved = candidate;
+                        placed = true;
+                        break;
+                    }
+                }
+            }
+            coreBoundaries.push_back(
+                {core.id, resolved, coreCollisionRadius});
+            coreDisplayPositions_[core.id] = ScreenToWorld(resolved);
+            if (focusedCoreId_ == 0 &&
+                focusAnimationState_ == FocusAnimationState::Idle) {
+                const D2D1_POINT_2F safeWorld = ScreenToWorld(resolved);
+                if (DistanceSquared(core.position, safeWorld) > 0.25f) {
+                    core.position = safeWorld;
+                    core.xRatio = std::clamp(
+                        resolved.x / std::max(1.0f, client.width),
+                        0.0f, 1.0f);
+                    core.yRatio = std::clamp(
+                        resolved.y / std::max(1.0f, client.height),
+                        0.0f, 1.0f);
+                    core.monitorId = CurrentMonitorId();
+                    if (!benchmarkMode_) {
+                        dirty_ = true;
+                    }
+                }
+            }
+        }
+
+        std::vector<const Core*> orderedCores;
+        orderedCores.reserve(state_.cores.size());
+        for (const Core& core : state_.cores) {
+            if (core.archived) continue;
+            orderedCores.push_back(&core);
+        }
+        std::stable_sort(
+            orderedCores.begin(), orderedCores.end(),
+            [](const Core* first, const Core* second) {
+                return first->id < second->id;
+            });
+
+        for (const Core* core : orderedCores) {
+            const bool mainClusterVisible =
+                CoreContentVisible(*core);
+            const bool hasDetachedFiles = std::any_of(
+                core->files.begin(), core->files.end(),
+                [](const FileItem& item) {
+                    return item.detachedFromUpper;
+                });
+            if (!mainClusterVisible && !hasDetachedFiles) {
+                continue;
+            }
+            const int maximum = EffectiveDisplayLimit(*core);
+            const std::array<int, 3> activeCapacities =
+                ActiveRingCapacities(*core);
+            std::vector<const FileItem*> candidates;
+            candidates.reserve(core->files.size());
+            if (mainClusterVisible) {
+                for (const FileItem& item : core->files) {
+                    if (item.parentFileId != 0 ||
+                        item.detachedFromUpper) {
+                        continue;
+                    }
+                    if ((item.slot >= 0 &&
+                         item.slot < kPriorityPlacementSlots) ||
+                        (focusedCoreId_ == core->id &&
+                         item.slot < 0)) {
+                        candidates.push_back(&item);
+                    }
+                }
+            }
+            std::stable_sort(
+                candidates.begin(), candidates.end(),
+                [this, core](const FileItem* first, const FileItem* second) {
+                    const int firstScore = PriorityScore(*core, *first);
+                    const int secondScore = PriorityScore(*core, *second);
+                    return firstScore != secondScore ? firstScore > secondScore
+                                                     : first->id < second->id;
+                });
+
+            const int fileMaximum = maximum;
+
+            std::vector<D2D1_RECT_F> occupied;
+            std::set<int> assignedRuntimeSlots;
+            int rejected = 0;
+            const auto itemScale = [](const FileItem*) {
+                return 1.0f;
+            };
+            const auto clampFileToViewport =
+                [this, &client](D2D1_POINT_2F screen, FileSizeTier tier,
+                                float scale, bool labelVisible) {
+                    D2D1_RECT_F bounds =
+                        StableFootprint(screen, tier, scale, labelVisible);
+                    constexpr float margin = 8.0f;
+                    if (bounds.left < margin) {
+                        screen.x += margin - bounds.left;
+                    }
+                    if (bounds.right > client.width - margin) {
+                        screen.x -= bounds.right - client.width + margin;
+                    }
+                    if (bounds.top < margin) {
+                        screen.y += margin - bounds.top;
+                    }
+                    if (bounds.bottom > client.height - margin) {
+                        screen.y -= bounds.bottom - client.height + margin;
+                    }
+                    return screen;
+                };
+            const auto collidesWithForeignCluster =
+                [this, core, &globalFootprints](
+                    const D2D1_RECT_F& bounds) {
+                    const D2D1_RECT_F safeBounds =
+                        InflateRectangle(bounds, 6.0f);
+                    for (const auto& [otherCoreId, otherBounds] :
+                         globalFootprints) {
+                        if (otherCoreId == core->id) continue;
+                        if (RectanglesIntersect(
+                                safeBounds,
+                                InflateRectangle(otherBounds, 6.0f))) {
+                            return true;
+                        }
+                    }
+                    for (const Core& other : state_.cores) {
+                        if (other.archived ||
+                            !CoreBodyVisible(other) ||
+                            other.id == core->id) {
+                            continue;
+                        }
+                        const D2D1_POINT_2F otherCenter =
+                            WorldToScreen(DisplayCoreWorld(other));
+                        const float half =
+                            metrics_.coreSize * state_.zoom / 2.0f + 8.0f;
+                        const D2D1_RECT_F body = D2D1::RectF(
+                            otherCenter.x - half, otherCenter.y - half,
+                            otherCenter.x + half, otherCenter.y + half);
+                        if (RectanglesIntersect(safeBounds, body)) {
+                            return true;
+                        }
+                    }
+                    return false;
+                };
+            const auto collidesWithOwnCluster =
+                [&occupied](const D2D1_RECT_F& bounds) {
+                    return std::any_of(
+                        occupied.begin(), occupied.end(),
+                        [&bounds](const D2D1_RECT_F& existing) {
+                            return RectanglesIntersect(
+                                InflateRectangle(bounds, 4.0f),
+                                InflateRectangle(existing, 4.0f));
+                        });
+                };
+            const auto slideAwayFromForeignCluster =
+                [this, core, &clampFileToViewport,
+                 &collidesWithForeignCluster,
+                 &collidesWithOwnCluster](
+                    D2D1_POINT_2F preferred, FileSizeTier tier,
+                    float scale, bool labelVisible) {
+                    preferred = clampFileToViewport(
+                        preferred, tier, scale, labelVisible);
+                    const D2D1_RECT_F preferredBounds =
+                        StableFootprint(
+                            preferred, tier, scale, labelVisible);
+                    if (!collidesWithForeignCluster(preferredBounds)) {
+                        return preferred;
+                    }
+
+                    D2D1_POINT_2F away = D2D1::Point2F();
+                    for (const Core& other : state_.cores) {
+                        if (other.archived ||
+                            !CoreBodyVisible(other) ||
+                            other.id == core->id) {
+                            continue;
+                        }
+                        const D2D1_POINT_2F otherCenter =
+                            WorldToScreen(DisplayCoreWorld(other));
+                        const float half =
+                            metrics_.coreSize * state_.zoom / 2.0f + 8.0f;
+                        const D2D1_RECT_F body = D2D1::RectF(
+                            otherCenter.x - half, otherCenter.y - half,
+                            otherCenter.x + half, otherCenter.y + half);
+                        if (RectanglesIntersect(
+                                InflateRectangle(preferredBounds, 6.0f),
+                                body)) {
+                            const D2D1_POINT_2F direction =
+                                NormalizeVector(
+                                    D2D1::Point2F(
+                                        preferred.x - otherCenter.x,
+                                        preferred.y - otherCenter.y),
+                                    D2D1::Point2F(1.0f, 0.0f));
+                            away.x += direction.x;
+                            away.y += direction.y;
+                        }
+                    }
+                    const D2D1_POINT_2F coreCenter =
+                        WorldToScreen(DisplayCoreWorld(*core));
+                    away = NormalizeVector(
+                        away,
+                        NormalizeVector(
+                            D2D1::Point2F(
+                                preferred.x - coreCenter.x,
+                                preferred.y - coreCenter.y),
+                            D2D1::Point2F(1.0f, 0.0f)));
+                    const float awayAngle = std::atan2(away.y, away.x);
+                    constexpr int directions = 24;
+                    for (int shell = 1; shell <= 32; ++shell) {
+                        const float distance =
+                            12.0f * static_cast<float>(shell);
+                        for (int direction = 0;
+                             direction < directions; ++direction) {
+                            // Test the direct repulsion direction first, then
+                            // alternate clockwise/counter-clockwise around it.
+                            const int branch = direction == 0
+                                ? 0
+                                : (direction % 2 == 1
+                                       ? (direction + 1) / 2
+                                       : -direction / 2);
+                            const float angle =
+                                awayAngle +
+                                static_cast<float>(branch) *
+                                    (2.0f * kPi /
+                                     static_cast<float>(directions));
+                            D2D1_POINT_2F candidate = D2D1::Point2F(
+                                preferred.x + std::cos(angle) * distance,
+                                preferred.y + std::sin(angle) * distance);
+                            candidate = clampFileToViewport(
+                                candidate, tier, scale, labelVisible);
+                            const D2D1_RECT_F bounds =
+                                StableFootprint(
+                                    candidate, tier, scale, labelVisible);
+                            if (!collidesWithForeignCluster(bounds) &&
+                                !collidesWithOwnCluster(bounds)) {
+                                return candidate;
+                            }
+                        }
+                    }
+                    // A packed workspace may have no legal nearby slot.
+                    // Preserve the user's canonical position instead of
+                    // moving a core early or writing a destructive fallback.
+                    return preferred;
+                };
+            const auto findRuntimeSlot =
+                [this, core, &activeCapacities, &assignedRuntimeSlots](
+                    const FileItem& item) {
+                    const int savedRing = RingForSlot(item.slot);
+                    const int savedRingSlot = RingSlotForSlot(item.slot);
+                    const bool userPlaced =
+                        item.manuallyMoved || item.lockedPosition;
+                    const int usableCapacity =
+                        userPlaced && savedRing >= 0 && savedRing < 3
+                            ? kRingCapacities[savedRing]
+                            : (savedRing >= 0 && savedRing < 3
+                                   ? activeCapacities[savedRing]
+                                   : 0);
+                    if (savedRing >= 0 && savedRing < 3 &&
+                        savedRingSlot >= 0 &&
+                        savedRingSlot < usableCapacity &&
+                        !assignedRuntimeSlots.contains(item.slot)) {
+                        return item.slot;
+                    }
+                    const float preferredAngle =
+                        (item.angleDegrees +
+                         EffectiveCoreRotationDegrees(*core) +
+                         item.angleOffsetDegrees) *
+                        kPi / 180.0f;
+                    const int preferredRing = std::clamp(
+                        item.ring >= 0 ? item.ring : PreferredRing(item),
+                        0, 2);
+                    float bestPenalty = FLT_MAX;
+                    int bestSlot = -1;
+                    for (int ring = 0; ring < 3; ++ring) {
+                        for (int ringSlot = 0;
+                             ringSlot < activeCapacities[ring];
+                             ++ringSlot) {
+                            const int slot = GlobalSlot(ring, ringSlot);
+                            if (assignedRuntimeSlots.contains(slot)) {
+                                continue;
+                            }
+                            float angleDistance = std::fmod(
+                                std::abs(SlotAngleRadians(ring, ringSlot) +
+                                             EffectiveCoreRotationDegrees(*core) *
+                                                 kPi / 180.0f -
+                                         preferredAngle),
+                                2.0f * kPi);
+                            angleDistance = std::min(
+                                angleDistance, 2.0f * kPi - angleDistance);
+                            const float penalty =
+                                std::abs(ring - preferredRing) * 8.0f +
+                                angleDistance;
+                            if (penalty < bestPenalty) {
+                                bestPenalty = penalty;
+                                bestSlot = slot;
+                            }
+                        }
+                    }
+                    return bestSlot;
+                };
+            for (const FileItem* item : candidates) {
+                if (layoutCache_[core->id].size() >=
+                    static_cast<std::size_t>(fileMaximum)) {
+                    break;
+                }
+                const int runtimeSlot = findRuntimeSlot(*item);
+                if (runtimeSlot < 0) {
+                    ++rejected;
+                    continue;
+                }
+                const int runtimeRing = RingForSlot(runtimeSlot);
+                const int runtimeRingSlot = RingSlotForSlot(runtimeSlot);
+                const bool focusOverflowItem =
+                    focusedCoreId_ == core->id && item->slot < 0;
+                float angle = focusOverflowItem
+                    ? SlotAngleRadians(runtimeRing, runtimeRingSlot) +
+                          EffectiveCoreRotationDegrees(*core) * kPi / 180.0f
+                    : (item->angleDegrees +
+                       EffectiveCoreRotationDegrees(*core) +
+                       item->angleOffsetDegrees) *
+                          kPi / 180.0f;
+                const float baseRadius =
+                    (RingRadiusForCore(*core, runtimeRing) +
+                     item->radiusOffset) *
+                    state_.zoom;
+                const D2D1_POINT_2F center =
+                    WorldToScreen(DisplayCoreWorld(*core));
+                float vectorX =
+                    std::cos(angle) * baseRadius +
+                    item->manualOffset.x * state_.zoom;
+                float vectorY =
+                    std::sin(angle) * baseRadius +
+                    item->manualOffset.y * state_.zoom;
+                const D2D1_POINT_2F preferred = D2D1::Point2F(
+                    center.x + vectorX, center.y + vectorY);
+                const float scale = itemScale(item);
+                const bool labelVisible = ShouldShowFileLabel(*item);
+                // Normal rendering is not an organizing command. Keep the
+                // exact saved angle and radius; only the hard work-area edge
+                // may clamp a node. Intra-cluster overlap is advisory and
+                // never feeds back into another file or a ring scale.
+                const D2D1_POINT_2F screen =
+                    slideAwayFromForeignCluster(
+                        preferred, item->sizeTier, scale, labelVisible);
+                const D2D1_RECT_F bounds =
+                    StableFootprint(screen, item->sizeTier, scale,
+                                    labelVisible);
+                occupied.push_back(bounds);
+                globalFootprints.emplace_back(core->id, bounds);
+                assignedRuntimeSlots.insert(runtimeSlot);
+                ItemLayout entry{
+                    item, ScreenToWorld(screen),
+                    StableLabelRectangle(screen, item->sizeTier, scale),
+                    labelVisible,
+                    false, 0};
+                entry.ring = std::clamp(runtimeRing, 0, 2);
+                entry.focusOnly =
+                    focusedCoreId_ == core->id &&
+                    layoutCache_[core->id].size() >=
+                        static_cast<std::size_t>(
+                            TemplateVisibleLimit(
+                                core->layoutTemplate));
+                layoutCache_[core->id].push_back(std::move(entry));
+            }
+            const int renderedMainCount =
+                static_cast<int>(layoutCache_[core->id].size());
+
+            // Child nodes are local to their parent and never consume a main-ring slot.
+            std::function<void(std::uint64_t, D2D1_POINT_2F)> appendChildren;
+            appendChildren = [this, core, &appendChildren, &client,
+                              &slideAwayFromForeignCluster, &occupied,
+                              &globalFootprints](
+                                 std::uint64_t parentId,
+                                 D2D1_POINT_2F parentWorld) {
+                FileItem* parent = FindItem(core->id, parentId);
+                if (parent == nullptr || parent->childrenCollapsed) return;
+                std::vector<FileItem*> children;
+                for (FileItem& candidate : const_cast<Core*>(core)->files) {
+                    if (candidate.parentFileId == parentId) children.push_back(&candidate);
+                }
+                for (std::size_t index = 0; index < children.size(); ++index) {
+                    FileItem* child = children[index];
+                    const float count = static_cast<float>(children.size());
+                    const float defaultAngle = count == 1 ? 90.0f :
+                        (count == 2 ? (index == 0 ? 135.0f : 45.0f) :
+                         (count == 3 ? 45.0f + 45.0f * static_cast<float>(index) :
+                          25.0f + 130.0f * static_cast<float>(index) /
+                                      std::max(1.0f, count - 1.0f)));
+                    const float angle = (child->relativeManualLock
+                        ? child->relativeAngle : defaultAngle) * kPi / 180.0f;
+                    const D2D1_POINT_2F parentScreen = WorldToScreen(parentWorld);
+                    D2D1_POINT_2F screen = D2D1::Point2F(
+                        parentScreen.x + std::cos(angle) * child->relativeRadius * state_.zoom +
+                            child->relativeManualOffset.x * state_.zoom,
+                        parentScreen.y + std::sin(angle) * child->relativeRadius * state_.zoom +
+                            child->relativeManualOffset.y * state_.zoom);
+                    const float half =
+                        TierContainerPixels(FileSizeTier::Minor) /
+                        2.0f;
+                    screen.x = std::clamp(screen.x, half + 8.0f, client.width - half - 8.0f);
+                    screen.y = std::clamp(screen.y, half + 8.0f, client.height - half - 24.0f);
+                    screen = slideAwayFromForeignCluster(
+                        screen, FileSizeTier::Minor, 1.0f,
+                        ShouldShowFileLabel(*child));
+                    const D2D1_RECT_F childBounds = StableFootprint(
+                        screen, FileSizeTier::Minor, 1.0f,
+                        ShouldShowFileLabel(*child));
+                    occupied.push_back(childBounds);
+                    globalFootprints.emplace_back(core->id, childBounds);
+                    ItemLayout childEntry{child, ScreenToWorld(screen),
+                        StableLabelRectangle(
+                            screen, FileSizeTier::Minor, 1.0f),
+                        ShouldShowFileLabel(*child), false, 0};
+                    childEntry.isChild = true;
+                    layoutCache_[core->id].push_back(childEntry);
+                    appendChildren(child->id, childEntry.position);
+                }
+            };
+            for (const FileItem& item : core->files) {
+                if (!item.detachedFromUpper || item.parentFileId != 0) continue;
+                const bool labelVisible = ShouldShowFileLabel(item);
+                const D2D1_POINT_2F screen = slideAwayFromForeignCluster(
+                    WorldToScreen(item.detachedWorldPosition),
+                    item.sizeTier, 1.0f, labelVisible);
+                const D2D1_RECT_F bounds = StableFootprint(
+                    screen, item.sizeTier, 1.0f, labelVisible);
+                occupied.push_back(bounds);
+                globalFootprints.emplace_back(core->id, bounds);
+                ItemLayout independent{&item, ScreenToWorld(screen),
+                    StableLabelRectangle(
+                        screen, item.sizeTier, 1.0f),
+                    labelVisible, false, 0};
+                layoutCache_[core->id].push_back(std::move(independent));
+            }
+            std::vector<std::pair<std::uint64_t, D2D1_POINT_2F>> roots;
+            for (const ItemLayout& entry : layoutCache_[core->id]) {
+                if (!entry.isMore && entry.item != nullptr && !entry.isChild) {
+                    roots.emplace_back(entry.item->id, entry.position);
+                }
+            }
+            for (const auto& [id, position] : roots) appendChildren(id, position);
+
+            int hidden = mainClusterVisible
+                ? static_cast<int>(std::count_if(
+                      core->files.begin(), core->files.end(),
+                      [](const FileItem& item) {
+                          return item.parentFileId == 0 &&
+                                 !item.detachedFromUpper;
+                      })) -
+                      renderedMainCount
+                : 0;
+            hidden = std::max(hidden, rejected);
+            if (hidden > 0) {
+                const D2D1_POINT_2F center =
+                    WorldToScreen(DisplayCoreWorld(*core));
+                const float coreHalf =
+                    metrics_.coreSize * state_.zoom *
+                    CoreFormalLayoutScale(*core) /
+                    2.0f;
+                const float halfWidth = 56.0f;
+                const float halfHeight = 14.0f;
+                const std::array<D2D1_POINT_2F, 4> controlCandidates{
+                    D2D1::Point2F(
+                        center.x,
+                        center.y + coreHalf +
+                            metrics_.coreFontSize + 34.0f),
+                    D2D1::Point2F(
+                        center.x,
+                        center.y - coreHalf - 24.0f),
+                    D2D1::Point2F(
+                        center.x + coreHalf + halfWidth + 12.0f,
+                        center.y),
+                    D2D1::Point2F(
+                        center.x - coreHalf - halfWidth - 12.0f,
+                        center.y)};
+                D2D1_POINT_2F moreScreen = controlCandidates[0];
+                D2D1_RECT_F moreBounds = D2D1::RectF();
+                bool foundControlPosition = false;
+                for (const D2D1_POINT_2F candidate : controlCandidates) {
+                    const D2D1_RECT_F bounds = D2D1::RectF(
+                        candidate.x - halfWidth,
+                        candidate.y - halfHeight,
+                        candidate.x + halfWidth,
+                        candidate.y + halfHeight);
+                    constexpr float margin = 8.0f;
+                    if (bounds.left < margin ||
+                        bounds.top < margin ||
+                        bounds.right > client.width - margin ||
+                        bounds.bottom > client.height - margin) {
+                        continue;
+                    }
+                    const bool fileCollision = std::any_of(
+                        occupied.begin(), occupied.end(),
+                        [&bounds](const D2D1_RECT_F& existing) {
+                            return RectanglesIntersect(
+                                InflateRectangle(bounds, 4.0f),
+                                InflateRectangle(existing, 4.0f));
+                        });
+                    const bool clusterCollision = std::any_of(
+                        globalFootprints.begin(),
+                        globalFootprints.end(),
+                        [core, &bounds](const auto& existing) {
+                            return existing.first != core->id &&
+                                   RectanglesIntersect(
+                                       InflateRectangle(bounds, 8.0f),
+                                       InflateRectangle(
+                                           existing.second, 8.0f));
+                        });
+                    if (!fileCollision && !clusterCollision) {
+                        moreScreen = candidate;
+                        moreBounds = bounds;
+                        foundControlPosition = true;
+                        break;
+                    }
+                }
+                if (!foundControlPosition) {
+                    moreScreen.x = std::clamp(
+                        controlCandidates[0].x,
+                        halfWidth + 8.0f,
+                        std::max(
+                            halfWidth + 8.0f,
+                            client.width -
+                                halfWidth - 8.0f));
+                    moreScreen.y = std::clamp(
+                        controlCandidates[0].y,
+                        halfHeight + 8.0f,
+                        std::max(
+                            halfHeight + 8.0f,
+                            client.height -
+                                halfHeight - 8.0f));
+                    moreBounds = D2D1::RectF(
+                        moreScreen.x - halfWidth,
+                        moreScreen.y - halfHeight,
+                        moreScreen.x + halfWidth,
+                        moreScreen.y + halfHeight);
+                    foundControlPosition = true;
+                }
+                if (foundControlPosition) {
+                    occupied.push_back(moreBounds);
+                    globalFootprints.emplace_back(
+                        core->id, moreBounds);
+                    ItemLayout more{
+                        nullptr, ScreenToWorld(moreScreen),
+                        D2D1::RectF(), false, true, hidden};
+                    more.ring = -1;
+                    more.focusOnly = focusedCoreId_ == core->id;
+                    layoutCache_[core->id].push_back(
+                        std::move(more));
+                }
+            }
+
+            std::stable_sort(
+                layoutCache_[core->id].begin(), layoutCache_[core->id].end(),
+                [](const ItemLayout& first, const ItemLayout& second) {
+                    if (first.isMore != second.isMore) {
+                        return !first.isMore;
+                    }
+                    if (first.item == nullptr || second.item == nullptr) {
+                        return false;
+                    }
+                    return first.item->slot < second.item->slot;
+                });
+        }
+        layoutDirty_ = false;
+    }
+
+    const LayoutMap& StableLayouts() {
+        if (layoutDirty_) {
+            RebuildLayoutCache();
+        }
+        return layoutCache_;
+    }
+
+    static float ClampUnit(float value) {
+        return std::clamp(value, 0.0f, 1.0f);
+    }
+
+    static float FocusEase(float progress) {
+        // cubic-bezier(0.22, 1, 0.36, 1), solved for x.
+        const float targetX = ClampUnit(progress);
+        float parameter = targetX;
+        for (int iteration = 0; iteration < 5; ++iteration) {
+            const float inverse = 1.0f - parameter;
+            const float x =
+                3.0f * inverse * inverse * parameter * 0.22f +
+                3.0f * inverse * parameter * parameter * 0.36f +
+                parameter * parameter * parameter;
+            const float derivative =
+                3.0f * inverse * inverse * 0.22f +
+                6.0f * inverse * parameter * (0.36f - 0.22f) +
+                3.0f * parameter * parameter * (1.0f - 0.36f);
+            if (std::abs(derivative) < 0.0001f) {
+                break;
+            }
+            parameter = ClampUnit(parameter - (x - targetX) / derivative);
+        }
+        const float inverse = 1.0f - parameter;
+        return 3.0f * inverse * inverse * parameter +
+               3.0f * inverse * parameter * parameter +
+               parameter * parameter * parameter;
+    }
+
+    float AnimationElapsedMilliseconds() const {
+        return std::chrono::duration<float, std::milli>(
+                   std::chrono::steady_clock::now() - focusAnimationStarted_)
+            .count();
+    }
+
+    bool FocusAnimationActive() const {
+        return focusAnimationState_ == FocusAnimationState::Focusing ||
+               focusAnimationState_ == FocusAnimationState::Switching ||
+               focusAnimationState_ == FocusAnimationState::Unfocusing;
+    }
+
+    float FocusMotionProgress() const {
+        if (!FocusAnimationActive()) {
+            return 1.0f;
+        }
+        const float elapsed = AnimationElapsedMilliseconds();
+        const float delayed =
+            focusAnimationState_ == FocusAnimationState::Unfocusing
+                ? elapsed
+                : elapsed - focusConfirmationMs_;
+        return FocusEase(ClampUnit(delayed / std::max(1.0f, focusMotionMs_)));
+    }
+
+    float FocusFadeProgress() const {
+        if (!FocusAnimationActive()) {
+            return 1.0f;
+        }
+        const float elapsed = AnimationElapsedMilliseconds();
+        const float delayed =
+            focusAnimationState_ == FocusAnimationState::Unfocusing
+                ? elapsed
+                : elapsed - 40.0f;
+        return FocusEase(ClampUnit(delayed / std::max(1.0f, focusFadeMs_)));
+    }
+
+    float CoreFocusAmount(std::uint64_t coreId) const {
+        if (!FocusAnimationActive()) {
+            return focusedCoreId_ == coreId ? 1.0f : 0.0f;
+        }
+        const auto found = animationFromFocus_.find(coreId);
+        const float from =
+            found == animationFromFocus_.end() ? 0.0f : found->second;
+        const float target = focusedCoreId_ == coreId ? 1.0f : 0.0f;
+        const float progress = FocusMotionProgress();
+        return from + (target - from) * progress;
+    }
+
+    float CoreCollapsedTargetScale(const Core& core) const {
+        (void)core;
+        return 1.0f;
+    }
+
+    float CoreFormalLayoutScale(const Core& core) const {
+        (void)core;
+        return 1.0f;
+    }
+
+    float CoreCollapsedVisualScale(const Core& core) const {
+        (void)core;
+        return 1.0f;
+    }
+
+    UINT32 EffectiveCoreThemeColor(const Core& core) const {
+        if (coreAppearancePanelActive_ &&
+            coreAppearancePanelCoreId_ == core.id &&
+            appearancePreviewColor_.has_value()) {
+            return *appearancePreviewColor_;
+        }
+        return core.themeColor;
+    }
+
+    float CoreGlowIntensity(const Core&) const {
+        return std::clamp(state_.coreGlowIntensity, 0.30f, 1.60f);
+    }
+
+    float CoreVisualScale(const Core& core) const {
+        return std::clamp(core.appearanceCoreScale, 0.80f, 1.20f);
+    }
+
+    void ToggleCoreExpansion(Core& core) {
+        std::unordered_map<std::uint64_t, float> captured;
+        captured.reserve(coreExpansionFrom_.size() + 1);
+        for (const auto& [coreId, unused] : coreExpansionFrom_) {
+            (void)unused;
+            if (const Core* animating = FindCore(coreId)) {
+                captured[coreId] = CoreExpansionAmount(*animating);
+            }
+        }
+        const float currentAmount = CoreExpansionAmount(core);
+        core.expanded = !core.expanded;
+        if (!core.expanded && focusedCoreId_ == core.id) {
+            ResetFocusImmediately();
+        }
+        coreExpansionFrom_ = std::move(captured);
+        if (EffectiveAnimationMode() == AnimationMode::Off) {
+            coreExpansionFrom_.erase(core.id);
+        } else {
+            coreExpansionFrom_[core.id] = currentAmount;
+            coreExpansionStarted_ = std::chrono::steady_clock::now();
+            if (window_ != nullptr) {
+                SetTimer(window_, kAnimationTimer,
+                         kCoreExpansionFrameIntervalMs, nullptr);
+            }
+        }
+        // Expansion is a runtime radial reveal only. It never changes the
+        // core size, file angle, file radius, slot or persisted layout.
+        layoutDirty_ = true;
+        VerifyCoreLayoutInvariant(
+            core, core.expanded ? "core-expand" : "core-collapse");
+    }
+
+    float CoreExpansionDurationMilliseconds() const {
+        switch (EffectiveAnimationMode()) {
+        case AnimationMode::Off: return 0.0f;
+        case AnimationMode::Simple: return 320.0f;
+        case AnimationMode::Soft: return 950.0f;
+        case AnimationMode::Standard:
+        default: return 650.0f;
+        }
+    }
+
+    bool CoreExpansionAnimationActive(std::uint64_t coreId) const {
+        return coreExpansionFrom_.contains(coreId);
+    }
+
+    float CoreExpansionAmount(const Core& core) const {
+        const auto found = coreExpansionFrom_.find(core.id);
+        if (found == coreExpansionFrom_.end()) {
+            return core.expanded ? 1.0f : 0.0f;
+        }
+        const float duration =
+            std::max(1.0f, CoreExpansionDurationMilliseconds());
+        const float elapsed = std::chrono::duration<float, std::milli>(
+            std::chrono::steady_clock::now() -
+            coreExpansionStarted_).count();
+        const float rawProgress =
+            ClampUnit(elapsed / duration);
+        const float smoothProgress =
+            rawProgress * rawProgress *
+            (3.0f - 2.0f * rawProgress);
+        const float progress =
+            EffectiveAnimationMode() == AnimationMode::Soft
+                ? smoothProgress * smoothProgress *
+                      (3.0f - 2.0f * smoothProgress)
+                : smoothProgress;
+        const float target = core.expanded ? 1.0f : 0.0f;
+        return found->second +
+               (target - found->second) * progress;
+    }
+
+    float CoreExpansionEntryAmount(
+        const Core& core, const ItemLayout& entry) const {
+        if (entry.item != nullptr &&
+            entry.item->detachedFromUpper) {
+            return 1.0f;
+        }
+        const float amount = CoreExpansionAmount(core);
+        const float delay =
+            entry.isChild ? 0.16f
+                          : (entry.ring > 0 ? 0.11f : 0.0f);
+        const float local = ClampUnit(
+            (amount - delay) / std::max(0.01f, 1.0f - delay));
+        return FocusEase(local);
+    }
+
+    bool CoreContentVisible(const Core& core) const {
+        return core.expanded ||
+               focusedCoreId_ == core.id ||
+               CoreExpansionAnimationActive(core.id);
+    }
+
+    bool IsSelectedCore(std::uint64_t coreId) const {
+        return selected_.kind == HitKind::Core && selected_.coreId == coreId;
+    }
+
+    std::uint64_t SelectedCoreForVisualEffect() const {
+        if ((selected_.kind != HitKind::Core &&
+             selected_.kind != HitKind::Item) ||
+            FindCore(selected_.coreId) == nullptr) {
+            return 0;
+        }
+        return selected_.coreId;
+    }
+
+    bool IsCoreVisuallySelected(std::uint64_t coreId) const {
+        return SelectedCoreForVisualEffect() == coreId;
+    }
+
+    bool SelectionRippleShouldAnimate() const {
+        const std::uint64_t selectedCoreId = SelectedCoreForVisualEffect();
+        if (selectedCoreId == 0 ||
+            (draggingCore_ && dragCoreId_ == selectedCoreId) ||
+            state_.workspacePaused ||
+            EffectiveAnimationMode() == AnimationMode::Off ||
+            state_.coreSelectionEffect == CoreSelectionEffect::Static) {
+            return false;
+        }
+        return state_.coreSelectionEffect !=
+                   CoreSelectionEffect::RippleOnceThenStatic ||
+               !coreSelectionRippleCompleted_;
+    }
+
+    void SyncCoreSelectionRippleTimer() {
+        if (window_ == nullptr) {
+            return;
+        }
+        // The ripple is the only repeating presentation effect. Eight samples
+        // per second keep a 1.4-second expansion soft without a 60 Hz layout
+        // or collision update.
+        if (SelectionRippleShouldAnimate()) {
+            SetTimer(window_, kCoreSelectionHaloTimer, 125, nullptr);
+        } else {
+            KillTimer(window_, kCoreSelectionHaloTimer);
+        }
+    }
+
+    static UINT32 LightenCoreColor(UINT32 color, float amount) {
+        amount = std::clamp(amount, 0.0f, 1.0f);
+        const auto lighten = [amount](UINT32 channel) {
+            return static_cast<UINT32>(std::lround(
+                static_cast<float>(channel) +
+                (255.0f - static_cast<float>(channel)) * amount));
+        };
+        const UINT32 red = lighten((color >> 16) & 0xFFu);
+        const UINT32 green = lighten((color >> 8) & 0xFFu);
+        const UINT32 blue = lighten(color & 0xFFu);
+        return (red << 16) | (green << 8) | blue;
+    }
+
+    static UINT32 SeparationColorFor(UINT32 color) {
+        const float red =
+            static_cast<float>((color >> 16) & 0xFFu) / 255.0f;
+        const float green =
+            static_cast<float>((color >> 8) & 0xFFu) / 255.0f;
+        const float blue =
+            static_cast<float>(color & 0xFFu) / 255.0f;
+        const float luminance =
+            red * 0.2126f + green * 0.7152f + blue * 0.0722f;
+        return luminance < 0.56f ? 0xF4F7FA : 0x17202A;
+    }
+
+    static UINT32 ConnectionColorWithStrength(
+        UINT32 color, float strength) {
+        strength = std::clamp(strength, 0.0f, 1.0f);
+        const float red = static_cast<float>((color >> 16) & 0xFFu);
+        const float green = static_cast<float>((color >> 8) & 0xFFu);
+        const float blue = static_cast<float>(color & 0xFFu);
+        const float luminance =
+            red * 0.2126f + green * 0.7152f + blue * 0.0722f;
+        const auto adjusted = [luminance, strength](float channel) {
+            return static_cast<UINT32>(std::lround(
+                luminance + (channel - luminance) * strength));
+        };
+        return (adjusted(red) << 16) |
+               (adjusted(green) << 8) |
+               adjusted(blue);
+    }
+
+    UINT32 EffectiveConnectionLineColor(const Core& core) const {
+        switch (core.connectionLineColorMode) {
+        case ConnectionLineColorMode::Black:
+            return 0x34383D;
+        case ConnectionLineColorMode::White:
+            return 0xF1F3F5;
+        case ConnectionLineColorMode::Custom:
+            return core.connectionLineCustomColor;
+        case ConnectionLineColorMode::FollowCore:
+        default:
+            return ConnectionColorWithStrength(
+                EffectiveCoreThemeColor(core), 0.90f);
+        }
+    }
+
+    void SetSelection(HitResult selection, bool restartCoreEffect = false) {
+        const bool changed = selected_ != selection;
+        selected_ = selection;
+        if (SelectedCoreForVisualEffect() != 0 &&
+            (changed || restartCoreEffect)) {
+            coreSelectionRippleStarted_ = std::chrono::steady_clock::now();
+            coreSelectionRippleCompleted_ = false;
+        } else if (SelectedCoreForVisualEffect() == 0) {
+            coreSelectionRippleCompleted_ = false;
+        }
+        SyncCoreSelectionRippleTimer();
+        SyncSelectionDismissTimer();
+    }
+
+    void ClearSelection() {
+        SetSelection({});
+    }
+
+    float CoreSelectionRippleProgress() const {
+        constexpr float kExpansionMilliseconds = 1400.0f;
+        constexpr float kCycleMilliseconds = 2400.0f;
+        const float elapsed = std::chrono::duration<float, std::milli>(
+            std::chrono::steady_clock::now() - coreSelectionRippleStarted_).count();
+        const float phase = std::fmod(std::max(0.0f, elapsed),
+                                      kCycleMilliseconds);
+        return phase <= kExpansionMilliseconds
+            ? phase / kExpansionMilliseconds
+            : -1.0f;
+    }
+
+    bool ShouldDrawCoreSelectionRipple(const Core& core) const {
+        return IsCoreVisuallySelected(core.id) && SelectionRippleShouldAnimate() &&
+               CoreSelectionRippleProgress() >= 0.0f;
+    }
+
+    void DrawCoreSelectionRipple(D2D1_POINT_2F center, float coreRadius,
+                                 float haloRadius, UINT32 color,
+                                 float glowIntensity) {
+        const float progress = std::clamp(CoreSelectionRippleProgress(),
+                                          0.0f, 1.0f);
+        const float eased = 1.0f - std::pow(1.0f - progress, 1.55f);
+        const float startRadius = haloRadius + 2.0f;
+        const float endRadius = std::max(startRadius + 2.0f,
+                                         coreRadius *
+                                             (1.84f + 0.16f * glowIntensity));
+        const float radius = startRadius + (endRadius - startRadius) * eased;
+        const float opacity = 0.25f * glowIntensity *
+            std::pow(1.0f - progress, 1.35f);
+        brush_->SetColor(D2D1::ColorF(color, opacity));
+        renderTarget_->DrawEllipse(
+            D2D1::Ellipse(center, radius, radius), brush_.Get(),
+            1.25f - progress * 0.30f);
+    }
+
+    float FocusEnvelope() const {
+        if (!FocusAnimationActive()) {
+            return focusedCoreId_ == 0 ? 0.0f : 1.0f;
+        }
+        const float target = focusedCoreId_ == 0 ? 0.0f : 1.0f;
+        const float progress = FocusFadeProgress();
+        return animationFromEnvelope_ +
+               (target - animationFromEnvelope_) * progress;
+    }
+
+    float ClusterFileOpacity(std::uint64_t coreId) const {
+        const float dim = 0.16f;
+        return 1.0f - FocusEnvelope() *
+                          (1.0f - CoreFocusAmount(coreId)) * (1.0f - dim);
+    }
+
+    float ClusterCoreOpacity(std::uint64_t coreId) const {
+        const float dim = 0.34f;
+        return 1.0f - FocusEnvelope() *
+                          (1.0f - CoreFocusAmount(coreId)) * (1.0f - dim);
+    }
+
+    float FocusContentOpacity(std::uint64_t coreId,
+                              const ItemLayout& entry) const {
+        if (!entry.focusOnly || focusedCoreId_ != coreId ||
+            focusAnimationState_ == FocusAnimationState::Focused ||
+            EffectiveAnimationMode() == AnimationMode::Off) {
+            return 1.0f;
+        }
+        if (focusAnimationState_ != FocusAnimationState::Focusing &&
+            focusAnimationState_ != FocusAnimationState::Switching) {
+            return 1.0f;
+        }
+        const float delay =
+            110.0f + static_cast<float>(std::clamp(entry.ring, 0, 2)) *
+                         30.0f;
+        return FocusEase(ClampUnit(
+            (AnimationElapsedMilliseconds() - delay) / 200.0f));
+    }
+
+    D2D1_POINT_2F VisualCorePosition(const Core& core) const {
+        const D2D1_POINT_2F target = DisplayCoreWorld(core);
+        if (!FocusAnimationActive()) {
+            return target;
+        }
+        const auto found = animationCoreFrom_.find(core.id);
+        if (found == animationCoreFrom_.end()) {
+            return target;
+        }
+        const float progress = FocusMotionProgress();
+        return D2D1::Point2F(
+            found->second.x + (target.x - found->second.x) * progress,
+            found->second.y + (target.y - found->second.y) * progress);
+    }
+
+    D2D1_POINT_2F VisualItemPosition(const Core& core,
+                                     const ItemLayout& entry) const {
+        // The layout cache stores canonical world coordinates only.  Focus is
+        // a pure runtime transform around the visual core; it is never fed
+        // back into the cache, a slot, a radius, or persistent state.
+        const D2D1_POINT_2F canonicalCore = DisplayCoreWorld(core);
+        const D2D1_POINT_2F visualCore = VisualCorePosition(core);
+        const float expansion =
+            CoreExpansionEntryAmount(core, entry);
+        return D2D1::Point2F(
+            visualCore.x +
+                (entry.position.x - canonicalCore.x) * expansion,
+            visualCore.y +
+                (entry.position.y - canonicalCore.y) * expansion);
+    }
+
+    void CaptureFocusAnimationFrame() {
+        StableLayouts();
+        std::unordered_map<std::uint64_t, D2D1_POINT_2F> coreFrame;
+        std::unordered_map<std::uint64_t, float> focusFrame;
+        const float envelopeFrame = FocusEnvelope();
+        for (const Core& core : state_.cores) {
+            coreFrame[core.id] = VisualCorePosition(core);
+            focusFrame[core.id] = CoreFocusAmount(core.id);
+        }
+        animationCoreFrom_ = std::move(coreFrame);
+        animationFromFocus_ = std::move(focusFrame);
+        animationFromEnvelope_ = envelopeFrame;
+    }
+
+    void ConfigureFocusAnimationTiming() {
+        switch (EffectiveAnimationMode()) {
+        case AnimationMode::Off:
+            focusConfirmationMs_ = 0.0f;
+            focusMotionMs_ = 0.0f;
+            focusFadeMs_ = 0.0f;
+            break;
+        case AnimationMode::Simple:
+            focusConfirmationMs_ = 25.0f;
+            focusMotionMs_ = 140.0f;
+            focusFadeMs_ = 130.0f;
+            break;
+        case AnimationMode::Soft:
+            focusConfirmationMs_ = 90.0f;
+            focusMotionMs_ = 320.0f;
+            focusFadeMs_ = 280.0f;
+            break;
+        case AnimationMode::Standard:
+        default:
+            focusConfirmationMs_ = 75.0f;
+            focusMotionMs_ = 280.0f;
+            focusFadeMs_ = 240.0f;
+            break;
+        }
+    }
+
+    void BeginFocusTransition(std::uint64_t targetCoreId) {
+        if (targetCoreId == 0 || FindCore(targetCoreId) == nullptr) {
+            return;
+        }
+        // Focus is explicit.  It keeps the same selected-core marker rather
+        // than creating a second, visually competing state.
+        SetSelection({HitKind::Core, targetCoreId, 0}, true);
+        if (const Core* target = FindCore(targetCoreId)) {
+            VerifyCoreLayoutInvariant(*target, "focus-enter");
+        }
+        if (focusedCoreId_ == targetCoreId &&
+            focusAnimationState_ == FocusAnimationState::Focused) {
+            return;
+        }
+        StableLayouts();
+        CaptureFocusAnimationFrame();
+        const bool switching = FocusEnvelope() > 0.01f;
+        focusedCoreId_ = targetCoreId;
+        focusAnimationState_ = switching ? FocusAnimationState::Switching
+                                         : FocusAnimationState::Focusing;
+        ConfigureFocusAnimationTiming();
+        layoutDirty_ = true;
+        StableLayouts();
+        focusAnimationStarted_ = std::chrono::steady_clock::now();
+        if (EffectiveAnimationMode() == AnimationMode::Off) {
+            focusAnimationState_ = FocusAnimationState::Focused;
+            animationCoreFrom_.clear();
+        } else {
+            SetTimer(window_, kAnimationTimer, 16, nullptr);
+        }
+        Invalidate();
+    }
+
+    void BeginUnfocusTransition() {
+        if (focusedCoreId_ == 0 && !FocusAnimationActive()) {
+            return;
+        }
+        const std::uint64_t previouslyFocusedCoreId = focusedCoreId_;
+        if (const Core* focused = FindCore(previouslyFocusedCoreId)) {
+            VerifyCoreLayoutInvariant(*focused, "focus-exit-begin");
+        }
+        CaptureFocusAnimationFrame();
+        focusedCoreId_ = 0;
+        focusAnimationState_ = FocusAnimationState::Unfocusing;
+        ConfigureFocusAnimationTiming();
+        focusConfirmationMs_ = 0.0f;
+        focusMotionMs_ = std::clamp(focusMotionMs_, 140.0f, 260.0f);
+        focusFadeMs_ = std::clamp(focusFadeMs_, 130.0f, 250.0f);
+        layoutDirty_ = true;
+        StableLayouts();
+        if (const Core* unfocused = FindCore(previouslyFocusedCoreId);
+            unfocused != nullptr) {
+            VerifyCoreLayoutInvariant(*unfocused, "focus-exit-end");
+        }
+        focusAnimationStarted_ = std::chrono::steady_clock::now();
+        if (EffectiveAnimationMode() == AnimationMode::Off) {
+            focusAnimationState_ = FocusAnimationState::Idle;
+            animationCoreFrom_.clear();
+        } else {
+            SetTimer(window_, kAnimationTimer, 16, nullptr);
+        }
+        Invalidate();
+    }
+
+    void ToggleCoreFocus(std::uint64_t coreId) {
+        if (focusedCoreId_ == coreId &&
+            (focusAnimationState_ == FocusAnimationState::Focused ||
+             focusAnimationState_ == FocusAnimationState::Focusing ||
+             focusAnimationState_ == FocusAnimationState::Switching)) {
+            BeginUnfocusTransition();
+        } else {
+            CheckReferences(coreId);
+            BeginFocusTransition(coreId);
+        }
+    }
+
+    void ResetFocusImmediately() {
+        if (window_ != nullptr) {
+            KillTimer(window_, kAnimationTimer);
+        }
+        focusedCoreId_ = 0;
+        focusAnimationState_ = FocusAnimationState::Idle;
+        animationCoreFrom_.clear();
+        animationFromFocus_.clear();
+        animationFromEnvelope_ = 0.0f;
+        layoutDirty_ = true;
+    }
+
+    D2D1_RECT_F VisualLabelRectangle(const Core& core,
+                                     const ItemLayout& entry) const {
+        if (!entry.isMore && entry.item == nullptr) {
+            return entry.labelRect;
+        }
+        const D2D1_POINT_2F base = WorldToScreen(entry.position);
+        const D2D1_POINT_2F visual =
+            WorldToScreen(VisualItemPosition(core, entry));
+        D2D1_RECT_F rectangle = entry.labelRect;
+        rectangle.left += visual.x - base.x;
+        rectangle.right += visual.x - base.x;
+        rectangle.top += visual.y - base.y;
+        rectangle.bottom += visual.y - base.y;
+        return rectangle;
+    }
+
+    float CoreScreenRadius(const Core& core) const {
+        return metrics_.coreSize * state_.zoom *
+               CoreVisualScale(core) / 2.0f;
+    }
+
+    std::wstring CoreCapacityText(const Core& core) const {
+        return std::to_wstring(AttachedFileCount(core)) + L"/" +
+               std::to_wstring(
+                   TemplateVisibleLimit(core.layoutTemplate));
+    }
+
+    D2D1_RECT_F CoreCapacityBadgeRectangle(
+        const Core& core, D2D1_POINT_2F center,
+        float coreRadius) const {
+        const std::wstring count = CoreCapacityText(core);
+        const float badgeScale = CoreVisualScale(core);
+        const float badgeHeight = std::clamp(
+            coreRadius * 0.52f, 17.0f, 23.0f);
+        const float badgeHalfWidth = std::clamp(
+            (metrics_.helperFontSize *
+                 static_cast<float>(count.size()) *
+                 0.50f +
+             9.0f) *
+                badgeScale,
+            badgeHeight * 0.76f, badgeHeight * 1.62f);
+        const D2D1_POINT_2F badge = D2D1::Point2F(
+            center.x + coreRadius * 0.58f,
+            center.y - coreRadius * 0.58f);
+        return D2D1::RectF(
+            badge.x - badgeHalfWidth,
+            badge.y - badgeHeight * 0.5f,
+            badge.x + badgeHalfWidth,
+            badge.y + badgeHeight * 0.5f);
+    }
+
+    D2D1_RECT_F CoreNameRectangle(
+        const Core& core, D2D1_POINT_2F center,
+        float coreRadius) const {
+        (void)core;
+        return D2D1::RectF(
+            center.x - metrics_.labelWidth / 2.0f,
+            center.y + coreRadius + 7.0f,
+            center.x + metrics_.labelWidth / 2.0f,
+            center.y + coreRadius +
+                metrics_.coreFontSize + 14.0f);
+    }
+
+    void AddInteractionShape(
+        std::vector<InteractionShape>& shapes,
+        D2D1_RECT_F rectangle, float padding,
+        bool ellipse = false) const {
+        if (interactionWindow_ == nullptr) {
+            return;
+        }
+        RECT client{};
+        GetClientRect(interactionWindow_, &client);
+        const float scale = std::max(0.1f, dpi_ / 96.0f);
+        RECT pixels{
+            static_cast<LONG>(std::floor(
+                (rectangle.left - padding) * scale)),
+            static_cast<LONG>(std::floor(
+                (rectangle.top - padding) * scale)),
+            static_cast<LONG>(std::ceil(
+                (rectangle.right + padding) * scale)),
+            static_cast<LONG>(std::ceil(
+                (rectangle.bottom + padding) * scale))};
+        pixels.left =
+            std::clamp(pixels.left, client.left, client.right);
+        pixels.right =
+            std::clamp(pixels.right, client.left, client.right);
+        pixels.top =
+            std::clamp(pixels.top, client.top, client.bottom);
+        pixels.bottom =
+            std::clamp(pixels.bottom, client.top, client.bottom);
+        if (pixels.right <= pixels.left ||
+            pixels.bottom <= pixels.top) {
+            return;
+        }
+        shapes.push_back({pixels, ellipse});
+    }
+
+    void UpdateInteractionRegion(const LayoutMap& layouts) {
+        if (interactionWindow_ == nullptr) {
+            return;
+        }
+        const D2D1_SIZE_F client = ClientDipSize();
+        std::vector<InteractionShape> shapes;
+        shapes.reserve(64);
+
+        if (tutorialActive_) {
+            AddInteractionShape(
+                shapes, TutorialCardRectangle(client), 2.0f);
+        } else if (state_.workspaceCollapsed) {
+            AddInteractionShape(
+                shapes,
+                D2D1::RectF(
+                    0.0f, 0.0f, client.width, client.height),
+                0.0f);
+        } else {
+            if (corePlacementMode_) {
+                AddInteractionShape(
+                    shapes,
+                    D2D1::RectF(
+                        0.0f, 0.0f, client.width, client.height),
+                    0.0f);
+            }
+            if (IsFreshWorkspaceEmpty()) {
+                AddInteractionShape(
+                    shapes, EmptyCreateButtonRectangle(client),
+                    4.0f);
+            } else {
+                for (const Core& core : state_.cores) {
+                    if (core.archived) {
+                        continue;
+                    }
+                    const bool useStableExpansionTargets =
+                        core.expanded &&
+                        CoreExpansionAnimationActive(core.id);
+                    if (CoreBodyVisible(core)) {
+                        const D2D1_POINT_2F center =
+                            WorldToScreen(VisualCorePosition(core));
+                        const float radius =
+                            CoreScreenRadius(core);
+                        AddInteractionShape(
+                            shapes,
+                            D2D1::RectF(
+                                center.x - radius,
+                                center.y - radius,
+                                center.x + radius,
+                                center.y + radius),
+                            5.0f, true);
+                        AddInteractionShape(
+                            shapes,
+                            CoreCapacityBadgeRectangle(
+                                core, center, radius),
+                            5.0f);
+                        AddInteractionShape(
+                            shapes,
+                            CoreNameRectangle(
+                                core, center, radius),
+                            5.0f);
+                    }
+                    const auto found = layouts.find(core.id);
+                    if (found == layouts.end()) {
+                        continue;
+                    }
+                    for (const ItemLayout& entry :
+                         found->second) {
+                        const D2D1_POINT_2F position =
+                            WorldToScreen(
+                                useStableExpansionTargets
+                                    ? entry.position
+                                    : VisualItemPosition(core, entry));
+                        if (entry.isMore) {
+                            AddInteractionShape(
+                                shapes,
+                                D2D1::RectF(
+                                    position.x - 56.0f,
+                                    position.y - 14.0f,
+                                    position.x + 56.0f,
+                                    position.y + 14.0f),
+                                5.0f);
+                            continue;
+                        }
+                        if (entry.item == nullptr) {
+                            continue;
+                        }
+                        const float half =
+                            ItemHitHalfSize(
+                                core, *entry.item) *
+                            state_.zoom;
+                        AddInteractionShape(
+                            shapes,
+                            D2D1::RectF(
+                                position.x - half,
+                                position.y - half,
+                                position.x + half,
+                                position.y + half),
+                            5.0f);
+                        if (entry.showLabel) {
+                            AddInteractionShape(
+                                shapes,
+                                useStableExpansionTargets
+                                    ? entry.labelRect
+                                    : VisualLabelRectangle(
+                                          core, entry),
+                                5.0f);
+                        }
+                    }
+                }
+            }
+
+            for (int index = 0;
+                 index < kWorkspaceControlCount;
+                 ++index) {
+                AddInteractionShape(
+                    shapes,
+                    WorkspaceControlRectangle(client, index),
+                    2.0f);
+            }
+            if (DividerEnabled()) {
+                AddInteractionShape(
+                    shapes,
+                    D2D1::RectF(
+                        0.0f, 0.0f, 12.0f,
+                        client.height),
+                    0.0f);
+            }
+            if (CoreDistanceSliderOpen()) {
+                AddInteractionShape(
+                    shapes,
+                    CoreDistanceSliderCardRectangle(client),
+                    2.0f);
+            }
+            if (CoreAppearancePanelOpen()) {
+                AddInteractionShape(
+                    shapes,
+                    CoreAppearancePanelRectangle(client),
+                    2.0f);
+            }
+        }
+
+        if (editWindow_ != nullptr) {
+            RECT editBounds{};
+            if (GetWindowRect(editWindow_, &editBounds)) {
+                POINT points[2]{
+                    {editBounds.left, editBounds.top},
+                    {editBounds.right, editBounds.bottom}};
+                MapWindowPoints(
+                    HWND_DESKTOP, interactionWindow_,
+                    points, 2);
+                shapes.push_back({
+                    RECT{points[0].x, points[0].y,
+                         points[1].x, points[1].y},
+                    false});
+            }
+        }
+
+        if (shapes == interactionShapes_) {
+            return;
+        }
+        HRGN combined = CreateRectRgn(0, 0, 0, 0);
+        if (combined == nullptr) {
+            return;
+        }
+        bool valid = true;
+        for (const InteractionShape& shape : shapes) {
+            HRGN part = shape.ellipse
+                ? CreateEllipticRgn(
+                      shape.bounds.left, shape.bounds.top,
+                      shape.bounds.right, shape.bounds.bottom)
+                : CreateRectRgn(
+                      shape.bounds.left, shape.bounds.top,
+                      shape.bounds.right, shape.bounds.bottom);
+            if (part == nullptr ||
+                CombineRgn(
+                    combined, combined, part, RGN_OR) ==
+                    ERROR) {
+                valid = false;
+            }
+            if (part != nullptr) {
+                DeleteObject(part);
+            }
+            if (!valid) {
+                break;
+            }
+        }
+        if (!valid ||
+            SetWindowRgn(
+                interactionWindow_, combined, FALSE) == 0) {
+            DeleteObject(combined);
+            return;
+        }
+        // SetWindowRgn owns combined after success.
+        interactionShapes_ = std::move(shapes);
+    }
+
+    void Paint() {
+        PAINTSTRUCT paint{};
+        BeginPaint(window_, &paint);
+        if (SUCCEEDED(EnsureDeviceResources())) {
+            DrawScene();
+        }
+        EndPaint(window_, &paint);
+    }
+
+    void DrawScene() {
+        renderTarget_->BeginDraw();
+        renderTarget_->SetTransform(D2D1::Matrix3x2F::Identity());
+        renderTarget_->Clear(D2D1::ColorF(0x000000, 0.0f));
+
+        const D2D1_SIZE_F client = renderTarget_->GetSize();
+
+        if (state_.workspaceCollapsed) {
+            DrawCollapsedWorkspace(client);
+            const LayoutMap emptyLayouts;
+            UpdateInteractionRegion(emptyLayouts);
+            const HRESULT result = renderTarget_->EndDraw();
+            if (result == D2DERR_RECREATE_TARGET) DiscardDeviceResources();
+            else if (SUCCEEDED(result)) PresentLayeredSurface();
+            return;
+        }
+
+        const D2D1_MATRIX_3X2_F view =
+            D2D1::Matrix3x2F::Scale(state_.zoom, state_.zoom) *
+            D2D1::Matrix3x2F::Translation(state_.viewOffset.x, state_.viewOffset.y);
+        renderTarget_->SetTransform(view);
+        const LayoutMap& layouts = StableLayouts();
+
+        if (!IsFreshWorkspaceEmpty()) {
+            for (const Core& core : state_.cores) {
+                if (core.archived) continue;
+                if (core.id == focusedCoreId_) {
+                    continue;
+                }
+                const auto found = layouts.find(core.id);
+                const std::vector<ItemLayout> empty;
+                DrawCluster(core, found == layouts.end() ? empty : found->second);
+            }
+            if (const Core* focused = FindCore(focusedCoreId_)) {
+                const auto found = layouts.find(focused->id);
+                const std::vector<ItemLayout> empty;
+                DrawCluster(*focused, found == layouts.end() ? empty : found->second);
+            }
+            DrawRaisedItems(layouts);
+            DrawDraggedItem();
+        }
+
+        renderTarget_->SetTransform(D2D1::Matrix3x2F::Identity());
+        if (IsFreshWorkspaceEmpty()) {
+            DrawEmptyWorkspace(client);
+        } else {
+            DrawFileLabels(layouts);
+            DrawHoverTooltip(layouts);
+        }
+        DrawHud(client);
+        DrawWorkspaceDivider(client);
+        DrawCorePlacementPreview(client);
+        DrawWorkspaceChrome(client);
+        DrawCoreDistanceSlider(client);
+        DrawCoreAppearancePanel(client);
+        DrawTutorial(client);
+        UpdateInteractionRegion(layouts);
+
+        const HRESULT result = renderTarget_->EndDraw();
+        if (result == D2DERR_RECREATE_TARGET) {
+            DiscardDeviceResources();
+        } else if (SUCCEEDED(result)) {
+            PresentLayeredSurface();
+        }
+    }
+
+    bool IsFreshWorkspaceEmpty() const {
+        for (const Core& core : state_.cores) {
+            if (core.archived) continue;
+            if (core.id != kUnclassifiedCoreId || !core.files.empty()) {
+                return false;
+            }
+        }
+        return true;
+    }
+
+    D2D1_RECT_F EmptyCreateButtonRectangle(const D2D1_SIZE_F& client) const {
+        const float width = std::min(220.0f, std::max(180.0f, client.width - 52.0f));
+        return D2D1::RectF((client.width - width) * 0.5f, client.height * 0.56f,
+                           (client.width + width) * 0.5f, client.height * 0.56f + 46.0f);
+    }
+
+    void DrawEmptyWorkspace(const D2D1_SIZE_F& client) {
+        const D2D1_RECT_F title = D2D1::RectF(30.0f, client.height * 0.38f,
+                                               client.width - 30.0f, client.height * 0.43f);
+        const D2D1_RECT_F body = D2D1::RectF(36.0f, client.height * 0.445f,
+                                              client.width - 36.0f, client.height * 0.52f);
+        const D2D1_RECT_F button = EmptyCreateButtonRectangle(client);
+        brush_->SetColor(D2D1::ColorF(0x202020, 0.96f));
+        renderTarget_->DrawTextW(L"创建你的第一个核心", static_cast<UINT32>(wcslen(L"创建你的第一个核心")), coreFormat_.Get(), title,
+                                 brush_.Get(), D2D1_DRAW_TEXT_OPTIONS_CLIP);
+        brush_->SetColor(D2D1::ColorF(0x4A4A4A, 0.94f));
+        renderTarget_->DrawTextW(L"把左侧常用文件拖到这里，建立稳定的逻辑集合。", static_cast<UINT32>(wcslen(L"把左侧常用文件拖到这里，建立稳定的逻辑集合。")),
+                                 bodyFormat_.Get(), body, brush_.Get(),
+                                 D2D1_DRAW_TEXT_OPTIONS_CLIP);
+        brush_->SetColor(D2D1::ColorF(0x2A7FB7, 0.94f));
+        renderTarget_->FillRoundedRectangle(D2D1::RoundedRect(button, 10.0f, 10.0f), brush_.Get());
+        brush_->SetColor(D2D1::ColorF(0xFFFFFF, 1.0f));
+        renderTarget_->DrawTextW(L"＋ 创建核心", static_cast<UINT32>(wcslen(L"＋ 创建核心")), bodyFormat_.Get(), button, brush_.Get(),
+                                 D2D1_DRAW_TEXT_OPTIONS_CLIP);
+    }
+
+    D2D1_RECT_F WorkspaceControlRectangle(const D2D1_SIZE_F& client, int index) const {
+        static constexpr std::array<float, kWorkspaceControlCount> regularWidths{
+            102.0f, 66.0f, 76.0f, 68.0f,
+            92.0f, 112.0f, 52.0f};
+        static constexpr std::array<float, kWorkspaceControlCount> compactWidths{
+            46.0f, 54.0f, 58.0f, 54.0f,
+            54.0f, 62.0f, 46.0f};
+        const auto& widths =
+            client.width < 680.0f
+                ? compactWidths
+                : regularWidths;
+        constexpr float gap = 2.0f;
+        const int safeIndex =
+            std::clamp(index, 0, kWorkspaceControlCount - 1);
+        float right = client.width - 10.0f;
+        for (int current = kWorkspaceControlCount - 1;
+             current > safeIndex;
+             --current) {
+            right -= widths[current] + gap;
+        }
+        return D2D1::RectF(
+            right - widths[safeIndex], 9.0f, right, 41.0f);
+    }
+
+    void DrawWorkspaceChrome(const D2D1_SIZE_F& client) {
+        const bool dark = WindowsUsesDarkTheme();
+        const UINT32 accent =
+            RgbFromColorRef(GetSysColor(COLOR_HIGHLIGHT));
+        POINT cursorPixels{};
+        GetCursorPos(&cursorPixels);
+        ScreenToClient(window_, &cursorPixels);
+        const D2D1_POINT_2F cursor =
+            PixelToDip(cursorPixels.x, cursorPixels.y);
+
+        const D2D1_RECT_F first =
+            WorkspaceControlRectangle(client, 0);
+        const D2D1_RECT_F last =
+            WorkspaceControlRectangle(
+                client, kWorkspaceControlCount - 1);
+        const D2D1_RECT_F group = D2D1::RectF(
+            first.left - 5.0f, 6.0f,
+            last.right + 5.0f, 44.0f);
+        const D2D1_RECT_F shadow = D2D1::RectF(
+            group.left + 2.0f, group.top + 3.0f,
+            group.right + 2.0f, group.bottom + 3.0f);
+        brush_->SetColor(D2D1::ColorF(
+            0x000000, dark ? 0.20f : 0.10f));
+        renderTarget_->FillRoundedRectangle(
+            D2D1::RoundedRect(shadow, 9.0f, 9.0f),
+            brush_.Get());
+        brush_->SetColor(D2D1::ColorF(
+            dark ? 0x242424 : 0xF7F7F7,
+            0.88f));
+        renderTarget_->FillRoundedRectangle(
+            D2D1::RoundedRect(group, 8.0f, 8.0f),
+            brush_.Get());
+        brush_->SetColor(D2D1::ColorF(
+            dark ? 0x666666 : 0xB6B6B6, 0.50f));
+        renderTarget_->DrawRoundedRectangle(
+            D2D1::RoundedRect(group, 8.0f, 8.0f),
+            brush_.Get(), 1.0f);
+
+        const bool compact = client.width < 680.0f;
+        const std::array<const wchar_t*, kWorkspaceControlCount> labels{
+            compact ? L"＋" : L"＋ 创建核心",
+            L"撤销",
+            compact ? L"整理" : L"整理 ▾",
+            L"设置",
+            compact ? L"隐藏" : L"隐藏到托盘",
+            state_.fullScreenWorkMode
+                ? (compact ? L"半屏" : L"退出全屏模式")
+                : (compact ? L"全屏" : L"全屏工作模式"),
+            L"退出"};
+        for (int index = 0;
+             index < kWorkspaceControlCount;
+             ++index) {
+            const D2D1_RECT_F button = WorkspaceControlRectangle(client, index);
+            const bool hovered = PointInside(cursor, button);
+            const bool disabled = index == 1 && undoStack_.empty();
+            if (hovered) {
+                brush_->SetColor(D2D1::ColorF(
+                    index == 6
+                        ? (dark ? 0x7A2A31 : 0xF2D7D9)
+                        : (index == 0
+                               ? accent
+                               : (dark ? 0x474747 : 0xE4EBF0)),
+                    index == 6 ? 0.72f
+                               : (index == 0 ? 0.24f : 0.92f)));
+                renderTarget_->FillRoundedRectangle(
+                    D2D1::RoundedRect(button, 5.0f, 5.0f),
+                    brush_.Get());
+            }
+            if (index == 4 || index == 6) {
+                brush_->SetColor(D2D1::ColorF(
+                    dark ? 0x666666 : 0xB6B6B6, 0.46f));
+                renderTarget_->DrawLine(
+                    D2D1::Point2F(button.left - 1.0f, 14.0f),
+                    D2D1::Point2F(button.left - 1.0f, 36.0f),
+                    brush_.Get(), 1.0f);
+            }
+            brush_->SetColor(D2D1::ColorF(
+                index == 6
+                    ? (dark ? 0xFFF2F2 : 0x7B151B)
+                    : (index == 0
+                           ? (dark ? 0xFFFFFF : 0x155A8A)
+                           : (dark ? 0xF5F5F5 : 0x242424)),
+                disabled ? 0.38f : 0.98f));
+            renderTarget_->DrawTextW(labels[index], static_cast<UINT32>(wcslen(labels[index])),
+                                     hudFormat_.Get(), button, brush_.Get(),
+                                     D2D1_DRAW_TEXT_OPTIONS_CLIP);
+        }
+    }
+
+    void ShowGlobalArrangeMenu() {
+        HMENU menu = CreatePopupMenu();
+        if (menu == nullptr) {
+            return;
+        }
+        AppendMenuW(
+            menu, MF_STRING, MenuDisperseCores,
+            L"整理核心位置");
+        AppendMenuW(
+            menu, MF_STRING, MenuOptimizeAll,
+            L"分散重叠核心");
+        AppendMenuW(
+            menu, MF_STRING, MenuArrangeAll,
+            L"整理全部（核心＋文件）");
+        const D2D1_RECT_F button =
+            WorkspaceControlRectangle(ClientDipSize(), 2);
+        POINT screen{
+            static_cast<LONG>(std::lround(button.left)),
+            static_cast<LONG>(std::lround(button.bottom + 3.0f))};
+        ClientToScreen(window_, &screen);
+        const UINT command = TrackPopupMenuPreservingSelection(
+            menu, TPM_RETURNCMD | TPM_RIGHTBUTTON,
+            screen.x, screen.y);
+        DestroyMenu(menu);
+        ExecuteMenuCommand(command);
+        Invalidate();
+    }
+
+    void ShowGlobalSettingsMenu() {
+        HMENU menu = CreatePopupMenu();
+        if (menu == nullptr) {
+            return;
+        }
+        HMENU densityMenu = CreatePopupMenu();
+        AppendMenuW(
+            densityMenu,
+            MF_STRING |
+                (state_.densityMode == DensityMode::Compact
+                     ? MF_CHECKED : 0),
+            MenuDensityCompact, L"紧凑");
+        AppendMenuW(
+            densityMenu,
+            MF_STRING |
+                (state_.densityMode == DensityMode::Standard
+                     ? MF_CHECKED : 0),
+            MenuDensityStandard, L"标准");
+        AppendMenuW(
+            densityMenu,
+            MF_STRING |
+                (state_.densityMode == DensityMode::Clear
+                     ? MF_CHECKED : 0),
+            MenuDensityClear, L"清晰");
+        AppendMenuW(
+            menu, MF_POPUP,
+            reinterpret_cast<UINT_PTR>(densityMenu),
+            L"核心分布密度");
+
+        HMENU animationMenu = CreatePopupMenu();
+        AppendMenuW(
+            animationMenu,
+            MF_STRING |
+                (state_.animationMode == AnimationMode::Off
+                     ? MF_CHECKED : 0),
+            MenuAnimationOff, L"关闭");
+        AppendMenuW(
+            animationMenu,
+            MF_STRING |
+                (state_.animationMode == AnimationMode::Simple
+                     ? MF_CHECKED : 0),
+            MenuAnimationSimple, L"简洁");
+        AppendMenuW(
+            animationMenu,
+            MF_STRING |
+                (state_.animationMode == AnimationMode::Standard
+                     ? MF_CHECKED : 0),
+            MenuAnimationStandard, L"标准");
+        AppendMenuW(
+            animationMenu,
+            MF_STRING |
+                (state_.animationMode == AnimationMode::Soft
+                     ? MF_CHECKED : 0),
+            MenuAnimationSoft, L"柔和");
+        AppendMenuW(
+            menu, MF_POPUP,
+            reinterpret_cast<UINT_PTR>(animationMenu),
+            L"全局动画强度");
+
+        HMENU selectionMenu = CreatePopupMenu();
+        AppendMenuW(
+            selectionMenu,
+            MF_STRING |
+                (state_.coreSelectionEffect ==
+                         CoreSelectionEffect::GentleRipple
+                     ? MF_CHECKED : 0),
+            MenuCoreSelectionEffectRotate, L"柔和波纹扩散");
+        AppendMenuW(
+            selectionMenu,
+            MF_STRING |
+                (state_.coreSelectionEffect ==
+                         CoreSelectionEffect::RippleOnceThenStatic
+                     ? MF_CHECKED : 0),
+            MenuCoreSelectionEffectOnce,
+            L"播放一次后保持静态");
+        AppendMenuW(
+            selectionMenu,
+            MF_STRING |
+                (state_.coreSelectionEffect ==
+                         CoreSelectionEffect::Static
+                     ? MF_CHECKED : 0),
+            MenuCoreSelectionEffectStatic,
+            L"仅显示静态光环");
+        AppendMenuW(
+            menu, MF_POPUP,
+            reinterpret_cast<UINT_PTR>(selectionMenu),
+            L"核心选中效果");
+        AppendMenuW(menu, MF_SEPARATOR, 0, nullptr);
+        AppendMenuW(menu, MF_STRING, MenuResetView, L"复位视图");
+        AppendMenuW(
+            menu, MF_STRING, MenuTrayTutorial,
+            L"重新打开使用教程");
+        AppendMenuW(menu, MF_SEPARATOR, 0, nullptr);
+        AppendMenuW(menu, MF_STRING, MenuSaveNow, L"立即保存布局");
+        AppendMenuW(
+            menu, MF_STRING, MenuOpenDataFolder,
+            L"打开数据目录");
+        AppendMenuW(
+            menu, MF_STRING, MenuExportLayout,
+            L"导出布局备份");
+        AppendMenuW(
+            menu, MF_STRING, MenuImportLayout,
+            L"导入布局备份");
+
+        const D2D1_RECT_F button =
+            WorkspaceControlRectangle(ClientDipSize(), 3);
+        POINT screen{
+            static_cast<LONG>(std::lround(button.left)),
+            static_cast<LONG>(std::lround(button.bottom + 3.0f))};
+        ClientToScreen(window_, &screen);
+        const UINT command = TrackPopupMenuPreservingSelection(
+            menu, TPM_RETURNCMD | TPM_RIGHTBUTTON,
+            screen.x, screen.y);
+        DestroyMenu(menu);
+        ExecuteMenuCommand(command);
+        Invalidate();
+    }
+
+    bool CorePlacementPointValid(
+        D2D1_POINT_2F point) const {
+        const D2D1_SIZE_F client = ClientDipSize();
+        const float radius =
+            metrics_.coreSize * 0.5f + 10.0f;
+        if (point.x < radius ||
+            point.x > client.width - radius ||
+            point.y < 54.0f + radius ||
+            point.y > client.height - radius) {
+            return false;
+        }
+        for (const Core& core : state_.cores) {
+            if (core.archived || !CoreBodyVisible(core)) {
+                continue;
+            }
+            const D2D1_POINT_2F other =
+                WorldToScreen(DisplayCoreWorld(core));
+            if (DistanceSquared(point, other) <
+                std::pow(metrics_.coreSize * 1.20f, 2.0f)) {
+                return false;
+            }
+        }
+        return true;
+    }
+
+    void BeginCorePlacementMode() {
+        CloseTransientPanels();
+        corePlacementMode_ = true;
+        POINT cursor{};
+        GetCursorPos(&cursor);
+        ScreenToClient(window_, &cursor);
+        corePlacementPreviewDip_ =
+            PixelToDip(cursor.x, cursor.y);
+        SetStatus(
+            L"单击空白位置放置核心；按 Esc 或右键取消");
+        Invalidate();
+    }
+
+    void CancelCorePlacementMode() {
+        if (!corePlacementMode_) {
+            return;
+        }
+        corePlacementMode_ = false;
+        SetStatus(L"已取消创建核心");
+        Invalidate();
+    }
+
+    void CompleteCorePlacement(D2D1_POINT_2F point) {
+        if (!CorePlacementPointValid(point)) {
+            SetStatus(L"此处过于靠近边缘或其他核心，请选择附近空位");
+            corePlacementPreviewDip_ = point;
+            Invalidate();
+            return;
+        }
+        corePlacementMode_ = false;
+        CreateCore(ScreenToWorld(point));
+        Invalidate();
+    }
+
+    void DrawCorePlacementPreview(
+        const D2D1_SIZE_F& client) {
+        (void)client;
+        if (!corePlacementMode_) {
+            return;
+        }
+        const bool valid =
+            CorePlacementPointValid(corePlacementPreviewDip_);
+        const float radius = metrics_.coreSize * 0.5f;
+        const UINT32 color =
+            valid ? DefaultCoreColor(CoreIconKind::General)
+                  : 0xC44B55;
+        brush_->SetColor(D2D1::ColorF(color, 0.12f));
+        renderTarget_->FillEllipse(
+            D2D1::Ellipse(
+                corePlacementPreviewDip_,
+                radius + 10.0f, radius + 10.0f),
+            brush_.Get());
+        brush_->SetColor(D2D1::ColorF(color, 0.46f));
+        renderTarget_->FillEllipse(
+            D2D1::Ellipse(
+                corePlacementPreviewDip_,
+                radius, radius),
+            brush_.Get());
+        brush_->SetColor(D2D1::ColorF(0xFFFFFF, 0.92f));
+        renderTarget_->DrawLine(
+            D2D1::Point2F(
+                corePlacementPreviewDip_.x - 8.0f,
+                corePlacementPreviewDip_.y),
+            D2D1::Point2F(
+                corePlacementPreviewDip_.x + 8.0f,
+                corePlacementPreviewDip_.y),
+            brush_.Get(), 2.0f);
+        renderTarget_->DrawLine(
+            D2D1::Point2F(
+                corePlacementPreviewDip_.x,
+                corePlacementPreviewDip_.y - 8.0f),
+            D2D1::Point2F(
+                corePlacementPreviewDip_.x,
+                corePlacementPreviewDip_.y + 8.0f),
+            brush_.Get(), 2.0f);
+    }
+
+    bool CoreDistanceSliderOpen() const {
+        return coreDistanceSliderActive_ &&
+               FindCore(coreDistanceSliderCoreId_) != nullptr;
+    }
+
+    void CloseCoreDistanceSlider() {
+        if (!coreDistanceSliderActive_) {
+            return;
+        }
+        if (const Core* core = FindCore(coreDistanceSliderCoreId_)) {
+            VerifyCoreLayoutInvariant(*core, "panel-close");
+        }
+        coreDistanceSliderActive_ = false;
+        draggingCoreDistancePanel_ = false;
+        draggingCoreDistanceSlider_ = false;
+        distanceLimitReached_ = false;
+        distanceCompactWarning_ = false;
+    }
+
+    void CloseCoreAppearancePanel() {
+        coreAppearancePanelActive_ = false;
+        draggingCoreAppearancePanel_ = false;
+        draggingCoreAppearanceSlider_ = false;
+        appearancePreviewColor_.reset();
+    }
+
+    bool CloseTransientPanels() {
+        const bool hadPanel =
+            CoreDistanceSliderOpen() || CoreAppearancePanelOpen();
+        CloseCoreDistanceSlider();
+        CloseCoreAppearancePanel();
+        if (hadPanel) {
+            SyncSelectionDismissTimer();
+            Invalidate();
+        }
+        return hadPanel;
+    }
+
+    D2D1_RECT_F CoreDistanceSliderCardRectangle(
+        const D2D1_SIZE_F& client) const {
+        constexpr float width = 308.0f;
+        constexpr float height = 186.0f;
+        const float left = std::clamp(coreDistanceSliderAnchorDip_.x - 18.0f,
+            14.0f, std::max(14.0f, client.width - width - 14.0f));
+        const float top = std::clamp(coreDistanceSliderAnchorDip_.y + 12.0f,
+            56.0f, std::max(56.0f, client.height - height - 14.0f));
+        return D2D1::RectF(left, top, left + width, top + height);
+    }
+
+    D2D1_RECT_F CoreDistanceSliderTitleBarRectangle(
+        const D2D1_SIZE_F& client) const {
+        const D2D1_RECT_F card =
+            CoreDistanceSliderCardRectangle(client);
+        return D2D1::RectF(
+            card.left, card.top, card.right, card.top + 38.0f);
+    }
+
+    D2D1_RECT_F CoreDistanceSliderCloseRectangle(
+        const D2D1_SIZE_F& client) const {
+        const D2D1_RECT_F card =
+            CoreDistanceSliderCardRectangle(client);
+        return D2D1::RectF(
+            card.right - 36.0f, card.top + 5.0f,
+            card.right - 7.0f, card.top + 34.0f);
+    }
+
+    D2D1_RECT_F CoreLayoutControlTrackRectangle(
+        const D2D1_SIZE_F& client, CoreLayoutControl control) const {
+        const D2D1_RECT_F card = CoreDistanceSliderCardRectangle(client);
+        const int row = std::max(0, static_cast<int>(control));
+        const float y = card.top + 55.0f + static_cast<float>(row) * 41.0f;
+        return D2D1::RectF(card.left + 82.0f, y,
+                           card.right - 48.0f, y + 8.0f);
+    }
+
+    static float CoreLayoutControlMinimum(CoreLayoutControl control) {
+        return control == CoreLayoutControl::InnerDistance ? 0.60f
+             : control == CoreLayoutControl::OuterDistance ? 0.70f
+             : 0.0f;
+    }
+
+    static float CoreLayoutControlMaximum(CoreLayoutControl control) {
+        return control == CoreLayoutControl::InnerDistance ? 1.40f
+             : control == CoreLayoutControl::OuterDistance ? 1.60f
+             : 360.0f;
+    }
+
+    float CoreLayoutControlValue(const Core& core,
+                                 CoreLayoutControl control) const {
+        switch (control) {
+        case CoreLayoutControl::InnerDistance: return core.innerDistanceScale;
+        case CoreLayoutControl::OuterDistance: return core.outerDistanceScale;
+        case CoreLayoutControl::Rotation: return core.rotationAngle;
+        default: return 0.0f;
+        }
+    }
+
+    float CoreLayoutControlRatio(float value,
+                                 CoreLayoutControl control) const {
+        const float minimum = CoreLayoutControlMinimum(control);
+        const float maximum = CoreLayoutControlMaximum(control);
+        return std::clamp((value - minimum) / std::max(0.001f, maximum - minimum),
+                          0.0f, 1.0f);
+    }
+
+    float CoreLayoutControlValueFromSliderX(float x,
+                                            CoreLayoutControl control) const {
+        const D2D1_RECT_F track = CoreLayoutControlTrackRectangle(
+            ClientDipSize(), control);
+        const float ratio = std::clamp((x - track.left) /
+            std::max(1.0f, track.right - track.left), 0.0f, 1.0f);
+        const float value = CoreLayoutControlMinimum(control) + ratio *
+            (CoreLayoutControlMaximum(control) - CoreLayoutControlMinimum(control));
+        if (control != CoreLayoutControl::Rotation &&
+            std::abs(value - 1.0f) < 0.025f) {
+            return 1.0f;
+        }
+        return value;
+    }
+
+    void DrawCoreDistanceSlider(const D2D1_SIZE_F& client) {
+        if (!CoreDistanceSliderOpen()) return;
+        const Core* core = FindCore(coreDistanceSliderCoreId_);
+        if (core == nullptr) return;
+        const D2D1_RECT_F card = CoreDistanceSliderCardRectangle(client);
+        const bool dark = WindowsUsesDarkTheme();
+        const UINT32 background = dark ? 0x202020 : 0xF7F7F7;
+        const UINT32 border = dark ? 0x666666 : 0xB7B7B7;
+        const UINT32 primary = dark ? 0xF3F3F3 : 0x242424;
+        const UINT32 secondary = dark ? 0xCACACA : 0x505050;
+        const UINT32 trackColor = dark ? 0x6C6C6C : 0xB8C0C5;
+        const UINT32 accent =
+            RgbFromColorRef(GetSysColor(COLOR_HIGHLIGHT));
+        const D2D1_RECT_F shadow = D2D1::RectF(
+            card.left + 3.0f, card.top + 5.0f,
+            card.right + 3.0f, card.bottom + 5.0f);
+        brush_->SetColor(D2D1::ColorF(0x000000, dark ? 0.24f : 0.14f));
+        renderTarget_->FillRoundedRectangle(
+            D2D1::RoundedRect(shadow, 11.0f, 11.0f), brush_.Get());
+        brush_->SetColor(D2D1::ColorF(background, 0.97f));
+        renderTarget_->FillRoundedRectangle(
+            D2D1::RoundedRect(card, 10.0f, 10.0f), brush_.Get());
+        brush_->SetColor(D2D1::ColorF(
+            dark ? 0x2B2B2B : 0xEEF3F7, 0.96f));
+        renderTarget_->FillRoundedRectangle(
+            D2D1::RoundedRect(
+                D2D1::RectF(
+                    card.left + 1.0f, card.top + 1.0f,
+                    card.right - 1.0f, card.top + 38.0f),
+                9.0f, 9.0f),
+            brush_.Get());
+        // Compact is a warning, not a block.  Only the unreadable limit stops
+        // the thumb at its last usable position.
+        brush_->SetColor(D2D1::ColorF(
+            distanceLimitReached_ || distanceCompactWarning_
+                ? 0xB26A2A : border,
+            distanceLimitReached_ || distanceCompactWarning_
+                ? 0.84f : 0.88f));
+        renderTarget_->DrawRoundedRectangle(
+            D2D1::RoundedRect(card, 10.0f, 10.0f), brush_.Get(), 1.0f);
+        brush_->SetColor(D2D1::ColorF(primary, 0.98f));
+        const wchar_t* title = L"布局调节";
+        renderTarget_->DrawTextW(title, static_cast<UINT32>(wcslen(title)),
+            hudFormat_.Get(), D2D1::RectF(card.left + 14.0f, card.top + 10.0f,
+            card.right - 44.0f, card.top + 33.0f), brush_.Get(),
+            D2D1_DRAW_TEXT_OPTIONS_CLIP);
+        const D2D1_RECT_F close =
+            CoreDistanceSliderCloseRectangle(client);
+        brush_->SetColor(D2D1::ColorF(secondary, 0.86f));
+        renderTarget_->DrawLine(
+            D2D1::Point2F(close.left + 9.0f, close.top + 9.0f),
+            D2D1::Point2F(close.right - 9.0f, close.bottom - 9.0f),
+            brush_.Get(), 1.35f);
+        renderTarget_->DrawLine(
+            D2D1::Point2F(close.right - 9.0f, close.top + 9.0f),
+            D2D1::Point2F(close.left + 9.0f, close.bottom - 9.0f),
+            brush_.Get(), 1.35f);
+        static constexpr std::array<const wchar_t*, 3> labels{
+            L"内圈距离", L"外圈距离", L"整体角度"};
+        for (int index = 0; index < 3; ++index) {
+            const CoreLayoutControl control =
+                static_cast<CoreLayoutControl>(index);
+            const D2D1_RECT_F track =
+                CoreLayoutControlTrackRectangle(client, control);
+            const float value = CoreLayoutControlValue(*core, control);
+            const float ratio = CoreLayoutControlRatio(value, control);
+            const float thumbX = track.left + (track.right - track.left) * ratio;
+            brush_->SetColor(D2D1::ColorF(secondary, 0.96f));
+            renderTarget_->DrawTextW(labels[index],
+                static_cast<UINT32>(wcslen(labels[index])), hudFormat_.Get(),
+                D2D1::RectF(card.left + 14.0f, track.top - 8.0f,
+                             track.left - 6.0f, track.bottom + 10.0f),
+                brush_.Get(), D2D1_DRAW_TEXT_OPTIONS_CLIP);
+            brush_->SetColor(D2D1::ColorF(trackColor, 0.92f));
+            renderTarget_->FillRoundedRectangle(
+                D2D1::RoundedRect(track, 4.0f, 4.0f), brush_.Get());
+            if (control != CoreLayoutControl::Rotation) {
+                const float defaultX = track.left +
+                    (track.right - track.left) *
+                    CoreLayoutControlRatio(1.0f, control);
+                brush_->SetColor(D2D1::ColorF(
+                    dark ? 0xB0B0B0 : 0x737373, 0.86f));
+                renderTarget_->DrawLine(D2D1::Point2F(defaultX, track.top - 4.0f),
+                    D2D1::Point2F(defaultX, track.bottom + 4.0f), brush_.Get(), 1.0f);
+            }
+            brush_->SetColor(D2D1::ColorF(accent, 0.96f));
+            renderTarget_->FillRoundedRectangle(D2D1::RoundedRect(
+                D2D1::RectF(track.left, track.top, thumbX, track.bottom),
+                4.0f, 4.0f), brush_.Get());
+            renderTarget_->FillEllipse(D2D1::Ellipse(D2D1::Point2F(thumbX,
+                (track.top + track.bottom) * 0.5f), 7.0f, 7.0f), brush_.Get());
+            const std::wstring valueText = control == CoreLayoutControl::Rotation
+                ? std::to_wstring(static_cast<int>(std::round(value))) + L"°"
+                : std::to_wstring(static_cast<int>(std::round(value * 100.0f))) + L"%";
+            brush_->SetColor(D2D1::ColorF(secondary, 0.96f));
+            renderTarget_->DrawTextW(valueText.c_str(),
+                static_cast<UINT32>(valueText.size()), hudFormat_.Get(),
+                D2D1::RectF(track.right + 6.0f, track.top - 8.0f,
+                             card.right - 10.0f, track.bottom + 10.0f),
+                brush_.Get(), D2D1_DRAW_TEXT_OPTIONS_CLIP);
+        }
+        if (distanceLimitReached_ || distanceCompactWarning_) {
+            brush_->SetColor(D2D1::ColorF(
+                dark ? 0xFFB86A : 0x8B4B20, 0.98f));
+            const wchar_t* warning = distanceLimitReached_
+                ? L"\u5df2\u8fbe\u5230\u6700\u5c0f\u53ef\u8bfb\u8ddd\u79bb"
+                : L"\u5df2\u63a5\u8fd1\u7d27\u51d1\u5e03\u5c40";
+            renderTarget_->DrawTextW(warning, static_cast<UINT32>(wcslen(warning)),
+                tooltipBodyFormat_.Get(), D2D1::RectF(card.right - 132.0f,
+                card.top + 11.0f, card.right - 12.0f, card.top + 32.0f),
+                brush_.Get(), D2D1_DRAW_TEXT_OPTIONS_CLIP);
+        }
+    }
+
+    void TraceCoreLayoutAdjustment(const Core& core,
+                                   const char* phase) const {
+        if (stateFile_.empty()) return;
+        const std::filesystem::path tracePath =
+            stateFile_.parent_path() / L"layout-adjustment.log";
+        std::ofstream trace(tracePath, std::ios::app);
+        if (!trace) return;
+        trace.imbue(std::locale::classic());
+        trace << UnixTimeNow() << ' ' << phase
+              << " core=" << core.id
+              << " base_inner=" << core.baseInnerRadius
+              << " base_outer=" << core.baseOuterRadius
+              << " inner_scale=" << core.innerDistanceScale
+              << " outer_scale=" << core.outerDistanceScale
+              << " rotation=" << core.rotationAngle
+              << " final_inner=" <<
+                    core.baseInnerRadius * core.innerDistanceScale
+              << " final_outer=" <<
+                    core.baseOuterRadius * core.outerDistanceScale
+              << " customized=" << (core.userLayoutCustomized ? 1 : 0)
+              << " focus_amount=" << CoreFocusAmount(core.id)
+              << " focus_visual_scale=1"
+              << '\n';
+    }
+
+    struct CoreLayoutInvariant {
+        float baseInnerRadius = 0.0f;
+        float baseOuterRadius = 0.0f;
+        float innerDistanceScale = 1.0f;
+        float outerDistanceScale = 1.0f;
+        float rotationAngle = 0.0f;
+    };
+
+    void RecordCoreLayoutInvariant(const Core& core, const char* phase) {
+        layoutInvariants_[core.id] = {
+            core.baseInnerRadius, core.baseOuterRadius,
+            core.innerDistanceScale, core.outerDistanceScale,
+            core.rotationAngle};
+        TraceCoreLayoutAdjustment(core, phase);
+    }
+
+    void VerifyCoreLayoutInvariant(const Core& core, const char* phase) {
+        const auto found = layoutInvariants_.find(core.id);
+        if (found == layoutInvariants_.end()) {
+            RecordCoreLayoutInvariant(core, phase);
+            return;
+        }
+        const CoreLayoutInvariant& expected = found->second;
+        const bool unchanged =
+            std::abs(expected.baseInnerRadius - core.baseInnerRadius) < 0.0001f &&
+            std::abs(expected.baseOuterRadius - core.baseOuterRadius) < 0.0001f &&
+            std::abs(expected.innerDistanceScale - core.innerDistanceScale) < 0.0001f &&
+            std::abs(expected.outerDistanceScale - core.outerDistanceScale) < 0.0001f &&
+            std::abs(expected.rotationAngle - core.rotationAngle) < 0.0001f;
+        TraceCoreLayoutAdjustment(core, phase);
+        if (!stateFile_.empty()) {
+            const std::filesystem::path tracePath =
+                stateFile_.parent_path() / L"layout-adjustment.log";
+            std::ofstream trace(tracePath, std::ios::app);
+            if (trace) {
+                trace.imbue(std::locale::classic());
+                trace << UnixTimeNow() << ' ' << phase
+                      << " core=" << core.id
+                      << " invariant=" << (unchanged ? "ok" : "changed")
+                      << " expected_inner=" << expected.innerDistanceScale
+                      << " expected_outer=" << expected.outerDistanceScale
+                      << " actual_inner=" << core.innerDistanceScale
+                      << " actual_outer=" << core.outerDistanceScale
+                      << '\n';
+            }
+        }
+#ifdef _DEBUG
+        assert(unchanged && "focus/collapse modified persisted layout parameters");
+#endif
+    }
+
+    void OpenCoreDistanceSlider(std::uint64_t coreId) {
+        const Core* core = FindCore(coreId);
+        if (core == nullptr) return;
+        CloseCoreAppearancePanel();
+        coreDistanceSliderCoreId_ = coreId;
+        coreDistanceSliderActive_ = true;
+        distanceLimitReached_ = false;
+        distanceCompactWarning_ = false;
+        activeCoreLayoutControl_ = CoreLayoutControl::InnerDistance;
+        constexpr float cardWidth = 308.0f;
+        constexpr float cardHeight = 186.0f;
+        constexpr float gap = 12.0f;
+        const D2D1_SIZE_F client = ClientDipSize();
+        const D2D1_POINT_2F center =
+            WorldToScreen(VisualCorePosition(*core));
+        const float coreHalf =
+            metrics_.coreSize * state_.zoom / 2.0f + 8.0f;
+        const std::array<D2D1_RECT_F, 4> candidates{
+            D2D1::RectF(
+                center.x + coreHalf + gap,
+                center.y - cardHeight / 2.0f,
+                center.x + coreHalf + gap + cardWidth,
+                center.y + cardHeight / 2.0f),
+            D2D1::RectF(
+                center.x - coreHalf - gap - cardWidth,
+                center.y - cardHeight / 2.0f,
+                center.x - coreHalf - gap,
+                center.y + cardHeight / 2.0f),
+            D2D1::RectF(
+                center.x - cardWidth / 2.0f,
+                center.y - coreHalf - gap - cardHeight,
+                center.x + cardWidth / 2.0f,
+                center.y - coreHalf - gap),
+            D2D1::RectF(
+                center.x - cardWidth / 2.0f,
+                center.y + coreHalf + gap,
+                center.x + cardWidth / 2.0f,
+                center.y + coreHalf + gap + cardHeight)};
+        D2D1_RECT_F best = candidates[0];
+        float bestPenalty = FLT_MAX;
+        const D2D1_RECT_F coreBounds = D2D1::RectF(
+            center.x - coreHalf, center.y - coreHalf,
+            center.x + coreHalf, center.y + coreHalf);
+        for (const D2D1_RECT_F candidate : candidates) {
+            D2D1_RECT_F placed = candidate;
+            const float shiftX =
+                placed.left < 14.0f
+                    ? 14.0f - placed.left
+                    : (placed.right > client.width - 14.0f
+                           ? client.width - 14.0f -
+                                 placed.right
+                           : 0.0f);
+            const float shiftY =
+                placed.top < 56.0f
+                    ? 56.0f - placed.top
+                    : (placed.bottom >
+                               client.height - 14.0f
+                           ? client.height - 14.0f -
+                                 placed.bottom
+                           : 0.0f);
+            placed.left += shiftX;
+            placed.right += shiftX;
+            placed.top += shiftY;
+            placed.bottom += shiftY;
+            float penalty =
+                std::abs(shiftX) + std::abs(shiftY);
+            if (RectanglesIntersect(placed, coreBounds)) {
+                penalty += 1000.0f;
+            }
+            if (penalty < bestPenalty) {
+                bestPenalty = penalty;
+                best = placed;
+            }
+        }
+        coreDistanceSliderAnchorDip_ = D2D1::Point2F(
+            best.left + 18.0f, best.top - 12.0f);
+        RecordCoreLayoutInvariant(*core, "panel-open");
+        SyncSelectionDismissTimer();
+        Invalidate();
+    }
+
+    bool HandleCoreDistanceSliderPointer(D2D1_POINT_2F point) {
+        if (!CoreDistanceSliderOpen()) return false;
+        const D2D1_RECT_F card = CoreDistanceSliderCardRectangle(ClientDipSize());
+        if (!PointInside(point, card)) {
+            CloseCoreDistanceSlider();
+            SyncSelectionDismissTimer();
+            Invalidate();
+            return false;
+        }
+        if (PointInside(
+                point,
+                CoreDistanceSliderCloseRectangle(ClientDipSize()))) {
+            CloseCoreDistanceSlider();
+            SyncSelectionDismissTimer();
+            Invalidate();
+            return true;
+        }
+        if (PointInside(
+                point,
+                CoreDistanceSliderTitleBarRectangle(ClientDipSize()))) {
+            draggingCoreDistancePanel_ = true;
+            coreDistancePanelDragOffsetDip_ = D2D1::Point2F(
+                point.x - card.left, point.y - card.top);
+            SetCapture(window_);
+            return true;
+        }
+        for (int index = 0; index < 3; ++index) {
+            const CoreLayoutControl control =
+                static_cast<CoreLayoutControl>(index);
+            const D2D1_RECT_F track = CoreLayoutControlTrackRectangle(
+                ClientDipSize(), control);
+            if (point.x >= track.left - 14.0f && point.x <= track.right + 38.0f &&
+                point.y >= track.top - 16.0f && point.y <= track.bottom + 16.0f) {
+                StableLayouts();
+                coreDistanceDragSnapshot_ = state_;
+                draggingCoreDistanceSlider_ = true;
+                activeCoreLayoutControl_ = control;
+                SetCoreLayoutControlValue(coreDistanceSliderCoreId_, control,
+                    CoreLayoutControlValueFromSliderX(point.x, control));
+                SetCapture(window_);
+                break;
+            }
+        }
+        return true;
+    }
+
+    void EndCoreDistanceSliderDrag(bool commit) {
+        if (!draggingCoreDistanceSlider_) return;
+        draggingCoreDistanceSlider_ = false;
+        if (GetCapture() == window_) ReleaseCapture();
+        if (commit) {
+            PushUndo(std::move(coreDistanceDragSnapshot_));
+            // The accepted preview has already been encoded into the formal
+            // per-file offsets. Saving here writes only that single source.
+            ScheduleSave(false);
+            if (const Core* core = FindCore(coreDistanceSliderCoreId_)) {
+                RecordCoreLayoutInvariant(*core, "slider-commit");
+            }
+            SetStatus(L"当前核心的内圈、外圈距离或角度已保存");
+        } else {
+            state_ = std::move(coreDistanceDragSnapshot_);
+            layoutDirty_ = true;
+        }
+        Invalidate();
+    }
+
+    bool CoreAppearancePanelOpen() const {
+        return coreAppearancePanelActive_ &&
+               FindCore(coreAppearancePanelCoreId_) != nullptr;
+    }
+
+    D2D1_RECT_F CoreAppearancePanelRectangle(
+        const D2D1_SIZE_F& client) const {
+        constexpr float width = 360.0f;
+        constexpr float height = 458.0f;
+        const float left = std::clamp(coreAppearancePanelAnchorDip_.x - 18.0f,
+            14.0f, std::max(14.0f, client.width - width - 14.0f));
+        const float top = std::clamp(coreAppearancePanelAnchorDip_.y + 12.0f,
+            56.0f, std::max(56.0f, client.height - height - 14.0f));
+        return D2D1::RectF(left, top, left + width, top + height);
+    }
+
+    D2D1_RECT_F CoreAppearancePanelTitleBarRectangle(
+        const D2D1_SIZE_F& client) const {
+        const D2D1_RECT_F card = CoreAppearancePanelRectangle(client);
+        return D2D1::RectF(card.left, card.top, card.right, card.top + 38.0f);
+    }
+
+    D2D1_RECT_F CoreAppearancePanelCloseRectangle(
+        const D2D1_SIZE_F& client) const {
+        const D2D1_RECT_F card = CoreAppearancePanelRectangle(client);
+        return D2D1::RectF(
+            card.right - 36.0f, card.top + 5.0f,
+            card.right - 7.0f, card.top + 34.0f);
+    }
+
+    D2D1_RECT_F CoreAppearanceColorRectangle(
+        const D2D1_SIZE_F& client, int index) const {
+        const D2D1_RECT_F card = CoreAppearancePanelRectangle(client);
+        const int column = std::clamp(index % 3, 0, 2);
+        const int row = std::clamp(index / 3, 0, 2);
+        const float left = card.left + 16.0f + static_cast<float>(column) * 110.0f;
+        const float top = card.top + 70.0f + static_cast<float>(row) * 29.0f;
+        return D2D1::RectF(left, top, left + 98.0f, top + 23.0f);
+    }
+
+    D2D1_RECT_F CoreAppearanceTrackRectangle(
+        const D2D1_SIZE_F& client, CoreAppearanceControl control) const {
+        const D2D1_RECT_F card = CoreAppearancePanelRectangle(client);
+        float y = card.top + 194.0f;
+        switch (control) {
+        case CoreAppearanceControl::CoreScale:
+            y = card.top + 194.0f;
+            break;
+        case CoreAppearanceControl::GlowIntensity:
+            y = card.top + 233.0f;
+            break;
+        case CoreAppearanceControl::LineWidth:
+            y = card.top + 390.0f;
+            break;
+        default:
+            break;
+        }
+        return D2D1::RectF(card.left + 104.0f, y,
+                           card.right - 54.0f, y + 8.0f);
+    }
+
+    D2D1_RECT_F CoreAppearanceCustomColorRectangle(
+        const D2D1_SIZE_F& client) const {
+        const D2D1_RECT_F card = CoreAppearancePanelRectangle(client);
+        return D2D1::RectF(card.left + 14.0f, card.top + 154.0f,
+                           card.right - 14.0f, card.top + 178.0f);
+    }
+
+    D2D1_RECT_F CoreAppearanceLineColorRectangle(
+        const D2D1_SIZE_F& client, int index) const {
+        const D2D1_RECT_F card = CoreAppearancePanelRectangle(client);
+        const int column = std::clamp(index % 2, 0, 1);
+        const int row = std::clamp(index / 2, 0, 1);
+        constexpr float gap = 6.0f;
+        const float width = (card.right - card.left - 28.0f - gap) * 0.5f;
+        const float left =
+            card.left + 14.0f + static_cast<float>(column) * (width + gap);
+        const float top =
+            card.top + 315.0f + static_cast<float>(row) * 29.0f;
+        return D2D1::RectF(left, top, left + width, top + 24.0f);
+    }
+
+    D2D1_RECT_F CoreAppearanceResetRectangle(
+        const D2D1_SIZE_F& client) const {
+        const D2D1_RECT_F card = CoreAppearancePanelRectangle(client);
+        return D2D1::RectF(card.left + 14.0f, card.bottom - 43.0f,
+                           card.right - 14.0f, card.bottom - 13.0f);
+    }
+
+    static float CoreAppearanceMinimum(CoreAppearanceControl control) {
+        switch (control) {
+        case CoreAppearanceControl::CoreScale: return 0.80f;
+        case CoreAppearanceControl::LineWidth: return 0.70f;
+        case CoreAppearanceControl::GlowIntensity: return 0.30f;
+        default: return 0.0f;
+        }
+    }
+
+    static float CoreAppearanceMaximum(CoreAppearanceControl control) {
+        switch (control) {
+        case CoreAppearanceControl::CoreScale: return 1.20f;
+        case CoreAppearanceControl::LineWidth: return 2.50f;
+        case CoreAppearanceControl::GlowIntensity: return 1.60f;
+        default: return 1.0f;
+        }
+    }
+
+    static float CoreAppearanceDefault(CoreAppearanceControl control) {
+        switch (control) {
+        case CoreAppearanceControl::CoreScale: return 1.0f;
+        case CoreAppearanceControl::LineWidth: return 1.2f;
+        case CoreAppearanceControl::GlowIntensity: return 1.0f;
+        default: return 0.0f;
+        }
+    }
+
+    float CoreAppearanceValue(const Core& core,
+                              CoreAppearanceControl control) const {
+        switch (control) {
+        case CoreAppearanceControl::CoreScale: return core.appearanceCoreScale;
+        case CoreAppearanceControl::LineWidth:
+            return state_.connectionLineWidth;
+        case CoreAppearanceControl::GlowIntensity:
+            return state_.coreGlowIntensity;
+        default: return 0.0f;
+        }
+    }
+
+    float CoreAppearanceRatio(float value,
+                              CoreAppearanceControl control) const {
+        const float minimum = CoreAppearanceMinimum(control);
+        const float maximum = CoreAppearanceMaximum(control);
+        return std::clamp((value - minimum) / std::max(0.001f, maximum - minimum),
+                          0.0f, 1.0f);
+    }
+
+    float CoreAppearanceValueFromSliderX(float x,
+                                         CoreAppearanceControl control) const {
+        const D2D1_RECT_F track = CoreAppearanceTrackRectangle(
+            ClientDipSize(), control);
+        const float ratio = std::clamp((x - track.left) /
+            std::max(1.0f, track.right - track.left), 0.0f, 1.0f);
+        float value = CoreAppearanceMinimum(control) + ratio *
+            (CoreAppearanceMaximum(control) - CoreAppearanceMinimum(control));
+        if (control == CoreAppearanceControl::LineWidth) {
+            static constexpr std::array<float, 3> presets{
+                kConnectionLineWidthThin,
+                kConnectionLineWidthStandard,
+                kConnectionLineWidthEmphasis};
+            for (const float preset : presets) {
+                if (std::abs(value - preset) < 0.045f) {
+                    value = preset;
+                    break;
+                }
+            }
+        } else if (std::abs(value - CoreAppearanceDefault(control)) < 0.025f) {
+            value = CoreAppearanceDefault(control);
+        }
+        return value;
+    }
+
+    bool SetCoreAppearanceControlValue(std::uint64_t coreId,
+                                       CoreAppearanceControl control,
+                                       float value) {
+        if (control == CoreAppearanceControl::LineWidth ||
+            control == CoreAppearanceControl::GlowIntensity) {
+            const float clamped = std::clamp(
+                value, CoreAppearanceMinimum(control),
+                CoreAppearanceMaximum(control));
+            if (control == CoreAppearanceControl::LineWidth) {
+                state_.connectionLineWidth = clamped;
+            } else {
+                state_.coreGlowIntensity = clamped;
+            }
+            Invalidate();
+            return true;
+        }
+        Core* core = FindCore(coreId);
+        if (core == nullptr) {
+            return false;
+        }
+        const float clamped = std::clamp(value,
+            CoreAppearanceMinimum(control), CoreAppearanceMaximum(control));
+        switch (control) {
+        case CoreAppearanceControl::CoreScale:
+            core->appearanceCoreScale = clamped;
+            break;
+        default:
+            return false;
+        }
+        // Appearance is display-only: no layout cache, collision resolver,
+        // file radius, placement or core coordinate is altered here.
+        Invalidate();
+        return true;
+    }
+
+    void ResetCoreAppearance(std::uint64_t coreId) {
+        Core* core = FindCore(coreId);
+        if (core == nullptr) {
+            return;
+        }
+        PushUndo(state_);
+        core->themeColor = DefaultCoreColor(core->iconKind);
+        core->themeColorCustomized = false;
+        core->appearanceCoreScale = 1.0f;
+        core->connectionLineColorMode =
+            ConnectionLineColorMode::FollowCore;
+        core->connectionLineCustomColor = 0x7A8490;
+        state_.connectionLineWidth = kConnectionLineWidthStandard;
+        state_.coreGlowIntensity = 1.0f;
+        appearancePreviewColor_.reset();
+        ScheduleSave(false);
+        SetStatus(L"已恢复当前核心外观及全局粗细、光晕");
+    }
+
+    void DrawCoreAppearancePanel(const D2D1_SIZE_F& client) {
+        if (!CoreAppearancePanelOpen()) {
+            return;
+        }
+        const Core* core = FindCore(coreAppearancePanelCoreId_);
+        if (core == nullptr) {
+            return;
+        }
+        const D2D1_RECT_F card = CoreAppearancePanelRectangle(client);
+        const bool dark = WindowsUsesDarkTheme();
+        const UINT32 background = dark ? 0x202020 : 0xF7F7F7;
+        const UINT32 border = dark ? 0x666666 : 0xB7B7B7;
+        const UINT32 primary = dark ? 0xF3F3F3 : 0x242424;
+        const UINT32 secondary = dark ? 0xCACACA : 0x505050;
+        const UINT32 trackColor = dark ? 0x6C6C6C : 0xB8C0C5;
+        const UINT32 accent = RgbFromColorRef(GetSysColor(COLOR_HIGHLIGHT));
+        const D2D1_RECT_F shadow = D2D1::RectF(
+            card.left + 3.0f, card.top + 5.0f,
+            card.right + 3.0f, card.bottom + 5.0f);
+        brush_->SetColor(D2D1::ColorF(0x000000, dark ? 0.24f : 0.14f));
+        renderTarget_->FillRoundedRectangle(
+            D2D1::RoundedRect(shadow, 11.0f, 11.0f), brush_.Get());
+        brush_->SetColor(D2D1::ColorF(background, 0.97f));
+        renderTarget_->FillRoundedRectangle(
+            D2D1::RoundedRect(card, 10.0f, 10.0f), brush_.Get());
+        brush_->SetColor(D2D1::ColorF(
+            dark ? 0x2B2B2B : 0xEEF3F7, 0.96f));
+        renderTarget_->FillRoundedRectangle(
+            D2D1::RoundedRect(
+                D2D1::RectF(
+                    card.left + 1.0f, card.top + 1.0f,
+                    card.right - 1.0f, card.top + 38.0f),
+                9.0f, 9.0f),
+            brush_.Get());
+        brush_->SetColor(D2D1::ColorF(border, 0.88f));
+        renderTarget_->DrawRoundedRectangle(
+            D2D1::RoundedRect(card, 10.0f, 10.0f), brush_.Get(), 1.0f);
+        brush_->SetColor(D2D1::ColorF(primary, 0.98f));
+        const wchar_t* title = L"核心外观设置";
+        renderTarget_->DrawTextW(title, static_cast<UINT32>(wcslen(title)),
+            hudFormat_.Get(), D2D1::RectF(card.left + 14.0f, card.top + 10.0f,
+            card.right - 44.0f, card.top + 33.0f), brush_.Get(),
+            D2D1_DRAW_TEXT_OPTIONS_CLIP);
+        const D2D1_RECT_F close =
+            CoreAppearancePanelCloseRectangle(client);
+        brush_->SetColor(D2D1::ColorF(secondary, 0.86f));
+        renderTarget_->DrawLine(
+            D2D1::Point2F(close.left + 9.0f, close.top + 9.0f),
+            D2D1::Point2F(close.right - 9.0f, close.bottom - 9.0f),
+            brush_.Get(), 1.35f);
+        renderTarget_->DrawLine(
+            D2D1::Point2F(close.right - 9.0f, close.top + 9.0f),
+            D2D1::Point2F(close.left + 9.0f, close.bottom - 9.0f),
+            brush_.Get(), 1.35f);
+        const wchar_t* colorLabel = L"核心颜色";
+        renderTarget_->DrawTextW(colorLabel, static_cast<UINT32>(wcslen(colorLabel)),
+            hudFormat_.Get(), D2D1::RectF(card.left + 14.0f, card.top + 45.0f,
+            card.right - 14.0f, card.top + 67.0f), brush_.Get(),
+            D2D1_DRAW_TEXT_OPTIONS_CLIP);
+        for (int index = 0; index < static_cast<int>(kCoreColorPresets.size()); ++index) {
+            const CoreColorPreset& preset = kCoreColorPresets[index];
+            const D2D1_RECT_F option = CoreAppearanceColorRectangle(client, index);
+            const D2D1_RECT_F swatch = D2D1::RectF(
+                option.left, option.top + 3.0f, option.left + 17.0f, option.top + 20.0f);
+            const D2D1_POINT_2F swatchCenter = D2D1::Point2F(
+                (swatch.left + swatch.right) * 0.5f,
+                (swatch.top + swatch.bottom) * 0.5f);
+            brush_->SetColor(D2D1::ColorF(preset.color, 1.0f));
+            renderTarget_->FillEllipse(
+                D2D1::Ellipse(swatchCenter, 8.5f, 8.5f), brush_.Get());
+            brush_->SetColor(D2D1::ColorF(dark ? 0xE8E8E8 : 0x3E4852, 0.92f));
+            renderTarget_->DrawEllipse(
+                D2D1::Ellipse(swatchCenter, 8.5f, 8.5f), brush_.Get(), 1.0f);
+            if (core->themeColor == preset.color) {
+                brush_->SetColor(D2D1::ColorF(0xFFFFFF, 0.98f));
+                renderTarget_->DrawLine(D2D1::Point2F(swatch.left + 3.5f, swatch.top + 9.0f),
+                    D2D1::Point2F(swatch.left + 7.0f, swatch.bottom - 3.5f),
+                    brush_.Get(), 1.6f);
+                renderTarget_->DrawLine(D2D1::Point2F(swatch.left + 7.0f, swatch.bottom - 3.5f),
+                    D2D1::Point2F(swatch.right - 3.0f, swatch.top + 4.0f),
+                    brush_.Get(), 1.6f);
+            }
+            brush_->SetColor(D2D1::ColorF(secondary, 0.96f));
+            renderTarget_->DrawTextW(preset.name,
+                static_cast<UINT32>(wcslen(preset.name)), hudFormat_.Get(),
+                D2D1::RectF(swatch.right + 5.0f, option.top,
+                             option.right, option.bottom), brush_.Get(),
+                D2D1_DRAW_TEXT_OPTIONS_CLIP);
+        }
+
+        const D2D1_RECT_F customColor =
+            CoreAppearanceCustomColorRectangle(client);
+        brush_->SetColor(D2D1::ColorF(dark ? 0x383838 : 0xE7EBEE, 0.96f));
+        renderTarget_->FillRoundedRectangle(
+            D2D1::RoundedRect(customColor, 5.0f, 5.0f), brush_.Get());
+        brush_->SetColor(D2D1::ColorF(border, 0.88f));
+        renderTarget_->DrawRoundedRectangle(
+            D2D1::RoundedRect(customColor, 5.0f, 5.0f), brush_.Get(), 1.0f);
+        const D2D1_RECT_F customSwatch = D2D1::RectF(
+            customColor.left + 8.0f, customColor.top + 4.0f,
+            customColor.left + 24.0f, customColor.bottom - 4.0f);
+        brush_->SetColor(D2D1::ColorF(EffectiveCoreThemeColor(*core), 1.0f));
+        renderTarget_->FillRoundedRectangle(
+            D2D1::RoundedRect(customSwatch, 3.0f, 3.0f), brush_.Get());
+        brush_->SetColor(D2D1::ColorF(dark ? 0xE8E8E8 : 0x3E4852, 0.92f));
+        renderTarget_->DrawRoundedRectangle(
+            D2D1::RoundedRect(customSwatch, 3.0f, 3.0f), brush_.Get(), 1.0f);
+        brush_->SetColor(D2D1::ColorF(primary, 0.98f));
+        const wchar_t* customColorText = L"自定义颜色...";
+        renderTarget_->DrawTextW(customColorText,
+            static_cast<UINT32>(wcslen(customColorText)), hudFormat_.Get(),
+            D2D1::RectF(customSwatch.right + 7.0f, customColor.top,
+                         customColor.right - 8.0f, customColor.bottom),
+            brush_.Get(), D2D1_DRAW_TEXT_OPTIONS_CLIP);
+
+        const float separatorY = card.top + 267.0f;
+        brush_->SetColor(D2D1::ColorF(border, 0.58f));
+        renderTarget_->DrawLine(
+            D2D1::Point2F(card.left + 14.0f, separatorY),
+            D2D1::Point2F(card.right - 14.0f, separatorY),
+            brush_.Get(), 1.0f);
+        brush_->SetColor(D2D1::ColorF(primary, 0.98f));
+        const wchar_t* lineSectionTitle =
+            L"连接线（颜色按核心，粗细全局）";
+        renderTarget_->DrawTextW(
+            lineSectionTitle,
+            static_cast<UINT32>(wcslen(lineSectionTitle)),
+            hudFormat_.Get(),
+            D2D1::RectF(card.left + 14.0f, card.top + 276.0f,
+                         card.right - 14.0f, card.top + 300.0f),
+            brush_.Get(), D2D1_DRAW_TEXT_OPTIONS_CLIP);
+        brush_->SetColor(D2D1::ColorF(secondary, 0.96f));
+        const wchar_t* lineColorLabel = L"连线颜色";
+        renderTarget_->DrawTextW(
+            lineColorLabel,
+            static_cast<UINT32>(wcslen(lineColorLabel)),
+            hudFormat_.Get(),
+            D2D1::RectF(card.left + 14.0f, card.top + 295.0f,
+                         card.right - 14.0f, card.top + 315.0f),
+            brush_.Get(), D2D1_DRAW_TEXT_OPTIONS_CLIP);
+        static constexpr std::array<ConnectionLineColorMode, 4>
+            lineColorModes{
+                ConnectionLineColorMode::FollowCore,
+                ConnectionLineColorMode::Black,
+                ConnectionLineColorMode::White,
+                ConnectionLineColorMode::Custom};
+        static constexpr std::array<const wchar_t*, 4> lineColorNames{
+            L"跟随核心", L"黑色", L"白色", L"自定义颜色..."};
+        for (int index = 0; index < 4; ++index) {
+            const ConnectionLineColorMode mode = lineColorModes[index];
+            const bool selected = core->connectionLineColorMode == mode;
+            const D2D1_RECT_F option =
+                CoreAppearanceLineColorRectangle(client, index);
+            brush_->SetColor(D2D1::ColorF(
+                selected
+                    ? (dark ? 0x354458 : 0xE1EDF8)
+                    : (dark ? 0x383838 : 0xE7EBEE),
+                0.96f));
+            renderTarget_->FillRoundedRectangle(
+                D2D1::RoundedRect(option, 5.0f, 5.0f), brush_.Get());
+            brush_->SetColor(D2D1::ColorF(
+                selected ? accent : border, selected ? 0.96f : 0.78f));
+            renderTarget_->DrawRoundedRectangle(
+                D2D1::RoundedRect(option, 5.0f, 5.0f),
+                brush_.Get(), selected ? 1.4f : 1.0f);
+            UINT32 swatchColor = 0x7A8490;
+            switch (mode) {
+            case ConnectionLineColorMode::FollowCore:
+                swatchColor = ConnectionColorWithStrength(
+                    EffectiveCoreThemeColor(*core), 0.90f);
+                break;
+            case ConnectionLineColorMode::Black:
+                swatchColor = 0x34383D;
+                break;
+            case ConnectionLineColorMode::White:
+                swatchColor = 0xF1F3F5;
+                break;
+            case ConnectionLineColorMode::Custom:
+                swatchColor = core->connectionLineCustomColor;
+                break;
+            }
+            const D2D1_RECT_F swatch = D2D1::RectF(
+                option.left + 7.0f, option.top + 4.0f,
+                option.left + 23.0f, option.bottom - 4.0f);
+            brush_->SetColor(D2D1::ColorF(swatchColor, 1.0f));
+            renderTarget_->FillRoundedRectangle(
+                D2D1::RoundedRect(swatch, 3.0f, 3.0f), brush_.Get());
+            brush_->SetColor(D2D1::ColorF(
+                dark ? 0xDADADA : 0x56616B, 0.88f));
+            renderTarget_->DrawRoundedRectangle(
+                D2D1::RoundedRect(swatch, 3.0f, 3.0f),
+                brush_.Get(), 1.0f);
+            brush_->SetColor(D2D1::ColorF(primary, 0.96f));
+            renderTarget_->DrawTextW(
+                lineColorNames[index],
+                static_cast<UINT32>(wcslen(lineColorNames[index])),
+                hudFormat_.Get(),
+                D2D1::RectF(swatch.right + 6.0f, option.top,
+                             option.right - 5.0f, option.bottom),
+                brush_.Get(), D2D1_DRAW_TEXT_OPTIONS_CLIP);
+        }
+
+        static constexpr std::array<CoreAppearanceControl, 3> controls{
+            CoreAppearanceControl::CoreScale,
+            CoreAppearanceControl::GlowIntensity,
+            CoreAppearanceControl::LineWidth};
+        static constexpr std::array<const wchar_t*, 3> labels{
+            L"核心大小", L"全局光晕", L"连线粗细"};
+        for (int index = 0; index < 3; ++index) {
+            const CoreAppearanceControl control = controls[index];
+            const D2D1_RECT_F track =
+                CoreAppearanceTrackRectangle(client, control);
+            const float value = CoreAppearanceValue(*core, control);
+            const float ratio = CoreAppearanceRatio(value, control);
+            const float thumbX = track.left + (track.right - track.left) * ratio;
+            brush_->SetColor(D2D1::ColorF(secondary, 0.96f));
+            renderTarget_->DrawTextW(labels[index],
+                static_cast<UINT32>(wcslen(labels[index])), hudFormat_.Get(),
+                D2D1::RectF(card.left + 14.0f, track.top - 8.0f,
+                             track.left - 6.0f, track.bottom + 11.0f),
+                brush_.Get(), D2D1_DRAW_TEXT_OPTIONS_CLIP);
+            brush_->SetColor(D2D1::ColorF(trackColor, 0.92f));
+            renderTarget_->FillRoundedRectangle(
+                D2D1::RoundedRect(track, 4.0f, 4.0f), brush_.Get());
+            const float defaultX = track.left + (track.right - track.left) *
+                CoreAppearanceRatio(CoreAppearanceDefault(control), control);
+            brush_->SetColor(D2D1::ColorF(dark ? 0xB0B0B0 : 0x737373, 0.86f));
+            renderTarget_->DrawLine(D2D1::Point2F(defaultX, track.top - 4.0f),
+                D2D1::Point2F(defaultX, track.bottom + 4.0f), brush_.Get(), 1.0f);
+            brush_->SetColor(D2D1::ColorF(accent, 0.96f));
+            renderTarget_->FillRoundedRectangle(D2D1::RoundedRect(
+                D2D1::RectF(track.left, track.top, thumbX, track.bottom),
+                4.0f, 4.0f), brush_.Get());
+            renderTarget_->FillEllipse(D2D1::Ellipse(D2D1::Point2F(
+                thumbX, (track.top + track.bottom) * 0.5f), 7.0f, 7.0f), brush_.Get());
+            std::wstring valueText;
+            if (control == CoreAppearanceControl::LineWidth) {
+                const int tenths = static_cast<int>(std::round(value * 10.0f));
+                valueText = std::to_wstring(tenths / 10) + L"." +
+                    std::to_wstring(std::abs(tenths % 10)) + L" DIP";
+            } else {
+                valueText = std::to_wstring(static_cast<int>(std::round(value * 100.0f))) + L"%";
+            }
+            brush_->SetColor(D2D1::ColorF(secondary, 0.96f));
+            renderTarget_->DrawTextW(valueText.c_str(),
+                static_cast<UINT32>(valueText.size()), hudFormat_.Get(),
+                D2D1::RectF(track.right + 6.0f, track.top - 8.0f,
+                             card.right - 10.0f, track.bottom + 11.0f),
+                brush_.Get(), D2D1_DRAW_TEXT_OPTIONS_CLIP);
+        }
+        const D2D1_RECT_F reset = CoreAppearanceResetRectangle(client);
+        brush_->SetColor(D2D1::ColorF(dark ? 0x383838 : 0xE7EBEE, 0.96f));
+        renderTarget_->FillRoundedRectangle(
+            D2D1::RoundedRect(reset, 6.0f, 6.0f), brush_.Get());
+        brush_->SetColor(D2D1::ColorF(border, 0.88f));
+        renderTarget_->DrawRoundedRectangle(
+            D2D1::RoundedRect(reset, 6.0f, 6.0f), brush_.Get(), 1.0f);
+        brush_->SetColor(D2D1::ColorF(primary, 0.98f));
+        const wchar_t* resetText = L"恢复默认外观";
+        renderTarget_->DrawTextW(resetText, static_cast<UINT32>(wcslen(resetText)),
+            hudFormat_.Get(), reset, brush_.Get(), D2D1_DRAW_TEXT_OPTIONS_CLIP);
+    }
+
+    void OpenCoreAppearancePanel(std::uint64_t coreId) {
+        const Core* core = FindCore(coreId);
+        if (core == nullptr) {
+            return;
+        }
+        CloseCoreDistanceSlider();
+        coreAppearancePanelCoreId_ = coreId;
+        coreAppearancePanelActive_ = true;
+        appearancePreviewColor_.reset();
+        constexpr float cardWidth = 360.0f;
+        constexpr float cardHeight = 458.0f;
+        constexpr float gap = 14.0f;
+        const D2D1_SIZE_F client = ClientDipSize();
+        const D2D1_POINT_2F center =
+            WorldToScreen(VisualCorePosition(*core));
+        const float coreHalf = metrics_.coreSize * state_.zoom *
+            CoreVisualScale(*core) / 2.0f + 8.0f;
+        float left = center.x + coreHalf + gap;
+        float top = center.y - cardHeight * 0.5f;
+        if (left + cardWidth > client.width - 14.0f) {
+            left = center.x - coreHalf - gap - cardWidth;
+        }
+        left = std::clamp(left, 14.0f, std::max(14.0f, client.width - cardWidth - 14.0f));
+        top = std::clamp(top, 56.0f, std::max(56.0f, client.height - cardHeight - 14.0f));
+        coreAppearancePanelAnchorDip_ = D2D1::Point2F(left + 18.0f, top - 12.0f);
+        SyncSelectionDismissTimer();
+        Invalidate();
+    }
+
+    std::optional<UINT32> AppearanceColorAt(D2D1_POINT_2F point) const {
+        if (!CoreAppearancePanelOpen()) {
+            return std::nullopt;
+        }
+        for (int index = 0; index < static_cast<int>(kCoreColorPresets.size()); ++index) {
+            if (PointInside(point, CoreAppearanceColorRectangle(ClientDipSize(), index))) {
+                return kCoreColorPresets[index].color;
+            }
+        }
+        return std::nullopt;
+    }
+
+    void UpdateAppearanceColorPreview(D2D1_POINT_2F point) {
+        const std::optional<UINT32> next = AppearanceColorAt(point);
+        if (next != appearancePreviewColor_) {
+            appearancePreviewColor_ = next;
+            Invalidate();
+        }
+    }
+
+    void ChooseCustomCoreColor(std::uint64_t coreId) {
+        const Core* core = FindCore(coreId);
+        if (core == nullptr) {
+            return;
+        }
+        static COLORREF customColors[16]{};
+        const UINT32 color = EffectiveCoreThemeColor(*core);
+        CHOOSECOLORW dialog{sizeof(dialog)};
+        dialog.hwndOwner = window_;
+        dialog.rgbResult = RGB((color >> 16) & 0xFFu,
+                               (color >> 8) & 0xFFu,
+                               color & 0xFFu);
+        dialog.lpCustColors = customColors;
+        dialog.Flags = CC_FULLOPEN | CC_RGBINIT;
+        popupMenuOpen_ = true;
+        const BOOL accepted = ChooseColorW(&dialog);
+        popupMenuOpen_ = false;
+        selectionDismissButtonsDown_ = AnyMouseButtonDown();
+        if (accepted == FALSE) {
+            return;
+        }
+        const UINT32 selectedColor =
+            (static_cast<UINT32>(GetRValue(dialog.rgbResult)) << 16) |
+            (static_cast<UINT32>(GetGValue(dialog.rgbResult)) << 8) |
+            static_cast<UINT32>(GetBValue(dialog.rgbResult));
+        ApplyCoreThemeColor(coreId, selectedColor);
+        appearancePreviewColor_.reset();
+        Invalidate();
+    }
+
+    void ApplyConnectionLineColorMode(
+        std::uint64_t coreId, ConnectionLineColorMode mode) {
+        Core* core = FindCore(coreId);
+        if (core == nullptr || core->connectionLineColorMode == mode) {
+            return;
+        }
+        PushUndo(state_);
+        core->connectionLineColorMode = mode;
+        ScheduleSave(false);
+        const wchar_t* name = L"跟随核心";
+        if (mode == ConnectionLineColorMode::Black) {
+            name = L"黑色";
+        } else if (mode == ConnectionLineColorMode::White) {
+            name = L"白色";
+        } else if (mode == ConnectionLineColorMode::Custom) {
+            name = L"自定义颜色";
+        }
+        SetStatus(std::wstring(L"当前核心连线颜色：") + name);
+        Invalidate();
+    }
+
+    void ChooseCustomConnectionLineColor(std::uint64_t coreId) {
+        Core* core = FindCore(coreId);
+        if (core == nullptr) {
+            return;
+        }
+        static COLORREF customColors[16]{};
+        const UINT32 color = EffectiveConnectionLineColor(*core);
+        CHOOSECOLORW dialog{sizeof(dialog)};
+        dialog.hwndOwner = window_;
+        dialog.rgbResult = RGB((color >> 16) & 0xFFu,
+                               (color >> 8) & 0xFFu,
+                               color & 0xFFu);
+        dialog.lpCustColors = customColors;
+        dialog.Flags = CC_FULLOPEN | CC_RGBINIT;
+        popupMenuOpen_ = true;
+        const BOOL accepted = ChooseColorW(&dialog);
+        popupMenuOpen_ = false;
+        selectionDismissButtonsDown_ = AnyMouseButtonDown();
+        if (accepted == FALSE) {
+            return;
+        }
+        const UINT32 selectedColor =
+            (static_cast<UINT32>(GetRValue(dialog.rgbResult)) << 16) |
+            (static_cast<UINT32>(GetGValue(dialog.rgbResult)) << 8) |
+            static_cast<UINT32>(GetBValue(dialog.rgbResult));
+        PushUndo(state_);
+        core = FindCore(coreId);
+        if (core == nullptr) {
+            return;
+        }
+        core->connectionLineCustomColor = selectedColor;
+        core->connectionLineColorMode =
+            ConnectionLineColorMode::Custom;
+        ScheduleSave(false);
+        SetStatus(L"当前核心连线颜色：自定义");
+        Invalidate();
+    }
+
+    bool HandleCoreAppearancePanelPointer(D2D1_POINT_2F point) {
+        if (!CoreAppearancePanelOpen()) {
+            return false;
+        }
+        const D2D1_RECT_F card = CoreAppearancePanelRectangle(ClientDipSize());
+        if (!PointInside(point, card)) {
+            CloseCoreAppearancePanel();
+            SyncSelectionDismissTimer();
+            Invalidate();
+            return false;
+        }
+        if (PointInside(
+                point,
+                CoreAppearancePanelCloseRectangle(ClientDipSize()))) {
+            CloseCoreAppearancePanel();
+            SyncSelectionDismissTimer();
+            Invalidate();
+            return true;
+        }
+        if (PointInside(point, CoreAppearancePanelTitleBarRectangle(ClientDipSize()))) {
+            draggingCoreAppearancePanel_ = true;
+            coreAppearancePanelDragOffsetDip_ = D2D1::Point2F(
+                point.x - card.left, point.y - card.top);
+            SetCapture(window_);
+            return true;
+        }
+        for (int index = 0; index < static_cast<int>(kCoreColorPresets.size()); ++index) {
+            const D2D1_RECT_F option = CoreAppearanceColorRectangle(ClientDipSize(), index);
+            if (PointInside(point, option)) {
+                ApplyCoreThemeColor(coreAppearancePanelCoreId_,
+                                    kCoreColorPresets[index].color);
+                appearancePreviewColor_.reset();
+                return true;
+            }
+        }
+        if (PointInside(point,
+                        CoreAppearanceCustomColorRectangle(ClientDipSize()))) {
+            ChooseCustomCoreColor(coreAppearancePanelCoreId_);
+            return true;
+        }
+        for (int index = 0; index < 4; ++index) {
+            if (!PointInside(
+                    point,
+                    CoreAppearanceLineColorRectangle(
+                        ClientDipSize(), index))) {
+                continue;
+            }
+            const ConnectionLineColorMode mode =
+                static_cast<ConnectionLineColorMode>(index);
+            if (mode == ConnectionLineColorMode::Custom) {
+                ChooseCustomConnectionLineColor(
+                    coreAppearancePanelCoreId_);
+            } else {
+                ApplyConnectionLineColorMode(
+                    coreAppearancePanelCoreId_, mode);
+            }
+            return true;
+        }
+        if (PointInside(point, CoreAppearanceResetRectangle(ClientDipSize()))) {
+            ResetCoreAppearance(coreAppearancePanelCoreId_);
+            return true;
+        }
+        for (int index = 0; index < 3; ++index) {
+            const CoreAppearanceControl control =
+                static_cast<CoreAppearanceControl>(index);
+            const D2D1_RECT_F track =
+                CoreAppearanceTrackRectangle(ClientDipSize(), control);
+            if (point.x >= track.left - 14.0f && point.x <= track.right + 42.0f &&
+                point.y >= track.top - 16.0f && point.y <= track.bottom + 16.0f) {
+                coreAppearanceDragSnapshot_ = state_;
+                draggingCoreAppearanceSlider_ = true;
+                activeCoreAppearanceControl_ = control;
+                SetCoreAppearanceControlValue(coreAppearancePanelCoreId_, control,
+                    CoreAppearanceValueFromSliderX(point.x, control));
+                SetCapture(window_);
+                break;
+            }
+        }
+        return true;
+    }
+
+    void EndCoreAppearanceSliderDrag(bool commit) {
+        if (!draggingCoreAppearanceSlider_) {
+            return;
+        }
+        draggingCoreAppearanceSlider_ = false;
+        if (GetCapture() == window_) {
+            ReleaseCapture();
+        }
+        if (commit) {
+            PushUndo(std::move(coreAppearanceDragSnapshot_));
+            ScheduleSave(false);
+            SetStatus(
+                activeCoreAppearanceControl_ ==
+                        CoreAppearanceControl::LineWidth
+                    ? L"全局连线粗细已保存"
+                    : (activeCoreAppearanceControl_ ==
+                               CoreAppearanceControl::GlowIntensity
+                           ? L"全局核心光晕已保存"
+                           : L"当前核心外观已保存"));
+        } else {
+            state_ = std::move(coreAppearanceDragSnapshot_);
+        }
+        Invalidate();
+    }
+
+    bool HandleWorkspaceChromePointer(D2D1_POINT_2F point) {
+        const D2D1_SIZE_F client = ClientDipSize();
+        if (PointInside(point, WorkspaceControlRectangle(client, 0))) {
+            BeginCorePlacementMode();
+            return true;
+        }
+        if (PointInside(point, WorkspaceControlRectangle(client, 1))) {
+            if (!undoStack_.empty()) {
+                Undo();
+            }
+            return true;
+        }
+        if (PointInside(point, WorkspaceControlRectangle(client, 2))) {
+            ShowGlobalArrangeMenu();
+            return true;
+        }
+        if (PointInside(point, WorkspaceControlRectangle(client, 3))) {
+            ShowGlobalSettingsMenu();
+            return true;
+        }
+        if (PointInside(point, WorkspaceControlRectangle(client, 4))) {
+            SetWorkspaceVisible(false);
+            return true;
+        }
+        if (PointInside(point, WorkspaceControlRectangle(client, 5))) {
+            ToggleFullScreenWorkMode();
+            return true;
+        }
+        if (PointInside(point, WorkspaceControlRectangle(client, 6))) {
+            RequestExit();
+            return true;
+        }
+        return false;
+    }
+
+    bool DividerEnabled() const {
+        return state_.dividerVisible && !state_.fullScreenWorkMode &&
+               !state_.workspaceCollapsed;
+    }
+
+    bool IsDividerHit(D2D1_POINT_2F point) const {
+        return DividerEnabled() && point.x >= 0.0f && point.x <= 12.0f;
+    }
+
+    void DrawWorkspaceDivider(const D2D1_SIZE_F& client) {
+        if (!DividerEnabled()) return;
+        const bool active = dividerHovered_ || draggingDivider_;
+        brush_->SetColor(D2D1::ColorF(active ? 0x53616B : 0x858C91,
+                                      active ? 0.92f : 0.58f));
+        renderTarget_->DrawLine(D2D1::Point2F(0.75f, 0.0f),
+                                D2D1::Point2F(0.75f, client.height),
+                                brush_.Get(), active ? 2.0f : 1.25f);
+        if (active) {
+            brush_->SetColor(D2D1::ColorF(0xA9B0B4, 0.30f));
+            renderTarget_->FillRectangle(D2D1::RectF(0.0f, 0.0f, 4.0f, client.height),
+                                         brush_.Get());
+        }
+    }
+
+    void SetWorkspaceRatio(float ratio, bool finalize) {
+        if (state_.fullScreenWorkMode) return;
+        state_.workspaceWidthRatio = std::clamp(ratio, 0.30f, 0.70f);
+        state_.dividerPosition = state_.workspaceWidthRatio;
+        ApplyCompanionWorkspaceFrame();
+        if (finalize) {
+            ApplyCoreRatiosToWorkspace();
+            RefreshResponsiveMetrics(true);
+            layoutDirty_ = true;
+            ScheduleSave();
+        }
+        Invalidate();
+    }
+
+    void UpdateWorkspaceRatioFromScreenPoint(int clientX, int clientY) {
+        (void)clientY;
+        POINT screen{clientX, clientY};
+        ClientToScreen(window_, &screen);
+        const RECT work = MonitorWorkAreaPixels();
+        const int width = std::max(1L, work.right - work.left);
+        const float ratio = static_cast<float>(work.right - screen.x) /
+                            static_cast<float>(width);
+        SetWorkspaceRatio(ratio, false);
+    }
+
+    void BeginDividerDrag(int x, int y) {
+        if (!DividerEnabled()) return;
+        UpdateCoreRatios();
+        draggingDivider_ = true;
+        dividerHovered_ = true;
+        SetCapture(window_);
+        UpdateWorkspaceRatioFromScreenPoint(x, y);
+    }
+
+    void EndDividerDrag() {
+        if (!draggingDivider_) return;
+        draggingDivider_ = false;
+        dividerHovered_ = false;
+        if (GetCapture() == window_) ReleaseCapture();
+        SetWorkspaceRatio(state_.workspaceWidthRatio, true);
+        SetStatus(L"右侧工作区宽度已保存");
+    }
+
+    void ShowDividerMenu(int x, int y) {
+        HMENU menu = CreatePopupMenu();
+        if (menu == nullptr) return;
+        constexpr UINT ratio30 = 31600;
+        constexpr UINT ratio40 = 31601;
+        constexpr UINT ratio50 = 31602;
+        constexpr UINT ratio60 = 31603;
+        constexpr UINT restoreDefault = 31604;
+        AppendMenuW(menu, MF_STRING, ratio30, L"右侧 30%");
+        AppendMenuW(menu, MF_STRING, ratio40, L"右侧 40%");
+        AppendMenuW(menu, MF_STRING, ratio50, L"左右各 50%");
+        AppendMenuW(menu, MF_STRING, ratio60, L"右侧 60%");
+        AppendMenuW(menu, MF_SEPARATOR, 0, nullptr);
+        AppendMenuW(menu, MF_STRING, restoreDefault, L"恢复默认比例");
+        POINT screen{x, y};
+        ClientToScreen(window_, &screen);
+        const UINT command = TrackPopupMenuPreservingSelection(
+            menu, TPM_RETURNCMD | TPM_RIGHTBUTTON,
+            screen.x, screen.y);
+        DestroyMenu(menu);
+        switch (command) {
+        case ratio30: SetWorkspaceRatio(0.30f, true); break;
+        case ratio40: SetWorkspaceRatio(0.40f, true); break;
+        case ratio50:
+        case restoreDefault: SetWorkspaceRatio(0.50f, true); break;
+        case ratio60: SetWorkspaceRatio(0.60f, true); break;
+        default: return;
+        }
+        SetStatus(L"右侧工作区比例已保存");
+    }
+
+    D2D1_RECT_F TutorialCardRectangle(const D2D1_SIZE_F& client) const {
+        const float margin = std::clamp(client.width * 0.055f, 18.0f, 32.0f);
+        const float width = std::max(1.0f, std::min(520.0f, client.width - margin * 2.0f));
+        const float height = std::min(390.0f, client.height - margin * 2.0f);
+        return D2D1::RectF((client.width - width) * 0.5f,
+                           std::max(margin, (client.height - height) * 0.40f),
+                           (client.width + width) * 0.5f,
+                           std::max(margin, (client.height - height) * 0.40f) + height);
+    }
+
+    D2D1_RECT_F TutorialPrimaryButtonRectangle(const D2D1_RECT_F& card) const {
+        return D2D1::RectF(card.left + 24.0f, card.bottom - 66.0f,
+                           card.right - 24.0f, card.bottom - 22.0f);
+    }
+
+    bool PointInside(D2D1_POINT_2F point, const D2D1_RECT_F& rectangle) const {
+        return point.x >= rectangle.left && point.x <= rectangle.right &&
+               point.y >= rectangle.top && point.y <= rectangle.bottom;
+    }
+
+    void DrawCollapsedWorkspace(const D2D1_SIZE_F& client) {
+        const D2D1_RECT_F tab = D2D1::RectF(0.0f, client.height * 0.38f,
+            client.width, client.height * 0.62f);
+        brush_->SetColor(D2D1::ColorF(0x10233D, 0.94f));
+        renderTarget_->FillRoundedRectangle(D2D1::RoundedRect(tab, 10.0f, 10.0f), brush_.Get());
+        brush_->SetColor(D2D1::ColorF(0x7DDCFF, 0.95f));
+        const float middleX = client.width * 0.5f;
+        const float middleY = client.height * 0.5f;
+        renderTarget_->DrawLine(D2D1::Point2F(middleX + 6.0f, middleY - 10.0f),
+                                D2D1::Point2F(middleX - 5.0f, middleY),
+                                brush_.Get(), 2.2f);
+        renderTarget_->DrawLine(D2D1::Point2F(middleX - 5.0f, middleY),
+                                D2D1::Point2F(middleX + 6.0f, middleY + 10.0f),
+                                brush_.Get(), 2.2f);
+    }
+
+    void DrawTutorial(const D2D1_SIZE_F& client) {
+        if (!tutorialActive_ || tutorialTitleFormat_ == nullptr ||
+            tutorialStepFormat_ == nullptr || tutorialBodyFormat_ == nullptr ||
+            tutorialButtonFormat_ == nullptr) {
+            return;
+        }
+        const D2D1_RECT_F card = TutorialCardRectangle(client);
+        const D2D1_RECT_F primary = TutorialPrimaryButtonRectangle(card);
+
+        brush_->SetColor(D2D1::ColorF(0x020711, 0.58f));
+        renderTarget_->FillRectangle(D2D1::RectF(0.0f, 0.0f, client.width, client.height),
+                                     brush_.Get());
+        brush_->SetColor(D2D1::ColorF(0x101D32, 0.98f));
+        renderTarget_->FillRoundedRectangle(D2D1::RoundedRect(card, 16.0f, 16.0f), brush_.Get());
+        brush_->SetColor(D2D1::ColorF(0x6DD9FF, 0.86f));
+        renderTarget_->DrawRoundedRectangle(D2D1::RoundedRect(card, 16.0f, 16.0f), brush_.Get(),
+                                            1.0f);
+
+        static constexpr std::array<const wchar_t*, 3> titles{
+            L"欢迎使用引力桌面", L"把常用文件拖到核心上",
+            L"点击核心展开，双击文件打开"};
+        static constexpr std::array<const wchar_t*, 3> steps{
+            L"第1步：创建一个核心", L"第2步：建立稳定文件集合", L"第3步：展开并打开文件"};
+        static constexpr std::array<const wchar_t*, 3> bodies{
+            L"点击右侧空白区域或“＋”按钮，创建一个项目核心。\n\n引力桌面只创建文件引用，不会移动、删除或改名真实文件。",
+            L"从左侧 Windows 桌面或资源管理器中拖入文件。真实文件仍保留在原位置。",
+            L"单击核心查看关联文件；双击文件即可按原路径打开。"};
+        const int step = std::clamp(tutorialStep_, 0, 2);
+        const D2D1_RECT_F titleRect = D2D1::RectF(card.left + 24.0f, card.top + 22.0f,
+                                                   card.right - 24.0f, card.top + 68.0f);
+        const D2D1_RECT_F stepRect = D2D1::RectF(card.left + 24.0f, card.top + 86.0f,
+                                                  card.right - 24.0f, card.top + 126.0f);
+        const D2D1_RECT_F bodyRect = D2D1::RectF(card.left + 24.0f, card.top + 142.0f,
+                                                  card.right - 24.0f, card.bottom - 112.0f);
+        brush_->SetColor(D2D1::ColorF(0xF2F8FF, 1.0f));
+        renderTarget_->DrawTextW(titles[step], static_cast<UINT32>(wcslen(titles[step])),
+                                 tutorialTitleFormat_.Get(), titleRect, brush_.Get(),
+                                 D2D1_DRAW_TEXT_OPTIONS_CLIP);
+        brush_->SetColor(D2D1::ColorF(0x75D9FF, 1.0f));
+        renderTarget_->DrawTextW(steps[step], static_cast<UINT32>(wcslen(steps[step])),
+                                 tutorialStepFormat_.Get(), stepRect, brush_.Get(),
+                                 D2D1_DRAW_TEXT_OPTIONS_CLIP);
+        brush_->SetColor(D2D1::ColorF(0xD7E6F7, 1.0f));
+        renderTarget_->DrawTextW(bodies[step], static_cast<UINT32>(wcslen(bodies[step])),
+                                 tutorialBodyFormat_.Get(), bodyRect, brush_.Get(),
+                                 D2D1_DRAW_TEXT_OPTIONS_CLIP);
+
+        brush_->SetColor(D2D1::ColorF(0x238FBD, 1.0f));
+        renderTarget_->FillRoundedRectangle(D2D1::RoundedRect(primary, 10.0f, 10.0f), brush_.Get());
+        const wchar_t* primaryLabel = step == 2 ? L"开始使用" : L"下一步";
+        brush_->SetColor(D2D1::ColorF(0xFFFFFF, 1.0f));
+        renderTarget_->DrawTextW(primaryLabel, static_cast<UINT32>(wcslen(primaryLabel)),
+                                 tutorialButtonFormat_.Get(), primary, brush_.Get(),
+                                 D2D1_DRAW_TEXT_OPTIONS_CLIP);
+
+        const D2D1_RECT_F backRect = D2D1::RectF(card.left + 24.0f, card.bottom - 104.0f,
+                                                  card.left + 94.0f, card.bottom - 76.0f);
+        const D2D1_RECT_F skipRect = D2D1::RectF(card.right - 94.0f, card.bottom - 104.0f,
+                                                  card.right - 24.0f, card.bottom - 76.0f);
+        brush_->SetColor(D2D1::ColorF(0x9BB4CD, 0.96f));
+        if (step > 0) {
+            renderTarget_->DrawTextW(L"上一步", 3, tutorialButtonFormat_.Get(), backRect,
+                                     brush_.Get(), D2D1_DRAW_TEXT_OPTIONS_CLIP);
+        }
+        renderTarget_->DrawTextW(L"跳过", 2, tutorialButtonFormat_.Get(), skipRect,
+                                 brush_.Get(), D2D1_DRAW_TEXT_OPTIONS_CLIP);
+        const std::wstring progress = std::to_wstring(step + 1) + L" / 3";
+        renderTarget_->DrawTextW(progress.c_str(), static_cast<UINT32>(progress.size()),
+                                 tutorialButtonFormat_.Get(),
+                                 D2D1::RectF(card.right - 78.0f, card.top + 26.0f,
+                                              card.right - 24.0f, card.top + 50.0f),
+                                 brush_.Get(), D2D1_DRAW_TEXT_OPTIONS_CLIP);
+    }
+
+    void StartTutorial() {
+        if (state_.workspaceCollapsed) SetWorkspaceCollapsed(false);
+        state_.workspacePaused = false;
+        ShowWindow(window_, SW_SHOWNOACTIVATE);
+        if (interactionWindow_ != nullptr) {
+            ShowWindow(interactionWindow_, SW_SHOWNOACTIVATE);
+        }
+        EnsureInteractionWindowPresented();
+        tutorialStep_ = 0;
+        tutorialActive_ = true;
+        Invalidate();
+    }
+
+    void FinishTutorial(bool skipped) {
+        tutorialActive_ = false;
+        state_.tutorialCompleted = true;
+        state_.firstRunCompleted = true;
+        ScheduleSave();
+        SetStatus(skipped ? L"已跳过教程；可从系统托盘重新打开" : L"教程完成：开始整理你的工作区");
+    }
+
+    bool HandleTutorialClick(D2D1_POINT_2F point) {
+        if (!tutorialActive_) return false;
+        const D2D1_RECT_F card = TutorialCardRectangle(ClientDipSize());
+        const D2D1_RECT_F primary = TutorialPrimaryButtonRectangle(card);
+        const D2D1_RECT_F back = D2D1::RectF(card.left + 24.0f, card.bottom - 104.0f,
+                                              card.left + 94.0f, card.bottom - 76.0f);
+        const D2D1_RECT_F skip = D2D1::RectF(card.right - 94.0f, card.bottom - 104.0f,
+                                              card.right - 24.0f, card.bottom - 76.0f);
+        if (PointInside(point, primary)) {
+            if (tutorialStep_ < 2) ++tutorialStep_;
+            else FinishTutorial(false);
+        } else if (tutorialStep_ > 0 && PointInside(point, back)) {
+            --tutorialStep_;
+        } else if (PointInside(point, skip)) {
+            FinishTutorial(true);
+        }
+        Invalidate();
+        return true;
+    }
+
+    void DrawCluster(const Core& core, const std::vector<ItemLayout>& layout) {
+        const bool hasDetachedFiles = std::any_of(
+            layout.begin(), layout.end(),
+            [](const ItemLayout& entry) {
+                return entry.item != nullptr &&
+                       entry.item->detachedFromUpper;
+            });
+        if (CoreContentVisible(core) ||
+            hasDetachedFiles) {
+            const float fileOpacity = ClusterFileOpacity(core.id);
+            const bool fileLayered = fileOpacity < 0.999f;
+            if (fileLayered) {
+                D2D1_LAYER_PARAMETERS fileLayer =
+                    D2D1::LayerParameters();
+                fileLayer.opacity = fileOpacity;
+                renderTarget_->PushLayer(fileLayer, nullptr);
+            }
+            DrawConnections(core, layout);
+            DrawItems(core, layout);
+            if (fileLayered) {
+                renderTarget_->PopLayer();
+            }
+        }
+        if (!CoreBodyVisible(core)) {
+            return;
+        }
+        const float coreOpacity = ClusterCoreOpacity(core.id);
+        const bool coreLayered = coreOpacity < 0.999f;
+        if (coreLayered) {
+            D2D1_LAYER_PARAMETERS coreLayer =
+                D2D1::LayerParameters();
+            coreLayer.opacity = coreOpacity;
+            renderTarget_->PushLayer(coreLayer, nullptr);
+        }
+        DrawCore(core);
+        if (coreLayered) {
+            renderTarget_->PopLayer();
+        }
+    }
+
+    void DrawDimOverlay(const Core& core) {
+        const float radius =
+            ClusterRadiusForCore(core) + 18.0f;
+        brush_->SetColor(D2D1::ColorF(0x070B16, 0.68f));
+        renderTarget_->FillEllipse(D2D1::Ellipse(core.position, radius, radius), brush_.Get());
+    }
+
+    void DrawLayeredConnection(D2D1_POINT_2F start,
+                               D2D1_POINT_2F end,
+                               UINT32 lineColor,
+                               float opacity,
+                               float width) {
+        const float inverseZoom =
+            1.0f / std::max(0.1f, state_.zoom);
+        const float separatorOpacity =
+            std::clamp(
+                (0.27f + opacity * 0.36f) * 0.84f,
+                0.22f, 0.60f);
+        brush_->SetColor(D2D1::ColorF(
+            SeparationColorFor(lineColor), separatorOpacity));
+        renderTarget_->DrawLine(
+            start, end, brush_.Get(),
+            (width + 0.64f) * inverseZoom);
+        brush_->SetColor(D2D1::ColorF(lineColor, opacity));
+        renderTarget_->DrawLine(
+            start, end, brush_.Get(), width * inverseZoom);
+    }
+
+    void DrawConnections(const Core& core, const std::vector<ItemLayout>& layout) {
+        const bool coreHovered =
+            hover_.kind == HitKind::Core && hover_.coreId == core.id;
+        const bool coreSelected = IsCoreVisuallySelected(core.id);
+        const bool coreFocused = CoreFocusAmount(core.id) > 0.5f;
+        const UINT32 lineColor = EffectiveConnectionLineColor(core);
+        const D2D1_POINT_2F corePosition = VisualCorePosition(core);
+        std::unordered_map<std::uint64_t, D2D1_POINT_2F> positions;
+        struct SelectedConnection {
+            D2D1_POINT_2F start;
+            D2D1_POINT_2F end;
+            bool child = false;
+            float opacity = 1.0f;
+            float mainWidth = 1.2f;
+        };
+        std::optional<SelectedConnection> selectedConnection;
+        for (const ItemLayout& entry : layout) {
+            if (entry.item != nullptr) positions[entry.item->id] = VisualItemPosition(core, entry);
+        }
+        for (const ItemLayout& entry : layout) {
+            if (entry.isMore) {
+                continue;
+            }
+            if (!entry.isChild && entry.item != nullptr &&
+                entry.item->detachedFromUpper) {
+                continue;
+            }
+            const bool itemHovered =
+                entry.item != nullptr && hover_.kind == HitKind::Item &&
+                hover_.coreId == core.id && hover_.itemId == entry.item->id;
+            const bool itemSelected = entry.item != nullptr &&
+                selected_.kind == HitKind::Item &&
+                selected_.coreId == core.id &&
+                selected_.itemId == entry.item->id;
+            const bool highlighted = itemHovered || itemSelected;
+            const float lineWidthScale =
+                std::clamp(
+                    state_.connectionLineWidth /
+                        kConnectionLineWidthStandard,
+                    0.70f / kConnectionLineWidthStandard,
+                    2.50f / kConnectionLineWidthStandard);
+            const float baseWidth = (entry.isChild ? 1.7f : 1.2f) *
+                lineWidthScale;
+            float opacity = entry.isChild ? 0.70f : 0.44f;
+            float width = baseWidth;
+            if (!entry.isChild && coreHovered) {
+                opacity = 0.49f;
+                width = 1.28f * lineWidthScale;
+            }
+            if (!entry.isChild && coreSelected) {
+                opacity = 0.58f;
+                width = 1.45f * lineWidthScale;
+            }
+            if (!entry.isChild && coreFocused) {
+                opacity = 0.72f;
+                width = 1.65f * lineWidthScale;
+            }
+            if (highlighted) {
+                opacity = 0.94f;
+                width = itemSelected
+                    ? std::min(3.40f, baseWidth * 1.35f)
+                    : std::min(3.40f, 2.2f * lineWidthScale);
+            }
+            const bool activeLine =
+                highlighted ||
+                (!entry.isChild &&
+                 (coreHovered || coreSelected || coreFocused));
+            opacity *= activeLine ? 0.94f : 0.86f;
+            if (entry.item != nullptr && entry.item->missing) {
+                opacity *= 0.58f;
+            }
+            const float clusterOpacity = ClusterFileOpacity(core.id);
+            if (clusterOpacity > 0.0f && clusterOpacity < 0.34f) {
+                // The cluster layer still performs the explicit focus dimming,
+                // but a visible node must retain a readable relationship line.
+                opacity = std::min(
+                    1.0f, opacity * 0.34f / clusterOpacity);
+            }
+            opacity *= FocusContentOpacity(core.id, entry);
+            opacity *= CoreExpansionEntryAmount(core, entry);
+            D2D1_POINT_2F start = corePosition;
+            const D2D1_POINT_2F end = VisualItemPosition(core, entry);
+            if (entry.isChild && entry.item != nullptr) {
+                if (const auto parent = positions.find(entry.item->parentFileId);
+                    parent != positions.end()) start = parent->second;
+            }
+            // Every visible node keeps its relationship line.  Large focused
+            // clusters used to lose remote lines here because of a fixed
+            // distance cutoff, making a still-visible file look unrelated.
+            const float distance = std::sqrt(DistanceSquared(start, end)) * state_.zoom;
+            if (!entry.isChild && distance > 340.0f && !highlighted) {
+                opacity *= std::clamp(520.0f / distance, 0.44f, 0.82f);
+            }
+            DrawLayeredConnection(
+                start, end, lineColor, opacity, width);
+            if (itemSelected) {
+                selectedConnection = {
+                    start, end, entry.isChild, opacity, width};
+            }
+        }
+        if (selectedConnection.has_value()) {
+            const float inverseZoom = 1.0f / std::max(0.1f, state_.zoom);
+            const float signalOpacity = std::clamp(selectedConnection->opacity,
+                                                   0.0f, 1.0f);
+            // This final pass keeps the selected relation above crossing lines
+            // with a crisp separator and bright center, not a blurred halo.
+            brush_->SetColor(D2D1::ColorF(
+                SeparationColorFor(lineColor),
+                0.76f * signalOpacity));
+            renderTarget_->DrawLine(selectedConnection->start,
+                selectedConnection->end, brush_.Get(),
+                std::min(
+                    4.4f,
+                    selectedConnection->mainWidth +
+                        1.0f) *
+                    inverseZoom);
+            brush_->SetColor(D2D1::ColorF(
+                LightenCoreColor(lineColor, 0.38f),
+                0.98f * signalOpacity));
+            renderTarget_->DrawLine(selectedConnection->start,
+                selectedConnection->end, brush_.Get(),
+                selectedConnection->mainWidth * inverseZoom);
+        }
+    }
+
+    void DrawItems(const Core& core, const std::vector<ItemLayout>& layout) {
+        for (const ItemLayout& entry : layout) {
+            const float contentOpacity =
+                FocusContentOpacity(core.id, entry) *
+                CoreExpansionEntryAmount(core, entry);
+            const bool layered = contentOpacity < 0.999f;
+            if (layered) {
+                D2D1_LAYER_PARAMETERS layer = D2D1::LayerParameters();
+                layer.opacity = contentOpacity;
+                renderTarget_->PushLayer(layer, nullptr);
+            }
+            if (entry.isMore) {
+                DrawMoreNode(core, entry);
+                if (layered) {
+                    renderTarget_->PopLayer();
+                }
+                continue;
+            }
+            const bool selected = selected_.kind == HitKind::Item &&
+                                  selected_.coreId == core.id &&
+                                  selected_.itemId == entry.item->id;
+            const bool hovered = hover_.kind == HitKind::Item &&
+                                 hover_.coreId == core.id &&
+                                 hover_.itemId == entry.item->id;
+            if (!selected && !hovered) {
+                DrawItem(core, *entry.item,
+                         VisualItemPosition(core, entry), false);
+            }
+            if (layered) {
+                renderTarget_->PopLayer();
+            }
+        }
+    }
+
+    void DrawRaisedItems(const LayoutMap& layouts) {
+        for (const auto& [coreId, layout] : layouts) {
+            const Core* core = FindCore(coreId);
+            if (core == nullptr) {
+                continue;
+            }
+            for (const ItemLayout& entry : layout) {
+                if (entry.isMore || entry.item == nullptr) {
+                    continue;
+                }
+                const bool selected =
+                    selected_.kind == HitKind::Item && selected_.coreId == coreId &&
+                    selected_.itemId == entry.item->id;
+                const bool hovered =
+                    hover_.kind == HitKind::Item && hover_.coreId == coreId &&
+                    hover_.itemId == entry.item->id;
+                if (selected && !hovered) {
+                    DrawItem(*core, *entry.item,
+                             VisualItemPosition(*core, entry), false);
+                }
+            }
+        }
+        for (const auto& [coreId, layout] : layouts) {
+            const Core* core = FindCore(coreId);
+            if (core == nullptr) {
+                continue;
+            }
+            for (const ItemLayout& entry : layout) {
+                if (entry.isMore || entry.item == nullptr) {
+                    continue;
+                }
+                const bool hovered =
+                    hover_.kind == HitKind::Item && hover_.coreId == coreId &&
+                    hover_.itemId == entry.item->id;
+                if (hovered) {
+                    DrawItem(*core, *entry.item,
+                             VisualItemPosition(*core, entry), false);
+                }
+            }
+        }
+    }
+
+    void DrawMoreNode(const Core& core, const ItemLayout& entry) {
+        const D2D1_POINT_2F position =
+            VisualItemPosition(core, entry);
+        const float halfWidth = 56.0f;
+        const float halfHeight = 14.0f;
+        const D2D1_RECT_F bounds = D2D1::RectF(
+            position.x - halfWidth, position.y - halfHeight,
+            position.x + halfWidth, position.y + halfHeight);
+        brush_->SetColor(D2D1::ColorF(0x142641, 0.94f));
+        renderTarget_->FillRoundedRectangle(
+            D2D1::RoundedRect(bounds, halfHeight, halfHeight),
+            brush_.Get());
+        brush_->SetColor(D2D1::ColorF(EffectiveCoreThemeColor(core), 0.88f));
+        renderTarget_->DrawRoundedRectangle(
+            D2D1::RoundedRect(bounds, halfHeight, halfHeight),
+            brush_.Get(), 1.2f);
+        const std::wstring text =
+            L"已折叠 " + std::to_wstring(entry.hiddenCount) + L" 个";
+        brush_->SetColor(D2D1::ColorF(0xEAF3FF));
+        renderTarget_->DrawTextW(
+            text.c_str(), static_cast<UINT32>(text.size()), coreFormat_.Get(),
+            bounds,
+            brush_.Get());
+    }
+
+    void DrawItem(const Core& core, const FileItem& item, D2D1_POINT_2F position,
+                  bool dragging) {
+        const bool selected =
+            selected_.kind == HitKind::Item && selected_.coreId == core.id &&
+            selected_.itemId == item.id;
+        const bool hovered =
+            hover_.kind == HitKind::Item && hover_.coreId == core.id &&
+            hover_.itemId == item.id;
+        const float iconSize = ItemIconSize(core, item);
+        const float containerHalf =
+            TierContainerPixels(item.sizeTier) * ItemVisualScale(core, item) /
+            2.0f;
+        const float cornerRadius = 9.0f;
+        // Windows desktop icons do not become visually stale because they
+        // have not been opened recently. Usage metadata must not make a valid
+        // file look disabled.
+        constexpr float freshness = 1.0f;
+        ComPtr<ID2D1Bitmap> bitmap = GetIconBitmap(item);
+        ComPtr<ID2D1Bitmap> iconShadow =
+            bitmap != nullptr ? GetIconShadowBitmap(item) : nullptr;
+
+        if (draggingItem_ && relationTargetItemId_ == item.id) {
+            const bool armed = std::chrono::duration_cast<std::chrono::milliseconds>(
+                std::chrono::steady_clock::now() - relationHoverStarted_).count() >=
+                    kRelationHoverDelayMs;
+            brush_->SetColor(D2D1::ColorF(armed ? 0x68F0B0 : 0x74B9FF,
+                                          armed ? 0.72f : 0.38f));
+            renderTarget_->DrawEllipse(D2D1::Ellipse(position, containerHalf + 13.0f,
+                                                      containerHalf + 13.0f),
+                                      brush_.Get(), armed ? 2.8f : 1.5f);
+            if (armed) {
+                const std::wstring hint = relationTargetCoreId_ == dragCoreId_
+                    ? L"松开后设为子文件"
+                    : L"松开后移入此核心并设为子文件";
+                renderTarget_->DrawTextW(hint.c_str(), static_cast<UINT32>(hint.size()),
+                    tooltipBodyFormat_.Get(),
+                    D2D1::RectF(position.x - 100.0f, position.y + containerHalf + 8.0f,
+                                 position.x + 100.0f, position.y + containerHalf + 30.0f),
+                    brush_.Get(), D2D1_DRAW_TEXT_OPTIONS_CLIP);
+            }
+        }
+
+        const bool externalDropTarget =
+            externalDropCoreId_ == core.id &&
+            externalDropItemId_ == item.id;
+        if (externalDropTarget) {
+            brush_->SetColor(D2D1::ColorF(0x2BAE72, 0.82f));
+            renderTarget_->DrawEllipse(
+                D2D1::Ellipse(position, containerHalf + 13.0f,
+                              containerHalf + 13.0f),
+                brush_.Get(), 2.8f);
+            const std::wstring hint =
+                L"作为该文件的子文件加入";
+            renderTarget_->DrawTextW(
+                hint.c_str(), static_cast<UINT32>(hint.size()),
+                tooltipBodyFormat_.Get(),
+                D2D1::RectF(
+                    position.x - 108.0f,
+                    position.y + containerHalf + 8.0f,
+                    position.x + 108.0f,
+                    position.y + containerHalf + 31.0f),
+                brush_.Get(), D2D1_DRAW_TEXT_OPTIONS_CLIP);
+        }
+
+        if (!item.missing &&
+            (selected || hovered || dragging || externalDropTarget)) {
+            const UINT32 accent =
+                RgbFromColorRef(GetSysColor(COLOR_HIGHLIGHT));
+            const float screenCompensation =
+                1.0f / std::max(0.01f, state_.zoom);
+            const float lineHeight =
+                std::ceil(metrics_.fileFontSize * 1.35f) *
+                screenCompensation;
+            const float selectionHalfWidth =
+                std::max(containerHalf + 5.0f,
+                         metrics_.labelWidth *
+                                 screenCompensation /
+                                 2.0f +
+                             3.0f);
+            const D2D1_RECT_F selectionBounds = D2D1::RectF(
+                position.x - selectionHalfWidth,
+                position.y - containerHalf - 5.0f,
+                position.x + selectionHalfWidth,
+                position.y + containerHalf + 8.0f +
+                    lineHeight * 2.0f + 7.0f);
+            brush_->SetColor(D2D1::ColorF(
+                accent,
+                dragging || externalDropTarget
+                    ? 0.24f
+                    : (selected ? 0.18f : 0.085f)));
+            renderTarget_->FillRoundedRectangle(
+                D2D1::RoundedRect(selectionBounds, 4.0f, 4.0f),
+                brush_.Get());
+            if (selected || dragging || externalDropTarget) {
+                brush_->SetColor(D2D1::ColorF(
+                    accent,
+                    dragging || externalDropTarget ? 0.74f : 0.48f));
+                renderTarget_->DrawRoundedRectangle(
+                    D2D1::RoundedRect(
+                        selectionBounds, 4.0f, 4.0f),
+                    brush_.Get(), 1.0f);
+            }
+        }
+
+        if (bitmap == nullptr) {
+            brush_->SetColor(D2D1::ColorF(
+                WindowsUsesDarkTheme() ? 0x343434 : 0xF2F2F2,
+                dragging ? 0.78f : 0.94f));
+            renderTarget_->FillRoundedRectangle(
+                D2D1::RoundedRect(
+                    D2D1::RectF(position.x - containerHalf,
+                                position.y - containerHalf,
+                                position.x + containerHalf,
+                                position.y + containerHalf),
+                    cornerRadius, cornerRadius),
+                brush_.Get());
+            brush_->SetColor(D2D1::ColorF(
+                WindowsUsesDarkTheme() ? 0x737373 : 0xA8A8A8,
+                0.82f * freshness));
+            renderTarget_->DrawRoundedRectangle(
+                D2D1::RoundedRect(
+                    D2D1::RectF(position.x - containerHalf,
+                                position.y - containerHalf,
+                                position.x + containerHalf,
+                                position.y + containerHalf),
+                    cornerRadius, cornerRadius),
+                brush_.Get(), selected ? 2.0f : 1.0f);
+        }
+
+        if (bitmap != nullptr) {
+            const D2D1_SIZE_F bitmapSize = bitmap->GetSize();
+            const float shorterSide =
+                std::min(bitmapSize.width, bitmapSize.height);
+            const float longerSide =
+                std::max(bitmapSize.width, bitmapSize.height);
+            const float aspect =
+                shorterSide / std::max(1.0f, longerSide);
+            const float visualNormalization =
+                IsImagePreviewType(item.path)
+                    ? 1.0f
+                    : std::clamp(
+                          std::sqrt(0.90f /
+                                    std::max(0.35f, aspect)),
+                          1.0f, 1.08f);
+            const float normalizedIconSize =
+                iconSize * visualNormalization;
+            const float fitScale =
+                std::min(
+                    normalizedIconSize /
+                        std::max(1.0f, bitmapSize.width),
+                    normalizedIconSize /
+                        std::max(1.0f, bitmapSize.height));
+            const float drawWidth = bitmapSize.width * fitScale;
+            const float drawHeight = bitmapSize.height * fitScale;
+            if (iconShadow != nullptr) {
+                const D2D1_SIZE_F shadowSize =
+                    iconShadow->GetSize();
+                const float shadowWidth =
+                    drawWidth * shadowSize.width /
+                    std::max(1.0f, bitmapSize.width);
+                const float shadowHeight =
+                    drawHeight * shadowSize.height /
+                    std::max(1.0f, bitmapSize.height);
+                const float shadowOffset = std::clamp(
+                    iconSize / 48.0f * 1.8f, 1.4f, 2.6f);
+                const auto shadowRectangle =
+                    [position, shadowWidth, shadowHeight](
+                        float offsetY) {
+                        return D2D1::RectF(
+                            position.x - shadowWidth / 2.0f,
+                            position.y - shadowHeight / 2.0f +
+                                offsetY,
+                            position.x + shadowWidth / 2.0f,
+                            position.y + shadowHeight / 2.0f +
+                                offsetY);
+                    };
+                // The centered separation edge carries legibility.  The
+                // downward shadow is deliberately subordinate and only adds
+                // a small amount of Explorer-like depth.
+                renderTarget_->DrawBitmap(
+                    iconShadow.Get(), shadowRectangle(0.0f),
+                    (dragging ? 0.25f : 0.48f) * freshness,
+                    D2D1_BITMAP_INTERPOLATION_MODE_LINEAR);
+                renderTarget_->DrawBitmap(
+                    iconShadow.Get(),
+                    shadowRectangle(shadowOffset),
+                    (dragging ? 0.16f : 0.30f) * freshness,
+                    D2D1_BITMAP_INTERPOLATION_MODE_LINEAR);
+            }
+            renderTarget_->DrawBitmap(
+                bitmap.Get(),
+                D2D1::RectF(position.x - drawWidth / 2.0f,
+                            position.y - drawHeight / 2.0f,
+                            position.x + drawWidth / 2.0f,
+                            position.y + drawHeight / 2.0f),
+                dragging ? 0.75f
+                         : freshness * (item.missing ? 0.52f : 1.0f),
+                D2D1_BITMAP_INTERPOLATION_MODE_LINEAR);
+        } else {
+            brush_->SetColor(D2D1::ColorF(0xD6E5FF, 0.9f));
+            const std::wstring glyph = item.isDirectory ? L"▣" : L"◇";
+            renderTarget_->DrawTextW(
+                glyph.c_str(), static_cast<UINT32>(glyph.size()), coreFormat_.Get(),
+                D2D1::RectF(position.x - iconSize / 2.0f,
+                            position.y - iconSize / 2.0f,
+                            position.x + iconSize / 2.0f,
+                            position.y + iconSize / 2.0f),
+                brush_.Get());
+        }
+
+        if (item.missing) {
+            const float badgeRadius =
+                std::clamp(iconSize * 0.13f, 6.0f, 8.0f);
+            const D2D1_POINT_2F badge = D2D1::Point2F(
+                position.x + iconSize * 0.34f,
+                position.y + iconSize * 0.32f);
+            brush_->SetColor(D2D1::ColorF(0xF0A33A, 0.98f));
+            renderTarget_->FillEllipse(
+                D2D1::Ellipse(badge, badgeRadius, badgeRadius),
+                brush_.Get());
+            brush_->SetColor(D2D1::ColorF(0x2B1A00, 0.96f));
+            renderTarget_->DrawTextW(
+                L"!", 1, bodyFormat_.Get(),
+                D2D1::RectF(
+                    badge.x - badgeRadius,
+                    badge.y - badgeRadius,
+                    badge.x + badgeRadius,
+                    badge.y + badgeRadius),
+                brush_.Get(), D2D1_DRAW_TEXT_OPTIONS_CLIP);
+        } else if (item.favorite) {
+            brush_->SetColor(D2D1::ColorF(0xFFD76A));
+            const std::wstring star = L"★";
+            renderTarget_->DrawTextW(
+                star.c_str(), 1, bodyFormat_.Get(),
+                D2D1::RectF(position.x + containerHalf - 18.0f,
+                            position.y - containerHalf - 5.0f,
+                            position.x + containerHalf + 5.0f,
+                            position.y - containerHalf + 18.0f),
+                brush_.Get());
+        }
+        if (!item.missing && item.inProgress) {
+            brush_->SetColor(D2D1::ColorF(0x62D8A2));
+            renderTarget_->FillEllipse(
+                D2D1::Ellipse(D2D1::Point2F(position.x - containerHalf + 2.0f,
+                                            position.y - containerHalf + 2.0f),
+                              4.5f, 4.5f),
+                brush_.Get());
+        }
+        const int children = ChildCount(core, item.id);
+        if (children > 0) {
+            const float badgeRadius = 10.0f;
+            const D2D1_POINT_2F badge = D2D1::Point2F(
+                position.x + containerHalf * 0.72f, position.y - containerHalf * 0.72f);
+            brush_->SetColor(D2D1::ColorF(EffectiveCoreThemeColor(core), 0.96f));
+            renderTarget_->FillEllipse(D2D1::Ellipse(badge, badgeRadius, badgeRadius), brush_.Get());
+            const std::wstring text = std::to_wstring(children);
+            brush_->SetColor(D2D1::ColorF(0xF4F8FF));
+            renderTarget_->DrawTextW(text.c_str(), static_cast<UINT32>(text.size()),
+                hudFormat_.Get(), D2D1::RectF(badge.x-badgeRadius,badge.y-badgeRadius,
+                                               badge.x+badgeRadius,badge.y+badgeRadius),
+                brush_.Get(), D2D1_DRAW_TEXT_OPTIONS_CLIP);
+        }
+
+    }
+
+    float MeasureMarqueeText(const std::wstring& text) {
+        if (const auto found = marqueeWidthCache_.find(text);
+            found != marqueeWidthCache_.end()) {
+            return found->second;
+        }
+        float width = static_cast<float>(text.size()) *
+                      metrics_.fileFontSize;
+        ComPtr<IDWriteTextLayout> layout;
+        if (fileMarqueeFormat_ != nullptr &&
+            SUCCEEDED(writeFactory_->CreateTextLayout(
+                text.c_str(), static_cast<UINT32>(text.size()),
+                fileMarqueeFormat_.Get(), 10000.0f,
+                metrics_.fileFontSize * 2.0f,
+                layout.ReleaseAndGetAddressOf()))) {
+            DWRITE_TEXT_METRICS textMetrics{};
+            if (SUCCEEDED(layout->GetMetrics(&textMetrics))) {
+                width = textMetrics.widthIncludingTrailingWhitespace;
+            }
+        }
+        width = std::max(1.0f, width);
+        marqueeWidthCache_.insert_or_assign(text, width);
+        return width;
+    }
+
+    void DrawDesktopText(const std::wstring& text,
+                         IDWriteTextFormat* format,
+                         const D2D1_RECT_F& rectangle,
+                         float opacity,
+                         UINT32 foreground = 0xF8F8F8) {
+        if (text.empty() || format == nullptr) {
+            return;
+        }
+        static constexpr std::array<D2D1_POINT_2F, 8>
+            outlineOffsets{
+                D2D1_POINT_2F{-0.85f, 0.0f},
+                D2D1_POINT_2F{0.85f, 0.0f},
+                D2D1_POINT_2F{0.0f, -0.85f},
+                D2D1_POINT_2F{0.0f, 0.85f},
+                D2D1_POINT_2F{-0.60f, -0.60f},
+                D2D1_POINT_2F{0.60f, -0.60f},
+                D2D1_POINT_2F{-0.60f, 0.60f},
+                D2D1_POINT_2F{0.60f, 0.60f}};
+        brush_->SetColor(D2D1::ColorF(
+            0x111820, 0.62f * opacity));
+        for (const D2D1_POINT_2F offset : outlineOffsets) {
+            renderTarget_->DrawTextW(
+                text.c_str(), static_cast<UINT32>(text.size()),
+                format,
+                D2D1::RectF(
+                    rectangle.left + offset.x,
+                    rectangle.top + offset.y,
+                    rectangle.right + offset.x,
+                    rectangle.bottom + offset.y),
+                brush_.Get(), D2D1_DRAW_TEXT_OPTIONS_CLIP);
+        }
+        brush_->SetColor(D2D1::ColorF(
+            foreground, 0.99f * opacity));
+        renderTarget_->DrawTextW(
+            text.c_str(), static_cast<UINT32>(text.size()),
+            format, rectangle, brush_.Get(),
+            D2D1_DRAW_TEXT_OPTIONS_CLIP);
+    }
+
+    bool DrawMarqueeLabel(const FileItem& item,
+                          const D2D1_RECT_F& labelRect,
+                          float opacity) {
+        if (!NeedsMarquee(item) || fileMarqueeFormat_ == nullptr) {
+            return false;
+        }
+        const std::wstring name = MarqueeSourceName(item);
+        // Keep the gap deliberately short.  The hover ticker should read as a
+        // continuous movement, not pause long enough to look stalled.
+        const std::wstring spacer = L"   ";
+        const float nameWidth = MeasureMarqueeText(name);
+        const float periodWidth =
+            MeasureMarqueeText(name + spacer);
+        const float viewportWidth =
+            std::max(1.0f, labelRect.right - labelRect.left - 8.0f);
+        if (nameWidth <= viewportWidth) {
+            return false;
+        }
+
+        constexpr float speed = 128.0f;
+        constexpr float pauseSeconds = 0.06f;
+        const float moveSeconds = periodWidth / speed;
+        const float cycleSeconds = pauseSeconds + moveSeconds;
+        const float seconds =
+            std::chrono::duration<float>(
+                std::chrono::steady_clock::now() -
+                marqueeStarted_)
+                .count();
+        const float phase = std::fmod(seconds, cycleSeconds);
+        const float offset =
+            phase <= pauseSeconds
+                ? 0.0f
+                : std::min(periodWidth,
+                           (phase - pauseSeconds) * speed);
+        const float startX = labelRect.left + 4.0f - offset;
+
+        renderTarget_->PushAxisAlignedClip(
+            D2D1::RectF(labelRect.left + 3.0f, labelRect.top,
+                        labelRect.right - 3.0f, labelRect.bottom),
+            D2D1_ANTIALIAS_MODE_PER_PRIMITIVE);
+        const UINT32 foreground =
+            item.missing ? 0xF2DEDE : 0xF8F8F8;
+        DrawDesktopText(
+            name, fileMarqueeFormat_.Get(),
+            D2D1::RectF(
+                startX, labelRect.top,
+                startX + nameWidth + 2.0f,
+                labelRect.bottom),
+            opacity, foreground);
+        DrawDesktopText(
+            name, fileMarqueeFormat_.Get(),
+            D2D1::RectF(
+                startX + periodWidth, labelRect.top,
+                startX + periodWidth + nameWidth + 2.0f,
+                labelRect.bottom),
+            opacity, foreground);
+        renderTarget_->PopAxisAlignedClip();
+        return true;
+    }
+
+    void DrawFileLabels(const LayoutMap& layouts) {
+        const auto drawPass = [this, &layouts](int pass) {
+            for (const auto& [coreId, layout] : layouts) {
+                const Core* core = FindCore(coreId);
+                if (core == nullptr) {
+                    continue;
+                }
+                for (const ItemLayout& entry : layout) {
+                    const float opacity =
+                        ClusterFileOpacity(coreId) *
+                        FocusContentOpacity(coreId, entry) *
+                        CoreExpansionEntryAmount(*core, entry);
+                    const bool selected =
+                        entry.item != nullptr &&
+                        selected_.kind == HitKind::Item && selected_.coreId == coreId &&
+                        selected_.itemId == entry.item->id;
+                    const bool hovered =
+                        entry.item != nullptr &&
+                        hover_.kind == HitKind::Item && hover_.coreId == coreId &&
+                        hover_.itemId == entry.item->id;
+                    const bool draw =
+                        pass == 0 ? (!selected && !hovered)
+                                  : (pass == 1 ? (selected && !hovered) : hovered);
+                    if (!draw || !entry.showLabel) {
+                        continue;
+                    }
+                    const D2D1_RECT_F labelRect =
+                        VisualLabelRectangle(*core, entry);
+
+                    std::wstring label = L"+更多";
+                    if (!entry.isMore && entry.item != nullptr) {
+                        if (state_.zoom > 1.15f &&
+                            !entry.item->originalName.empty()) {
+                            label = Shorten(entry.item->originalName, 18);
+                        } else {
+                            label = entry.item->displayName.empty()
+                                        ? MakeDisplayName(
+                                              entry.item->path,
+                                              entry.item->isDirectory)
+                                        : entry.item->displayName;
+                        }
+                    }
+                    IDWriteTextFormat* format = fileNameFormat_.Get();
+                    if (entry.item != nullptr &&
+                        entry.item->sizeTier == FileSizeTier::Important) {
+                        format = fileImportantFormat_.Get();
+                    } else if (entry.item != nullptr &&
+                               entry.item->sizeTier == FileSizeTier::Minor) {
+                        format = fileMinorFormat_.Get();
+                    }
+                    if (entry.item != nullptr && hovered &&
+                        DrawMarqueeLabel(
+                            *entry.item, labelRect, opacity)) {
+                        continue;
+                    }
+                    DrawDesktopText(
+                        label, format, labelRect, opacity,
+                        entry.item != nullptr &&
+                                entry.item->missing
+                            ? 0xF2DEDE
+                            : 0xF8F8F8);
+                }
+            }
+        };
+        drawPass(0);
+        drawPass(1);
+        drawPass(2);
+    }
+
+    bool WindowsUsesDarkTheme() const {
+        DWORD appsUseLightTheme = 1;
+        DWORD size = sizeof(appsUseLightTheme);
+        const LONG result = RegGetValueW(
+            HKEY_CURRENT_USER,
+            L"Software\\Microsoft\\Windows\\CurrentVersion\\Themes\\Personalize",
+            L"AppsUseLightTheme", RRF_RT_REG_DWORD, nullptr,
+            &appsUseLightTheme, &size);
+        return result == ERROR_SUCCESS && appsUseLightTheme == 0;
+    }
+
+    void DrawHoverTooltip(const LayoutMap& layouts) {
+        if (hover_.kind != HitKind::Item) return;
+        const auto hoverElapsed =
+            std::chrono::duration_cast<
+                std::chrono::milliseconds>(
+                std::chrono::steady_clock::now() -
+                hoverStarted_).count();
+        if (hoverElapsed < kHoverTooltipDelayMs) return;
+        const Core* core = FindCore(hover_.coreId);
+        if (core == nullptr || (!core->expanded && focusedCoreId_ != core->id) ||
+            (focusedCoreId_ != 0 && focusedCoreId_ != core->id)) return;
+        const auto found = layouts.find(core->id);
+        if (found == layouts.end()) return;
+        const auto hovered = std::find_if(found->second.begin(), found->second.end(),
+            [this](const ItemLayout& entry) {
+                return entry.item != nullptr && entry.item->id == hover_.itemId;
+            });
+        if (hovered == found->second.end()) return;
+
+        const D2D1_SIZE_F client = ClientDipSize();
+        const float width = std::clamp(client.width - 32.0f, 240.0f, 288.0f);
+        constexpr float height = 88.0f;
+        const D2D1_POINT_2F position =
+            WorldToScreen(VisualItemPosition(*core, *hovered));
+        const float half = ScreenItemIconSize(*core, *hovered->item) / 2.0f + 8.0f;
+        // Top, right, left, bottom: ordered by the requested visual priority.
+        const std::array<D2D1_RECT_F, 4> options{
+            D2D1::RectF(position.x - width / 2.0f, position.y - half - height - 9.0f,
+                        position.x + width / 2.0f, position.y - half - 9.0f),
+            D2D1::RectF(position.x + half + 10.0f, position.y - height / 2.0f,
+                        position.x + half + 10.0f + width, position.y + height / 2.0f),
+            D2D1::RectF(position.x - half - 10.0f - width, position.y - height / 2.0f,
+                        position.x - half - 10.0f, position.y + height / 2.0f),
+            D2D1::RectF(position.x - width / 2.0f, position.y + half + 9.0f,
+                        position.x + width / 2.0f, position.y + half + 9.0f + height)};
+
+        float bestPenalty = FLT_MAX;
+        D2D1_RECT_F tooltip = options[0];
+        for (std::size_t optionIndex = 0; optionIndex < options.size(); ++optionIndex) {
+            D2D1_RECT_F option = options[optionIndex];
+            // Score the rectangle that will actually be painted.  Scoring an
+            // offscreen candidate and moving it afterwards caused tooltips to
+            // land over the target label near an edge.
+            const float optionShiftX = option.left < 8.0f ? 8.0f - option.left
+                : (option.right > client.width - 8.0f
+                    ? client.width - 8.0f - option.right : 0.0f);
+            const float optionShiftY = option.top < 8.0f ? 8.0f - option.top
+                : (option.bottom > client.height - 8.0f
+                    ? client.height - 8.0f - option.bottom : 0.0f);
+            option.left += optionShiftX; option.right += optionShiftX;
+            option.top += optionShiftY; option.bottom += optionShiftY;
+            float penalty = static_cast<float>(optionIndex) * 2.0f;
+            for (const auto& [otherCoreId, otherLayout] : layouts) {
+                const Core* otherCore = FindCore(otherCoreId);
+                if (otherCore == nullptr) continue;
+                for (const ItemLayout& entry : otherLayout) {
+                    const bool isTarget = otherCoreId == hover_.coreId &&
+                        entry.item != nullptr && entry.item->id == hover_.itemId;
+                    const D2D1_RECT_F bounds = entry.item == nullptr
+                        ? D2D1::RectF(WorldToScreen(entry.position).x - 56.0f,
+                                      WorldToScreen(entry.position).y - 14.0f,
+                                      WorldToScreen(entry.position).x + 56.0f,
+                                      WorldToScreen(entry.position).y + 14.0f)
+                        : StableFootprint(WorldToScreen(VisualItemPosition(*otherCore, entry)),
+                                          entry.item->sizeTier, 1.0f,
+                                          entry.showLabel);
+                    if (RectanglesIntersect(option, bounds)) {
+                        penalty += isTarget ? 800.0f : 160.0f;
+                    }
+                    if (entry.showLabel && RectanglesIntersect(
+                            option, VisualLabelRectangle(*otherCore, entry))) {
+                        penalty += isTarget ? 800.0f : 120.0f;
+                    }
+                }
+            }
+            const D2D1_POINT_2F coreScreen =
+                WorldToScreen(VisualCorePosition(*core));
+            const float coreHalf = metrics_.coreSize * state_.zoom *
+                CoreVisualScale(*core) / 2.0f + 8.0f;
+            if (RectanglesIntersect(option, D2D1::RectF(
+                    coreScreen.x - coreHalf, coreScreen.y - coreHalf,
+                    coreScreen.x + coreHalf, coreScreen.y + coreHalf))) {
+                penalty += 300.0f;
+            }
+            if (penalty < bestPenalty) {
+                bestPenalty = penalty;
+                tooltip = option;
+            }
+        }
+        const bool dark = WindowsUsesDarkTheme();
+        const UINT32 background = dark ? 0x202020 : 0xF7F7F7;
+        const UINT32 border = dark ? 0x6B6B6B : 0xB7B7B7;
+        const UINT32 primary = dark ? 0xF3F3F3 : 0x1F1F1F;
+        const UINT32 secondary = dark ? 0xC6C6C6 : 0x505050;
+        brush_->SetColor(D2D1::ColorF(background, 0.96f));
+        renderTarget_->FillRoundedRectangle(D2D1::RoundedRect(tooltip, 6.0f, 6.0f),
+                                            brush_.Get());
+        brush_->SetColor(D2D1::ColorF(border, 0.92f));
+        renderTarget_->DrawRoundedRectangle(D2D1::RoundedRect(tooltip, 6.0f, 6.0f),
+                                            brush_.Get(), 1.0f);
+        const std::wstring name = Shorten(
+            hovered->item->originalName.empty()
+                ? FileDisplayName(hovered->item->path)
+                : hovered->item->originalName, 42);
+        const std::wstring path = Shorten(hovered->item->path, 54);
+        const std::wstring recent = L"最近使用：" +
+            FormatTimestamp(hovered->item->lastOpened);
+        const D2D1_RECT_F nameRect = D2D1::RectF(
+            tooltip.left + 12.0f, tooltip.top + 8.0f,
+            tooltip.right - 12.0f, tooltip.top + 31.0f);
+        const D2D1_RECT_F pathRect = D2D1::RectF(
+            tooltip.left + 12.0f, tooltip.top + 34.0f,
+            tooltip.right - 12.0f, tooltip.top + 55.0f);
+        const D2D1_RECT_F recentRect = D2D1::RectF(
+            tooltip.left + 12.0f, tooltip.top + 58.0f,
+            tooltip.right - 12.0f, tooltip.bottom - 7.0f);
+        brush_->SetColor(D2D1::ColorF(primary, 0.98f));
+        renderTarget_->DrawTextW(name.c_str(), static_cast<UINT32>(name.size()),
+            tooltipFormat_.Get(), nameRect, brush_.Get(), D2D1_DRAW_TEXT_OPTIONS_CLIP);
+        brush_->SetColor(D2D1::ColorF(secondary, 0.94f));
+        renderTarget_->DrawTextW(path.c_str(), static_cast<UINT32>(path.size()),
+            tooltipBodyFormat_.Get(), pathRect, brush_.Get(), D2D1_DRAW_TEXT_OPTIONS_CLIP);
+        renderTarget_->DrawTextW(recent.c_str(), static_cast<UINT32>(recent.size()),
+            tooltipBodyFormat_.Get(), recentRect, brush_.Get(), D2D1_DRAW_TEXT_OPTIONS_CLIP);
+    }
+
+    void DrawCore(const Core& core) {
+        // Dragging takes visual priority over selection.  Hover and selection
+        // never change this core's size, position, or any file coordinate.
+        const bool selected = IsCoreVisuallySelected(core.id) &&
+            !(draggingCore_ && dragCoreId_ == core.id);
+        const bool hovered = hover_.kind == HitKind::Core && hover_.coreId == core.id;
+        const float focusAmount = CoreFocusAmount(core.id);
+        const bool focused = focusAmount > 0.5f;
+        const bool dropTarget =
+            (draggingItem_ && dragTargetCoreId_ != 0 &&
+             dragTargetCoreId_ == core.id) ||
+            (externalDropCoreId_ == core.id &&
+             externalDropItemId_ == 0);
+        D2D1_MATRIX_3X2_F previous{};
+        renderTarget_->GetTransform(&previous);
+        renderTarget_->SetTransform(D2D1::Matrix3x2F::Identity());
+        const D2D1_POINT_2F center =
+            WorldToScreen(VisualCorePosition(core));
+        const float coreRadius = CoreScreenRadius(core);
+        const float outerRadius = coreRadius + 6.0f;
+
+        // A layered, alpha-only halo makes the core legible without a blur
+        // pass or a continuously animated effect.
+        const UINT32 themeColor = EffectiveCoreThemeColor(core);
+        const UINT32 haloColor = dropTarget ? 0x67E8B0 : themeColor;
+        const float haloStrength = dropTarget ? 1.15f
+            : (selected ? 1.22f : (hovered || focused ? 1.0f : 0.62f)) *
+                CoreGlowIntensity(core);
+        brush_->SetColor(D2D1::ColorF(haloColor, 0.035f * haloStrength));
+        renderTarget_->FillEllipse(
+            D2D1::Ellipse(center, outerRadius + 20.0f, outerRadius + 20.0f),
+            brush_.Get());
+        brush_->SetColor(D2D1::ColorF(haloColor, 0.070f * haloStrength));
+        renderTarget_->FillEllipse(
+            D2D1::Ellipse(center, outerRadius + 12.0f, outerRadius + 12.0f),
+            brush_.Get());
+        brush_->SetColor(D2D1::ColorF(
+            haloColor, dropTarget ? 0.26f : 0.14f * haloStrength));
+        renderTarget_->FillEllipse(
+            D2D1::Ellipse(center, outerRadius + 5.0f, outerRadius + 5.0f),
+            brush_.Get());
+        brush_->SetColor(D2D1::ColorF(themeColor, 1.0f));
+        renderTarget_->FillEllipse(
+            D2D1::Ellipse(center, coreRadius, coreRadius), brush_.Get());
+        brush_->SetColor(D2D1::ColorF(
+            SeparationColorFor(themeColor),
+            selected || focused ? 0.94f : 0.84f));
+        renderTarget_->DrawEllipse(
+            D2D1::Ellipse(
+                center, coreRadius + 0.45f, coreRadius + 0.45f),
+            brush_.Get(), selected || focused ? 1.65f : 1.35f);
+        brush_->SetColor(D2D1::ColorF(
+            dropTarget ? 0x8CFFD0 : (selected ? themeColor : 0xB9D7FF),
+            selected || focused ? 0.98f : 0.72f));
+        renderTarget_->DrawEllipse(
+            D2D1::Ellipse(center, outerRadius, outerRadius), brush_.Get(),
+            selected || focused ? 2.1f : 1.2f);
+        if (selected && ShouldDrawCoreSelectionRipple(core)) {
+            // Drawn after the unchanged static halo and ring.  This is a
+            // transient display-only stroke; it never changes core geometry.
+            DrawCoreSelectionRipple(
+                center, coreRadius, outerRadius, themeColor,
+                CoreGlowIntensity(core));
+        }
+
+        brush_->SetColor(D2D1::ColorF(0xF4F8FF, 0.96f));
+        const float left = center.x - 12.0f;
+        const float top = center.y - 11.0f;
+        const float glyphScale =
+            std::clamp(coreRadius / 32.0f, 0.85f, 1.55f);
+        renderTarget_->SetTransform(
+            D2D1::Matrix3x2F::Scale(glyphScale, glyphScale, center));
+        switch (core.iconKind) {
+        case CoreIconKind::Documents:
+            renderTarget_->DrawRoundedRectangle(
+                D2D1::RoundedRect(
+                    D2D1::RectF(left + 3.0f, top, left + 21.0f, top + 23.0f),
+                    2.0f, 2.0f),
+                brush_.Get(), 2.0f);
+            renderTarget_->DrawLine(
+                D2D1::Point2F(left + 7.0f, top + 8.0f),
+                D2D1::Point2F(left + 17.0f, top + 8.0f), brush_.Get(), 1.6f);
+            renderTarget_->DrawLine(
+                D2D1::Point2F(left + 7.0f, top + 14.0f),
+                D2D1::Point2F(left + 17.0f, top + 14.0f), brush_.Get(), 1.6f);
+            break;
+        case CoreIconKind::Games:
+            renderTarget_->DrawRoundedRectangle(
+                D2D1::RoundedRect(
+                    D2D1::RectF(left, top + 5.0f, left + 24.0f, top + 20.0f),
+                    6.0f, 6.0f),
+                brush_.Get(), 2.0f);
+            renderTarget_->DrawLine(
+                D2D1::Point2F(left + 5.0f, top + 12.0f),
+                D2D1::Point2F(left + 11.0f, top + 12.0f), brush_.Get(), 1.7f);
+            renderTarget_->DrawLine(
+                D2D1::Point2F(left + 8.0f, top + 9.0f),
+                D2D1::Point2F(left + 8.0f, top + 15.0f), brush_.Get(), 1.7f);
+            renderTarget_->FillEllipse(
+                D2D1::Ellipse(D2D1::Point2F(left + 18.0f, top + 10.0f),
+                              1.8f, 1.8f),
+                brush_.Get());
+            renderTarget_->FillEllipse(
+                D2D1::Ellipse(D2D1::Point2F(left + 20.5f, top + 14.0f),
+                              1.8f, 1.8f),
+                brush_.Get());
+            break;
+        case CoreIconKind::Folder:
+            renderTarget_->DrawRoundedRectangle(
+                D2D1::RoundedRect(
+                    D2D1::RectF(left, top + 5.0f, left + 24.0f, top + 21.0f),
+                    2.0f, 2.0f),
+                brush_.Get(), 2.0f);
+            renderTarget_->DrawLine(
+                D2D1::Point2F(left + 2.0f, top + 5.0f),
+                D2D1::Point2F(left + 10.0f, top + 5.0f), brush_.Get(), 2.0f);
+            break;
+        case CoreIconKind::Study:
+            renderTarget_->DrawLine(
+                D2D1::Point2F(center.x, top + 3.0f),
+                D2D1::Point2F(center.x, top + 22.0f), brush_.Get(), 1.8f);
+            renderTarget_->DrawRoundedRectangle(
+                D2D1::RoundedRect(
+                    D2D1::RectF(left, top + 2.0f, center.x, top + 21.0f),
+                    2.0f, 2.0f),
+                brush_.Get(), 1.8f);
+            renderTarget_->DrawRoundedRectangle(
+                D2D1::RoundedRect(
+                    D2D1::RectF(center.x, top + 2.0f, left + 24.0f,
+                                top + 21.0f),
+                    2.0f, 2.0f),
+                brush_.Get(), 1.8f);
+            break;
+        case CoreIconKind::Unclassified:
+            for (int row = 0; row < 2; ++row) {
+                for (int column = 0; column < 2; ++column) {
+                    renderTarget_->DrawRoundedRectangle(
+                        D2D1::RoundedRect(
+                            D2D1::RectF(left + column * 12.0f,
+                                        top + row * 12.0f,
+                                        left + column * 12.0f + 9.0f,
+                                        top + row * 12.0f + 9.0f),
+                            1.5f, 1.5f),
+                        brush_.Get(), 1.8f);
+                }
+            }
+            break;
+        default:
+            renderTarget_->DrawLine(
+                D2D1::Point2F(center.x, top),
+                D2D1::Point2F(center.x, top + 22.0f), brush_.Get(), 2.0f);
+            renderTarget_->DrawLine(
+                D2D1::Point2F(left + 1.0f, center.y),
+                D2D1::Point2F(left + 23.0f, center.y), brush_.Get(), 2.0f);
+            renderTarget_->FillEllipse(
+                D2D1::Ellipse(center, 4.0f, 4.0f), brush_.Get());
+            break;
+        }
+        renderTarget_->SetTransform(D2D1::Matrix3x2F::Identity());
+
+        const std::wstring name = Shorten(core.name, 18);
+        const D2D1_RECT_F nameRect =
+            CoreNameRectangle(core, center, coreRadius);
+        DrawDesktopText(
+            name, coreFormat_.Get(), nameRect,
+            (hovered || selected || focused) ? 1.0f : 0.92f,
+            0xFCFCFC);
+        if (externalDropCoreId_ == core.id &&
+            externalDropItemId_ == 0) {
+            const D2D1_RECT_F receive = D2D1::RectF(
+                center.x - 58.0f,
+                nameRect.bottom + 3.0f,
+                center.x + 58.0f,
+                nameRect.bottom + 29.0f);
+            brush_->SetColor(
+                D2D1::ColorF(0x167A51, 0.94f));
+            renderTarget_->FillRoundedRectangle(
+                D2D1::RoundedRect(
+                    receive, 8.0f, 8.0f),
+                brush_.Get());
+            brush_->SetColor(
+                D2D1::ColorF(0xF4FFF9, 1.0f));
+            const wchar_t* receiveText =
+                L"松开以加入此核心";
+            renderTarget_->DrawTextW(
+                receiveText,
+                static_cast<UINT32>(
+                    wcslen(receiveText)),
+                hudFormat_.Get(), receive,
+                brush_.Get(),
+                D2D1_DRAW_TEXT_OPTIONS_CLIP);
+        }
+
+        // The badge is a stable capacity indicator, not a hover decoration:
+        // for example 10/15 or 16/18.  It sits beside the core glyph so the
+        // count remains readable without competing with the core name.
+        const std::wstring count = CoreCapacityText(core);
+        const float badgeScale = CoreVisualScale(core);
+        const D2D1_RECT_F badgeBounds =
+            CoreCapacityBadgeRectangle(
+                core, center, coreRadius);
+        const float badgeHeight =
+            badgeBounds.bottom - badgeBounds.top;
+        const D2D1_POINT_2F badge = D2D1::Point2F(
+            (badgeBounds.left + badgeBounds.right) * 0.5f,
+            (badgeBounds.top + badgeBounds.bottom) * 0.5f);
+        const D2D1_RECT_F badgeGlowBounds = D2D1::RectF(
+            badgeBounds.left - 2.0f, badgeBounds.top - 2.0f,
+            badgeBounds.right + 2.0f, badgeBounds.bottom + 2.0f);
+        brush_->SetColor(D2D1::ColorF(themeColor, 0.22f));
+        renderTarget_->FillRoundedRectangle(
+            D2D1::RoundedRect(badgeGlowBounds,
+                               badgeHeight * 0.5f + 2.0f,
+                               badgeHeight * 0.5f + 2.0f),
+            brush_.Get());
+        brush_->SetColor(D2D1::ColorF(0x10213B, 0.96f));
+        renderTarget_->FillRoundedRectangle(
+            D2D1::RoundedRect(
+                badgeBounds, badgeHeight * 0.5f, badgeHeight * 0.5f),
+            brush_.Get());
+        brush_->SetColor(D2D1::ColorF(
+            LightenCoreColor(themeColor, 0.48f), 0.96f));
+        renderTarget_->DrawRoundedRectangle(
+            D2D1::RoundedRect(
+                badgeBounds, badgeHeight * 0.5f, badgeHeight * 0.5f),
+            brush_.Get(), 1.0f);
+        brush_->SetColor(D2D1::ColorF(0xF7FAFF, 0.99f));
+        renderTarget_->SetTransform(D2D1::Matrix3x2F::Scale(
+            badgeScale, badgeScale, badge));
+        renderTarget_->DrawTextW(
+            count.c_str(), static_cast<UINT32>(count.size()), bodyFormat_.Get(),
+            badgeBounds,
+            brush_.Get(), D2D1_DRAW_TEXT_OPTIONS_CLIP);
+        renderTarget_->SetTransform(D2D1::Matrix3x2F::Identity());
+
+        const bool hasMissing = std::any_of(core.files.begin(), core.files.end(),
+                                            [](const FileItem& item) { return item.missing; });
+        const bool hasActive = std::any_of(core.files.begin(), core.files.end(),
+                                           [](const FileItem& item) {
+                                               return item.inProgress;
+                                           });
+        if (hasMissing || hasActive) {
+            brush_->SetColor(
+                D2D1::ColorF(hasMissing ? 0xF07882 : 0x62D8A2, 0.95f));
+            renderTarget_->FillEllipse(
+                D2D1::Ellipse(D2D1::Point2F(
+                                                center.x - coreRadius * 0.72f,
+                                            center.y - coreRadius * 0.72f),
+                              std::clamp(coreRadius * 0.14f, 4.0f, 6.0f),
+                              std::clamp(coreRadius * 0.14f, 4.0f, 6.0f)),
+                brush_.Get());
+        }
+        renderTarget_->SetTransform(previous);
+    }
+
+    void DrawDraggedItem() {
+        if (!draggingItem_ || !dragMoved_) {
+            return;
+        }
+        Core* core = FindCore(dragCoreId_);
+        FileItem* item = FindItem(dragCoreId_, dragItemId_);
+        if (core != nullptr && item != nullptr) {
+            DrawItem(*core, *item, dragWorld_, true);
+        }
+    }
+
+    void DrawHud(const D2D1_SIZE_F client) {
+        if (!status_.empty()) {
+            const float width = std::min(620.0f, client.width - 40.0f);
+            const D2D1_RECT_F box =
+                D2D1::RectF(20.0f, client.height - 54.0f, 20.0f + width, client.height - 16.0f);
+            brush_->SetColor(D2D1::ColorF(0x172846, 0.94f));
+            renderTarget_->FillRoundedRectangle(D2D1::RoundedRect(box, 8.0f, 8.0f),
+                                                brush_.Get());
+            brush_->SetColor(D2D1::ColorF(0xDCEAFF));
+            renderTarget_->DrawTextW(status_.c_str(), static_cast<UINT32>(status_.size()),
+                                     hudFormat_.Get(), box, brush_.Get(),
+                                     D2D1_DRAW_TEXT_OPTIONS_CLIP);
+        }
+    }
+
+    static bool IsImagePreviewType(const std::wstring& path) {
+        std::wstring extension = PathFindExtensionW(path.c_str());
+        std::transform(extension.begin(), extension.end(), extension.begin(),
+                       [](wchar_t ch) {
+                           return static_cast<wchar_t>(std::towlower(ch));
+                       });
+        constexpr std::array<const wchar_t*, 12> extensions{
+            L".png", L".jpg", L".jpeg", L".webp", L".gif", L".bmp",
+            L".tif", L".tiff", L".heic", L".avif", L".psd", L".svg"};
+        return std::any_of(
+            extensions.begin(), extensions.end(),
+            [&extension](const wchar_t* candidate) {
+                return extension == candidate;
+            });
+    }
+
+    ComPtr<ID2D1Bitmap> BitmapFromHBitmap(HBITMAP source) {
+        if (source == nullptr) {
+            return nullptr;
+        }
+        ComPtr<IWICBitmap> wicBitmap;
+        ComPtr<IWICFormatConverter> converter;
+        ComPtr<ID2D1Bitmap> bitmap;
+        HRESULT result = wicFactory_->CreateBitmapFromHBITMAP(
+            source, nullptr, WICBitmapUsePremultipliedAlpha,
+            wicBitmap.ReleaseAndGetAddressOf());
+        if (SUCCEEDED(result)) {
+            result =
+                wicFactory_->CreateFormatConverter(converter.ReleaseAndGetAddressOf());
+        }
+        if (SUCCEEDED(result)) {
+            result = converter->Initialize(
+                wicBitmap.Get(), GUID_WICPixelFormat32bppPBGRA,
+                WICBitmapDitherTypeNone, nullptr, 0.0,
+                WICBitmapPaletteTypeMedianCut);
+        }
+        if (SUCCEEDED(result)) {
+            result = renderTarget_->CreateBitmapFromWicBitmap(
+                converter.Get(), nullptr, bitmap.ReleaseAndGetAddressOf());
+        }
+        return SUCCEEDED(result) ? bitmap : nullptr;
+    }
+
+    ComPtr<ID2D1Bitmap> BitmapFromCroppedIconSource(
+        IWICBitmapSource* source,
+        ComPtr<ID2D1Bitmap>* shadowOutput = nullptr) {
+        if (shadowOutput != nullptr) {
+            shadowOutput->Reset();
+        }
+        if (source == nullptr) {
+            return nullptr;
+        }
+        ComPtr<IWICFormatConverter> converter;
+        if (FAILED(wicFactory_->CreateFormatConverter(
+                converter.ReleaseAndGetAddressOf())) ||
+            FAILED(converter->Initialize(
+                source, GUID_WICPixelFormat32bppPBGRA,
+                WICBitmapDitherTypeNone, nullptr, 0.0,
+                WICBitmapPaletteTypeMedianCut))) {
+            return nullptr;
+        }
+
+        UINT width = 0;
+        UINT height = 0;
+        if (FAILED(converter->GetSize(&width, &height)) ||
+            width == 0 || height == 0) {
+            return nullptr;
+        }
+        const UINT stride = width * 4;
+        std::vector<BYTE> pixels(
+            static_cast<std::size_t>(stride) * height);
+        if (FAILED(converter->CopyPixels(
+                nullptr, stride, static_cast<UINT>(pixels.size()),
+                pixels.data()))) {
+            return nullptr;
+        }
+
+        UINT left = width;
+        UINT top = height;
+        UINT right = 0;
+        UINT bottom = 0;
+        bool found = false;
+        for (UINT y = 0; y < height; ++y) {
+            for (UINT x = 0; x < width; ++x) {
+                const BYTE alpha =
+                    pixels[static_cast<std::size_t>(y) * stride +
+                           static_cast<std::size_t>(x) * 4 + 3];
+                if (alpha <= 10) {
+                    continue;
+                }
+                found = true;
+                left = std::min(left, x);
+                top = std::min(top, y);
+                right = std::max(right, x + 1);
+                bottom = std::max(bottom, y + 1);
+            }
+        }
+        if (!found) {
+            return nullptr;
+        }
+
+        const UINT padding =
+            std::max(1U, std::min(width, height) / 64U);
+        left = left > padding ? left - padding : 0;
+        top = top > padding ? top - padding : 0;
+        right = std::min(width, right + padding);
+        bottom = std::min(height, bottom + padding);
+
+        WICRect crop{
+            static_cast<INT>(left),
+            static_cast<INT>(top),
+            static_cast<INT>(right - left),
+            static_cast<INT>(bottom - top)};
+        ComPtr<IWICBitmapClipper> clipper;
+        ComPtr<ID2D1Bitmap> bitmap;
+        HRESULT result = wicFactory_->CreateBitmapClipper(
+            clipper.ReleaseAndGetAddressOf());
+        if (SUCCEEDED(result)) {
+            result = clipper->Initialize(converter.Get(), &crop);
+        }
+        if (SUCCEEDED(result)) {
+            result = renderTarget_->CreateBitmapFromWicBitmap(
+                clipper.Get(), nullptr,
+                bitmap.ReleaseAndGetAddressOf());
+        }
+        if (SUCCEEDED(result) && shadowOutput != nullptr) {
+            const UINT cropWidth = static_cast<UINT>(crop.Width);
+            const UINT cropHeight = static_cast<UINT>(crop.Height);
+            const UINT minimumSide =
+                std::max(1U, std::min(cropWidth, cropHeight));
+            const UINT blurRadius =
+                std::clamp(minimumSide / 40U, 2U, 7U);
+            const UINT shadowPadding = blurRadius + 2U;
+            const UINT shadowWidth = cropWidth + shadowPadding * 2U;
+            const UINT shadowHeight = cropHeight + shadowPadding * 2U;
+            std::vector<float> alpha(
+                static_cast<std::size_t>(shadowWidth) * shadowHeight,
+                0.0f);
+            for (UINT y = 0; y < cropHeight; ++y) {
+                for (UINT x = 0; x < cropWidth; ++x) {
+                    const std::size_t sourceIndex =
+                        static_cast<std::size_t>(top + y) * stride +
+                        static_cast<std::size_t>(left + x) * 4U + 3U;
+                    alpha[
+                        static_cast<std::size_t>(y + shadowPadding) *
+                            shadowWidth +
+                        x + shadowPadding] =
+                        static_cast<float>(pixels[sourceIndex]);
+                }
+            }
+
+            // A cached two-pass box blur approximates the restrained shadow
+            // used by Windows desktop icons. It is generated once per icon;
+            // the static desktop never runs a live blur effect.
+            std::vector<float> horizontal(alpha.size(), 0.0f);
+            std::vector<float> blurred(alpha.size(), 0.0f);
+            for (UINT y = 0; y < shadowHeight; ++y) {
+                float sum = 0.0f;
+                for (int x = -static_cast<int>(blurRadius);
+                     x <= static_cast<int>(blurRadius); ++x) {
+                    if (x >= 0 && x < static_cast<int>(shadowWidth)) {
+                        sum += alpha[
+                            static_cast<std::size_t>(y) * shadowWidth +
+                            static_cast<UINT>(x)];
+                    }
+                }
+                const float divisor =
+                    static_cast<float>(blurRadius * 2U + 1U);
+                for (UINT x = 0; x < shadowWidth; ++x) {
+                    horizontal[
+                        static_cast<std::size_t>(y) * shadowWidth + x] =
+                        sum / divisor;
+                    const int removeX =
+                        static_cast<int>(x) -
+                        static_cast<int>(blurRadius);
+                    const int addX =
+                        static_cast<int>(x) +
+                        static_cast<int>(blurRadius) + 1;
+                    if (removeX >= 0) {
+                        sum -= alpha[
+                            static_cast<std::size_t>(y) * shadowWidth +
+                            static_cast<UINT>(removeX)];
+                    }
+                    if (addX < static_cast<int>(shadowWidth)) {
+                        sum += alpha[
+                            static_cast<std::size_t>(y) * shadowWidth +
+                            static_cast<UINT>(addX)];
+                    }
+                }
+            }
+            for (UINT x = 0; x < shadowWidth; ++x) {
+                float sum = 0.0f;
+                for (int y = -static_cast<int>(blurRadius);
+                     y <= static_cast<int>(blurRadius); ++y) {
+                    if (y >= 0 && y < static_cast<int>(shadowHeight)) {
+                        sum += horizontal[
+                            static_cast<std::size_t>(y) * shadowWidth + x];
+                    }
+                }
+                const float divisor =
+                    static_cast<float>(blurRadius * 2U + 1U);
+                for (UINT y = 0; y < shadowHeight; ++y) {
+                    blurred[
+                        static_cast<std::size_t>(y) * shadowWidth + x] =
+                        sum / divisor;
+                    const int removeY =
+                        static_cast<int>(y) -
+                        static_cast<int>(blurRadius);
+                    const int addY =
+                        static_cast<int>(y) +
+                        static_cast<int>(blurRadius) + 1;
+                    if (removeY >= 0) {
+                        sum -= horizontal[
+                            static_cast<std::size_t>(removeY) *
+                                shadowWidth +
+                            x];
+                    }
+                    if (addY < static_cast<int>(shadowHeight)) {
+                        sum += horizontal[
+                            static_cast<std::size_t>(addY) *
+                                shadowWidth +
+                            x];
+                    }
+                }
+            }
+
+            const UINT shadowStride = shadowWidth * 4U;
+            std::vector<BYTE> shadowPixels(
+                static_cast<std::size_t>(shadowStride) * shadowHeight,
+                0);
+            for (std::size_t index = 0;
+                 index < blurred.size(); ++index) {
+                shadowPixels[index * 4U + 3U] =
+                    static_cast<BYTE>(std::clamp(
+                        blurred[index] * 0.58f, 0.0f, 255.0f));
+            }
+            ComPtr<IWICBitmap> shadowWic;
+            if (SUCCEEDED(wicFactory_->CreateBitmapFromMemory(
+                    shadowWidth, shadowHeight,
+                    GUID_WICPixelFormat32bppPBGRA,
+                    shadowStride,
+                    static_cast<UINT>(shadowPixels.size()),
+                    shadowPixels.data(),
+                    shadowWic.ReleaseAndGetAddressOf()))) {
+                renderTarget_->CreateBitmapFromWicBitmap(
+                    shadowWic.Get(), nullptr,
+                    shadowOutput->ReleaseAndGetAddressOf());
+            }
+        }
+        return SUCCEEDED(result) ? bitmap : nullptr;
+    }
+
+    ComPtr<ID2D1Bitmap> GetImageThumbnail(
+        const FileItem& item,
+        ComPtr<ID2D1Bitmap>* shadowOutput) {
+        if (item.missing || item.isDirectory ||
+            !IsImagePreviewType(item.path)) {
+            return nullptr;
+        }
+        ComPtr<IShellItemImageFactory> imageFactory;
+        if (FAILED(SHCreateItemFromParsingName(
+                item.path.c_str(), nullptr,
+                IID_PPV_ARGS(imageFactory.ReleaseAndGetAddressOf())))) {
+            return nullptr;
+        }
+        HBITMAP thumbnail = nullptr;
+        const SIZE requested{160, 160};
+        const HRESULT result = imageFactory->GetImage(
+            requested,
+            static_cast<SIIGBF>(SIIGBF_THUMBNAILONLY |
+                                SIIGBF_BIGGERSIZEOK |
+                                SIIGBF_RESIZETOFIT),
+            &thumbnail);
+        if (FAILED(result) || thumbnail == nullptr) {
+            return nullptr;
+        }
+        ComPtr<IWICBitmap> wicBitmap;
+        ComPtr<ID2D1Bitmap> bitmap;
+        if (SUCCEEDED(wicFactory_->CreateBitmapFromHBITMAP(
+                thumbnail, nullptr, WICBitmapUsePremultipliedAlpha,
+                wicBitmap.ReleaseAndGetAddressOf()))) {
+            bitmap = BitmapFromCroppedIconSource(
+                wicBitmap.Get(), shadowOutput);
+        }
+        DeleteObject(thumbnail);
+        return bitmap;
+    }
+
+    ComPtr<ID2D1Bitmap> GetIconBitmap(const FileItem& item) {
+        std::wstring key = item.path.empty() ? L"<unknown>" : item.path;
+        std::transform(key.begin(), key.end(), key.begin(),
+                       [](wchar_t ch) { return static_cast<wchar_t>(std::towlower(ch)); });
+        if (const auto cached = iconCache_.find(key); cached != iconCache_.end()) {
+            return cached->second;
+        }
+
+        ComPtr<ID2D1Bitmap> shadow;
+        if (ComPtr<ID2D1Bitmap> thumbnail =
+                GetImageThumbnail(item, &shadow);
+            thumbnail != nullptr) {
+            iconCache_.insert_or_assign(key, thumbnail);
+            iconShadowCache_.insert_or_assign(key, shadow);
+            return thumbnail;
+        }
+
+        SHFILEINFOW info{};
+        DWORD attributes = item.isDirectory ? FILE_ATTRIBUTE_DIRECTORY : FILE_ATTRIBUTE_NORMAL;
+        UINT flags =
+            SHGFI_SYSICONINDEX | SHGFI_ADDOVERLAYS |
+            SHGFI_OVERLAYINDEX;
+        if (item.missing) {
+            flags |= SHGFI_USEFILEATTRIBUTES;
+        }
+        if (SHGetFileInfoW(item.path.c_str(), attributes, &info, sizeof(info), flags) == 0) {
+            iconCache_.insert_or_assign(key, nullptr);
+            iconShadowCache_.insert_or_assign(key, nullptr);
+            return nullptr;
+        }
+
+        const int imageListSize = SHIL_JUMBO;
+        ComPtr<IImageList> imageList;
+        HICON icon = nullptr;
+        HRESULT iconResult = SHGetImageList(
+            imageListSize, IID_IImageList,
+            reinterpret_cast<void**>(imageList.ReleaseAndGetAddressOf()));
+        if (SUCCEEDED(iconResult)) {
+            const int iconIndex = info.iIcon & 0x00FFFFFF;
+            const int overlayIndex =
+                (static_cast<unsigned int>(info.iIcon) >> 24) & 0xFF;
+            const UINT drawFlags =
+                ILD_TRANSPARENT |
+                (overlayIndex > 0
+                     ? INDEXTOOVERLAYMASK(overlayIndex)
+                     : 0);
+            iconResult =
+                imageList->GetIcon(iconIndex, drawFlags, &icon);
+        }
+        if (FAILED(iconResult) || icon == nullptr) {
+            SHFILEINFOW fallback{};
+            UINT fallbackFlags =
+                SHGFI_ICON | SHGFI_LARGEICON |
+                SHGFI_ADDOVERLAYS;
+            if (item.missing) {
+                fallbackFlags |= SHGFI_USEFILEATTRIBUTES;
+            }
+            if (SHGetFileInfoW(item.path.c_str(), attributes, &fallback, sizeof(fallback),
+                               fallbackFlags) != 0) {
+                icon = fallback.hIcon;
+            }
+        }
+        if (icon == nullptr) {
+            iconCache_.insert_or_assign(key, nullptr);
+            iconShadowCache_.insert_or_assign(key, nullptr);
+            return nullptr;
+        }
+
+        ComPtr<IWICBitmap> wicBitmap;
+        ComPtr<ID2D1Bitmap> bitmap;
+        HRESULT result = wicFactory_->CreateBitmapFromHICON(icon,
+                                                            wicBitmap.ReleaseAndGetAddressOf());
+        DestroyIcon(icon);
+        if (SUCCEEDED(result)) {
+            bitmap = BitmapFromCroppedIconSource(
+                wicBitmap.Get(), &shadow);
+            result = bitmap != nullptr ? S_OK : E_FAIL;
+        }
+        if (FAILED(result)) {
+            bitmap.Reset();
+            shadow.Reset();
+        }
+        iconCache_.insert_or_assign(key, bitmap);
+        iconShadowCache_.insert_or_assign(key, shadow);
+        return bitmap;
+    }
+
+    ComPtr<ID2D1Bitmap> GetIconShadowBitmap(const FileItem& item) {
+        std::wstring key = item.path.empty() ? L"<unknown>" : item.path;
+        std::transform(
+            key.begin(), key.end(), key.begin(),
+            [](wchar_t ch) {
+                return static_cast<wchar_t>(std::towlower(ch));
+            });
+        (void)GetIconBitmap(item);
+        if (const auto cached = iconShadowCache_.find(key);
+            cached != iconShadowCache_.end()) {
+            return cached->second;
+        }
+        return nullptr;
+    }
+
+    D2D1_POINT_2F PixelToDip(int x, int y) const {
+        const float scale = dpi_ / 96.0f;
+        return D2D1::Point2F(static_cast<float>(x) / scale, static_cast<float>(y) / scale);
+    }
+
+    void ToggleMaximizeRestore() {
+        ShowWindow(window_, IsZoomed(window_) ? SW_RESTORE : SW_MAXIMIZE);
+        Invalidate();
+    }
+
+    D2D1_POINT_2F ScreenToWorld(D2D1_POINT_2F point) const {
+        return D2D1::Point2F((point.x - state_.viewOffset.x) / state_.zoom,
+                             (point.y - state_.viewOffset.y) / state_.zoom);
+    }
+
+    D2D1_POINT_2F WorldToScreen(D2D1_POINT_2F point) const {
+        return D2D1::Point2F(point.x * state_.zoom + state_.viewOffset.x,
+                             point.y * state_.zoom + state_.viewOffset.y);
+    }
+
+    static float DistanceSquared(D2D1_POINT_2F first, D2D1_POINT_2F second) {
+        const float x = first.x - second.x;
+        const float y = first.y - second.y;
+        return x * x + y * y;
+    }
+
+    HitResult HitTest(D2D1_POINT_2F world) {
+        const LayoutMap& layouts = StableLayouts();
+        const D2D1_POINT_2F screen = WorldToScreen(world);
+        for (auto coreIterator = state_.cores.rbegin(); coreIterator != state_.cores.rend();
+             ++coreIterator) {
+            Core& core = *coreIterator;
+            if (core.archived) continue;
+            const bool hasDetachedFiles = std::any_of(
+                core.files.begin(), core.files.end(),
+                [](const FileItem& item) {
+                    return item.detachedFromUpper;
+                });
+            if (!core.expanded && focusedCoreId_ != core.id &&
+                !hasDetachedFiles) {
+                continue;
+            }
+            if (focusedCoreId_ != 0 && focusedCoreId_ != core.id) {
+                continue;
+            }
+            const auto found = layouts.find(core.id);
+            if (found == layouts.end()) {
+                continue;
+            }
+            const std::vector<ItemLayout>& layout = found->second;
+            for (auto itemIterator = layout.rbegin(); itemIterator != layout.rend();
+                 ++itemIterator) {
+                if (itemIterator->isMore) {
+                    const D2D1_POINT_2F position =
+                        WorldToScreen(
+                            VisualItemPosition(
+                                core, *itemIterator));
+                    if (std::abs(screen.x - position.x) <=
+                            61.0f &&
+                        std::abs(screen.y - position.y) <=
+                            19.0f) {
+                        return {HitKind::More, core.id, 0};
+                    }
+                    continue;
+                }
+                if (itemIterator->item == nullptr) {
+                    continue;
+                }
+                const D2D1_POINT_2F position =
+                    WorldToScreen(
+                        VisualItemPosition(
+                            core, *itemIterator));
+                const float hitHalf =
+                    ItemHitHalfSize(
+                        core, *itemIterator->item) *
+                        state_.zoom +
+                    5.0f;
+                const bool iconHit =
+                    std::abs(screen.x - position.x) <=
+                        hitHalf &&
+                    std::abs(screen.y - position.y) <=
+                        hitHalf;
+                D2D1_RECT_F label =
+                    VisualLabelRectangle(
+                        core, *itemIterator);
+                label.left -= 5.0f;
+                label.top -= 5.0f;
+                label.right += 5.0f;
+                label.bottom += 5.0f;
+                const bool labelHit =
+                    itemIterator->showLabel &&
+                    PointInside(screen, label);
+                if (iconHit || labelHit) {
+                    return {HitKind::Item, core.id, itemIterator->item->id};
+                }
+            }
+        }
+        for (auto iterator = state_.cores.rbegin(); iterator != state_.cores.rend(); ++iterator) {
+            if (iterator->archived || !CoreBodyVisible(*iterator)) continue;
+            const D2D1_POINT_2F center =
+                WorldToScreen(
+                    VisualCorePosition(*iterator));
+            const float coreRadius =
+                CoreScreenRadius(*iterator);
+            const float coreHitRadius =
+                coreRadius + 5.0f;
+            D2D1_RECT_F name =
+                CoreNameRectangle(
+                    *iterator, center, coreRadius);
+            name.left -= 5.0f;
+            name.top -= 5.0f;
+            name.right += 5.0f;
+            name.bottom += 5.0f;
+            D2D1_RECT_F badge =
+                CoreCapacityBadgeRectangle(
+                    *iterator, center, coreRadius);
+            badge.left -= 5.0f;
+            badge.top -= 5.0f;
+            badge.right += 5.0f;
+            badge.bottom += 5.0f;
+            if (DistanceSquared(screen, center) <=
+                    coreHitRadius * coreHitRadius ||
+                PointInside(screen, name) ||
+                PointInside(screen, badge)) {
+                return {HitKind::Core, iterator->id, 0};
+            }
+        }
+        return {};
+    }
+
+    std::uint64_t DropCoreAt(D2D1_POINT_2F world) {
+        HitResult hit = HitTest(world);
+        if (hit.kind == HitKind::Core || hit.kind == HitKind::Item ||
+            hit.kind == HitKind::More) {
+            return hit.coreId;
+        }
+        float bestDistance = 95.0f * 95.0f;
+        std::uint64_t best = 0;
+        for (const Core& core : state_.cores) {
+            if (core.archived || !CoreBodyVisible(core)) continue;
+            const float distance =
+                DistanceSquared(world, VisualCorePosition(core));
+            if (distance < bestDistance) {
+                bestDistance = distance;
+                best = core.id;
+            }
+        }
+        return best;
+    }
+
+    Core* FindCore(std::uint64_t id) {
+        const auto iterator = std::find_if(
+            state_.cores.begin(), state_.cores.end(),
+            [id](const Core& core) { return core.id == id; });
+        return iterator == state_.cores.end() ? nullptr : &*iterator;
+    }
+
+    const Core* FindCore(std::uint64_t id) const {
+        const auto iterator = std::find_if(
+            state_.cores.begin(), state_.cores.end(),
+            [id](const Core& core) { return core.id == id; });
+        return iterator == state_.cores.end() ? nullptr : &*iterator;
+    }
+
+    FileItem* FindItem(std::uint64_t coreId, std::uint64_t itemId) {
+        Core* core = FindCore(coreId);
+        if (core == nullptr) {
+            return nullptr;
+        }
+        const auto iterator = std::find_if(
+            core->files.begin(), core->files.end(),
+            [itemId](const FileItem& item) { return item.id == itemId; });
+        return iterator == core->files.end() ? nullptr : &*iterator;
+    }
+
+    FileItem* FindItemAnywhere(std::uint64_t itemId, Core** owner = nullptr) {
+        for (Core& core : state_.cores) {
+            if (FileItem* item = FindItem(core.id, itemId)) {
+                if (owner != nullptr) *owner = &core;
+                return item;
+            }
+        }
+        return nullptr;
+    }
+
+    int ChildCount(const Core& core, std::uint64_t parentId) const {
+        return static_cast<int>(std::count_if(core.files.begin(), core.files.end(),
+            [parentId](const FileItem& item) { return item.parentFileId == parentId; }));
+    }
+
+    bool WouldCreateRelationCycle(std::uint64_t childId, std::uint64_t parentId) {
+        std::set<std::uint64_t> visited;
+        std::uint64_t cursor = parentId;
+        while (cursor != 0 && visited.insert(cursor).second) {
+            if (cursor == childId) return true;
+            FileItem* item = FindItemAnywhere(cursor);
+            cursor = item == nullptr ? 0 : item->parentFileId;
+        }
+        return false;
+    }
+
+    bool ApplyParentRelation(std::uint64_t childCoreId, std::uint64_t childId,
+                             std::uint64_t parentCoreId, std::uint64_t parentId,
+                             D2D1_POINT_2F childOriginalWorld) {
+        if (childId == parentId || WouldCreateRelationCycle(childId, parentId)) {
+            SetStatus(L"已拒绝：不能把文件连接到自身或其后代");
+            return false;
+        }
+        Core* source = FindCore(childCoreId);
+        Core* target = FindCore(parentCoreId);
+        FileItem* child = FindItem(childCoreId, childId);
+        FileItem* parent = FindItem(parentCoreId, parentId);
+        if (source == nullptr || target == nullptr || child == nullptr || parent == nullptr) {
+            SetStatus(L"无法建立关系：文件不存在或位置已变化");
+            return false;
+        }
+        // Preserve the pre-drag position.  Dropping B on A changes only the
+        // relationship; B returns to its original visual location and never
+        // overlaps A merely because the relation was created.
+        StableLayouts();
+        D2D1_POINT_2F parentWorld = BaseDisplayItemPosition(*target, *parent);
+        if (const auto layouts = layoutCache_.find(parentCoreId);
+            layouts != layoutCache_.end()) {
+            const auto entry = std::find_if(
+                layouts->second.begin(), layouts->second.end(),
+                [parentId](const ItemLayout& candidate) {
+                    return candidate.item != nullptr && candidate.item->id == parentId;
+                });
+            if (entry != layouts->second.end()) {
+                parentWorld = entry->position;
+            }
+        }
+        WorkspaceState before = state_;
+        if (source != target) {
+            std::vector<std::uint64_t> subtree{childId};
+            for (std::size_t index = 0; index < subtree.size(); ++index) {
+                for (const FileItem& candidate : source->files) {
+                    if (candidate.parentFileId == subtree[index]) {
+                        subtree.push_back(candidate.id);
+                    }
+                }
+            }
+            if (AttachedFileCount(*target) + subtree.size() >
+                static_cast<std::size_t>(kCoreFileCapacity)) {
+                SetStatus(L"目标核心容量不足，未改变文件关系");
+                return false;
+            }
+            for (const std::uint64_t id : subtree) {
+                if (!MoveItemToCoreInternal(childCoreId, id, parentCoreId)) {
+                    state_ = std::move(before);
+                    SetStatus(L"无法移入目标核心");
+                    return false;
+                }
+            }
+            child = FindItem(parentCoreId, childId);
+            target = FindCore(parentCoreId);
+            parent = FindItem(parentCoreId, parentId);
+            if (child == nullptr || target == nullptr || parent == nullptr) {
+                state_ = std::move(before);
+                SetStatus(L"目标文件状态已变化，未建立关系");
+                return false;
+            }
+        }
+        child->parentFileId = parentId;
+        child->detachedFromUpper = false;
+        if (parent->familyId == 0) {
+            FileFamily family;
+            family.id = state_.nextId++;
+            family.coreId = parentCoreId;
+            family.rootFileId = parentId;
+            family.currentFileId = parentId;
+            parent->familyId = family.id;
+            state_.families.push_back(std::move(family));
+        }
+        child->familyId = parent->familyId;
+        child->sizeTier = FileSizeTier::Minor;
+        const float offsetX = childOriginalWorld.x - parentWorld.x;
+        const float offsetY = childOriginalWorld.y - parentWorld.y;
+        child->relativeAngle = NormalizeDegrees(
+            std::atan2(offsetY, offsetX) * 180.0f / kPi);
+        child->relativeRadius = std::clamp(
+            std::sqrt(offsetX * offsetX + offsetY * offsetY), 36.0f, 8192.0f);
+        child->relativeManualOffset = D2D1::Point2F();
+        child->relativeManualLock = true;
+        child->slot = -1;
+        child->ring = -1;
+        child->ringSlot = -1;
+        layoutDirty_ = true;
+        const std::wstring childName = child->displayName.empty()
+            ? FileDisplayName(child->path) : child->displayName;
+        const std::wstring parentName = parent->displayName.empty()
+            ? FileDisplayName(parent->path) : parent->displayName;
+        SetStatus(childName + L" 已设为 " + parentName + L" 的子文件 · 可按 Ctrl+Z 撤销");
+        return true;
+    }
+
+    void EstablishParentRelation(std::uint64_t childCoreId,
+                                 std::uint64_t childId,
+                                 std::uint64_t parentCoreId,
+                                 std::uint64_t parentId,
+                                 D2D1_POINT_2F childOriginalWorld) {
+        WorkspaceState before = state_;
+        if (!ApplyParentRelation(childCoreId, childId, parentCoreId,
+                                 parentId, childOriginalWorld)) {
+            return;
+        }
+        PushUndo(std::move(before));
+        ScheduleSave();
+    }
+
+    void DetachParentRelation(std::uint64_t coreId, std::uint64_t itemId) {
+        FileItem* item = FindItem(coreId, itemId);
+        Core* core = FindCore(coreId);
+        if (item == nullptr || core == nullptr || item->detachedFromUpper) {
+            return;
+        }
+        StableLayouts();
+        D2D1_POINT_2F currentScreen =
+            WorldToScreen(BaseDisplayItemPosition(*core, *item));
+        if (const auto found = layoutCache_.find(coreId); found != layoutCache_.end()) {
+            const auto entry = std::find_if(
+                found->second.begin(), found->second.end(),
+                [itemId](const ItemLayout& candidate) {
+                    return candidate.item != nullptr && candidate.item->id == itemId;
+                });
+            if (entry != found->second.end()) {
+                currentScreen = WorldToScreen(entry->position);
+            }
+        }
+        PushUndo(state_);
+        item->parentFileId = 0;
+        item->detachedFromUpper = true;
+        item->detachedWorldPosition = ScreenToWorld(currentScreen);
+        item->relativeManualLock = false;
+        // It remains in the core's storage only for persistence and hit testing;
+        // it no longer owns a core slot or a core connection.
+        item->slot = -1;
+        item->ring = -1;
+        item->ringSlot = -1;
+        layoutDirty_ = true;
+        ScheduleSave();
+        SetStatus(L"已断开所有上层连接，文件保持独立 · 可按 Ctrl+Z 撤销");
+    }
+
+    void ArrangeAttachedSubtreeOutward(Core& core,
+                                       std::uint64_t rootItemId) {
+        FileItem* root = FindItem(core.id, rootItemId);
+        if (root == nullptr) return;
+        const D2D1_POINT_2F coreCenter =
+            DisplayCoreWorld(core);
+        const D2D1_POINT_2F rootPosition =
+            BaseDisplayItemPosition(core, *root);
+        std::function<void(std::uint64_t, D2D1_POINT_2F, int)> arrange;
+        arrange = [this, &core, coreCenter, &arrange](
+                      std::uint64_t parentId,
+                      D2D1_POINT_2F parentPosition,
+                      int depth) {
+            std::vector<FileItem*> children;
+            for (FileItem& candidate : core.files) {
+                if (candidate.parentFileId == parentId) {
+                    children.push_back(&candidate);
+                }
+            }
+            std::stable_sort(
+                children.begin(), children.end(),
+                [](const FileItem* first, const FileItem* second) {
+                    return first->id < second->id;
+                });
+            if (children.empty()) return;
+
+            const float outwardAngle = std::atan2(
+                parentPosition.y - coreCenter.y,
+                parentPosition.x - coreCenter.x);
+            const float spreadDegrees = std::min(
+                80.0f,
+                28.0f *
+                    static_cast<float>(children.size() - 1));
+            const float childRadius = std::max(
+                78.0f,
+                NodePitchForCore(core) * 0.88f +
+                    static_cast<float>(depth) * 6.0f);
+            for (std::size_t index = 0;
+                 index < children.size(); ++index) {
+                FileItem& child = *children[index];
+                const float offsetDegrees =
+                    children.size() == 1
+                        ? 0.0f
+                        : -spreadDegrees / 2.0f +
+                              spreadDegrees *
+                                  static_cast<float>(index) /
+                                  static_cast<float>(
+                                      children.size() - 1);
+                child.relativeAngle = NormalizeDegrees(
+                    outwardAngle * 180.0f / kPi +
+                    offsetDegrees);
+                child.relativeRadius = childRadius;
+                child.relativeManualOffset =
+                    D2D1::Point2F();
+                child.relativeManualLock = true;
+                child.detachedFromUpper = false;
+                child.slot = -1;
+                child.ring = -1;
+                child.ringSlot = -1;
+                const float angle =
+                    child.relativeAngle * kPi / 180.0f;
+                const D2D1_POINT_2F childPosition =
+                    D2D1::Point2F(
+                        parentPosition.x +
+                            std::cos(angle) *
+                                child.relativeRadius,
+                        parentPosition.y +
+                            std::sin(angle) *
+                                child.relativeRadius);
+                arrange(child.id, childPosition, depth + 1);
+            }
+        };
+        arrange(rootItemId, rootPosition, 0);
+    }
+
+    void AttachItemToCore(std::uint64_t sourceCoreId, std::uint64_t itemId,
+                          std::uint64_t targetCoreId, WorkspaceState before) {
+        Core* source = FindCore(sourceCoreId);
+        Core* target = FindCore(targetCoreId);
+        FileItem* item = FindItem(sourceCoreId, itemId);
+        if (source == nullptr || target == nullptr || item == nullptr) {
+            SetStatus(L"无法连接到核心：文件或核心不存在");
+            return;
+        }
+
+        if (source != target) {
+            std::vector<std::uint64_t> subtree{itemId};
+            for (std::size_t index = 0; index < subtree.size(); ++index) {
+                for (const FileItem& candidate : source->files) {
+                    if (candidate.parentFileId == subtree[index]) {
+                        subtree.push_back(candidate.id);
+                    }
+                }
+            }
+            if (AttachedFileCount(*target) + subtree.size() >
+                static_cast<std::size_t>(kCoreFileCapacity)) {
+                SetStatus(L"目标核心容量不足，未改变连接");
+                return;
+            }
+            for (const std::uint64_t subtreeItemId : subtree) {
+                if (!MoveItemToCoreInternal(sourceCoreId, subtreeItemId, targetCoreId)) {
+                    state_ = std::move(before);
+                    SetStatus(L"无法连接到目标核心");
+                    return;
+                }
+            }
+            for (FileFamily& family : state_.families) {
+                if (std::find(
+                        subtree.begin(), subtree.end(),
+                        family.rootFileId) != subtree.end()) {
+                    family.coreId = targetCoreId;
+                }
+            }
+            target = FindCore(targetCoreId);
+            item = FindItem(targetCoreId, itemId);
+        }
+        if (target == nullptr || item == nullptr) {
+            SetStatus(L"无法连接到目标核心");
+            return;
+        }
+
+        // Restoring a core link is explicit: the file becomes a normal root
+        // node and receives a real core slot.  No real file is moved.
+        item->parentFileId = 0;
+        item->detachedFromUpper = false;
+        item->detachedWorldPosition = D2D1::Point2F();
+        item->relativeManualLock = false;
+        item->relativeManualOffset = D2D1::Point2F();
+        item->sizeTier = InferSizeTier(*item);
+        item->slot = -1;
+        item->ring = -1;
+        item->ringSlot = -1;
+        AssignNewItemLayout(*target, *item);
+        ArrangeAttachedSubtreeOutward(*target, itemId);
+        target->expanded = true;
+        layoutDirty_ = true;
+        PushUndo(std::move(before));
+        SetSelection({HitKind::Item, targetCoreId, itemId});
+        ScheduleSave();
+        SetStatus(L"已连接到核心；真实文件位置未变化 · 可按 Ctrl+Z 撤销");
+    }
+
+    FileItem* FindItemByPath(const std::wstring& path, Core** owningCore = nullptr) {
+        for (Core& core : state_.cores) {
+            const auto iterator = std::find_if(
+                core.files.begin(), core.files.end(),
+                [&path](const FileItem& item) { return PathEquals(item.path, path); });
+            if (iterator != core.files.end()) {
+                if (owningCore != nullptr) {
+                    *owningCore = &core;
+                }
+                return &*iterator;
+            }
+        }
+        return nullptr;
+    }
+
+    int FindPlacementSlot(const Core& core, const FileItem& item) const {
+        std::set<int> occupied;
+        for (const FileItem& existing : core.files) {
+            if (existing.slot >= 0) {
+                occupied.insert(existing.slot);
+            }
+        }
+        const int preferredRing =
+            std::min(1, PreferredRing(item));
+        std::array<int, 3> ringOrder{};
+        if (preferredRing == 0) {
+            ringOrder = {0, 1, 2};
+        } else if (preferredRing == 1) {
+            ringOrder = {1, 0, 2};
+        } else {
+            ringOrder = {2, 1, 0};
+        }
+
+        const float preferredAngle = PreferredAngleDegrees(item) * kPi / 180.0f;
+        const auto circularDistance = [](float first, float second) {
+            float distance = std::fmod(std::abs(first - second), 2.0f * kPi);
+            return std::min(distance, 2.0f * kPi - distance);
+        };
+
+        for (const int ring : ringOrder) {
+            std::vector<std::pair<float, int>> candidates;
+            const std::array<int, 2> templateCounts = TemplateRingCounts(
+                core.layoutTemplate,
+                std::min(TemplateVisibleLimit(core.layoutTemplate),
+                         static_cast<int>(AttachedFileCount(core)) + 1));
+            const int ringCapacity = ring < 2 ? templateCounts[ring] : 0;
+            for (int ringSlot = 0; ringSlot < ringCapacity;
+                 ++ringSlot) {
+                const int slot = TemplateGlobalSlot(
+                    core.layoutTemplate, ring, ringSlot);
+                if (!occupied.contains(slot)) {
+                    candidates.emplace_back(
+                        circularDistance(SlotAngleRadians(ring, ringSlot),
+                                         preferredAngle),
+                        slot);
+                }
+            }
+            std::sort(candidates.begin(), candidates.end());
+            for (const auto& [distancePenalty, slot] : candidates) {
+                (void)distancePenalty;
+                return slot;
+            }
+        }
+        return -1;
+    }
+
+    void AssignNewItemLayout(Core& core, FileItem& item) {
+        item.slot = FindPlacementSlot(core, item);
+        item.ring = RingForSlot(item.slot);
+        item.ringSlot = RingSlotForSlot(item.slot);
+        if (item.slot < 0) {
+            return;
+        }
+        if (core.layoutMode == LayoutMode::Standard ||
+            core.layoutMode == LayoutMode::GrowToSpace) {
+            const std::array<int, 2> counts = TemplateRingCounts(
+                core.layoutTemplate,
+                std::min(TemplateVisibleLimit(core.layoutTemplate),
+                         static_cast<int>(AttachedFileCount(core)) + 1));
+            item.angleDegrees = NormalizeDegrees(
+                TemplateAngleDegrees(core.layoutTemplate, item.ring,
+                                     item.ringSlot, counts[0],
+                                     counts[1]));
+            item.angleOffsetDegrees = 0.0f;
+            item.radiusOffset = 0.0f;
+        } else {
+            item.angleDegrees =
+                NormalizeDegrees(PreferredAngleDegrees(item));
+        }
+    }
+
+    float MostOpenAngleDegrees(const Core& core) const {
+        std::vector<float> occupiedAngles;
+        occupiedAngles.reserve(core.files.size());
+        for (const FileItem& existing : core.files) {
+            if (existing.parentFileId != 0 ||
+                existing.detachedFromUpper || existing.slot < 0) {
+                continue;
+            }
+            occupiedAngles.push_back(NormalizeDegrees(
+                existing.angleDegrees +
+                EffectiveCoreRotationDegrees(core) +
+                existing.angleOffsetDegrees));
+        }
+        if (occupiedAngles.empty()) {
+            return -90.0f;
+        }
+        float bestAngle = -90.0f;
+        float bestClearance = -1.0f;
+        for (int sample = 0; sample < 24; ++sample) {
+            const float angle = -90.0f + sample * 15.0f;
+            float clearance = 180.0f;
+            for (const float existing : occupiedAngles) {
+                float difference = std::abs(
+                    NormalizeDegrees(angle) - existing);
+                difference = std::min(difference, 360.0f - difference);
+                clearance = std::min(clearance, difference);
+            }
+            if (clearance > bestClearance) {
+                bestClearance = clearance;
+                bestAngle = angle;
+            }
+        }
+        return NormalizeDegrees(bestAngle);
+    }
+
+    int FindDroppedOuterSlot(const Core& core,
+                             float preferredAngleDegrees) const {
+        std::set<int> occupied;
+        for (const FileItem& existing : core.files) {
+            if (existing.slot >= 0) {
+                occupied.insert(existing.slot);
+            }
+        }
+        float bestDifference = FLT_MAX;
+        int bestSlot = -1;
+        // The normal outer-ring limit is twelve. The thirteenth physical
+        // slot remains reserved for conditional automatic layouts.
+        for (int ringSlot = 0; ringSlot < 12; ++ringSlot) {
+            const int slot = GlobalSlot(1, ringSlot);
+            if (slot < 0 || occupied.contains(slot)) {
+                continue;
+            }
+            const float slotAngle =
+                SlotAngleRadians(1, ringSlot) * 180.0f / kPi;
+            float difference = std::abs(
+                NormalizeDegrees(slotAngle) -
+                NormalizeDegrees(preferredAngleDegrees));
+            difference = std::min(difference, 360.0f - difference);
+            if (difference < bestDifference) {
+                bestDifference = difference;
+                bestSlot = slot;
+            }
+        }
+        return bestSlot;
+    }
+
+    void AssignDroppedItemLayout(Core& core, FileItem& item,
+                                 D2D1_POINT_2F dropWorld,
+                                 int dropOrdinal) {
+        const D2D1_POINT_2F coreScreen =
+            WorldToScreen(DisplayCoreWorld(core));
+        const D2D1_POINT_2F dropScreen =
+            WorldToScreen(dropWorld);
+        const float deltaX = dropScreen.x - coreScreen.x;
+        const float deltaY = dropScreen.y - coreScreen.y;
+        const float distance =
+            std::sqrt(deltaX * deltaX + deltaY * deltaY);
+        float angle = distance >= 18.0f
+            ? NormalizeDegrees(
+                  std::atan2(deltaY, deltaX) * 180.0f / kPi)
+            : MostOpenAngleDegrees(core);
+        if (dropOrdinal > 0) {
+            const int branch = (dropOrdinal + 1) / 2;
+            const float sign = dropOrdinal % 2 == 1 ? 1.0f : -1.0f;
+            angle = NormalizeDegrees(
+                angle + sign * static_cast<float>(branch) * 30.0f);
+        }
+
+        item.slot = FindDroppedOuterSlot(core, angle);
+        if (item.slot < 0) {
+            AssignNewItemLayout(core, item);
+        } else {
+            item.ring = 1;
+            item.ringSlot = RingSlotForSlot(item.slot);
+        }
+        if (item.slot < 0) {
+            return;
+        }
+        // The drop establishes a user-owned outer-ring position. Ordinary
+        // single-file dragging can immediately change both angle and radius;
+        // explicit whole-ring controls still apply through the additive
+        // per-file offset formula.
+        item.ring = item.ring >= 0 ? item.ring : 1;
+        item.angleDegrees = NormalizeDegrees(
+            angle - EffectiveCoreRotationDegrees(core));
+        item.angleOffsetDegrees = 0.0f;
+        item.radiusOffset = 0.0f;
+        item.manualOffset = D2D1::Point2F();
+        item.manuallyMoved = true;
+        item.lockedPosition = true;
+    }
+
+    void WarnIfClustersOverlap(std::uint64_t coreId) {
+        const Core* core = FindCore(coreId);
+        if (core == nullptr) {
+            return;
+        }
+        for (const Core& other : state_.cores) {
+            if (other.id == core->id) {
+                continue;
+            }
+            const float distance = std::sqrt(
+                DistanceSquared(WorldToScreen(core->position),
+                                WorldToScreen(other.position)));
+            const float required =
+                (metrics_.coreSize + 40.0f) * state_.zoom;
+            if (distance < required) {
+                SetStatus(
+                    L"两个核心本体距离过近；已推动另一核心并保持整个簇团结构");
+                return;
+            }
+        }
+    }
+
+    void CaptureCoreLayout(const Core& core) {
+        CoreLayoutSnapshot snapshot;
+        snapshot.layoutMode = core.layoutMode;
+        snapshot.layoutTemplate = core.layoutTemplate;
+        snapshot.layoutLocked = core.layoutLocked;
+        snapshot.baseRotationDegrees =
+            core.baseRotationDegrees;
+        snapshot.growthDirectionDegrees =
+            core.growthDirectionDegrees;
+        snapshot.innerDistanceScale = core.innerDistanceScale;
+        snapshot.outerDistanceScale = core.outerDistanceScale;
+        snapshot.rotationAngle = core.rotationAngle;
+        snapshot.userLayoutCustomized = core.userLayoutCustomized;
+        for (const FileItem& item : core.files) {
+            snapshot.files.emplace(
+                item.id,
+                FileLayoutSnapshot{
+                    item.slot,
+                    item.ring,
+                    item.ringSlot,
+                    item.angleDegrees,
+                    item.angleOffsetDegrees,
+                    item.radiusOffset,
+                    item.manualOffset,
+                    item.manuallyMoved,
+                    item.lockedPosition});
+        }
+        lastCoreLayouts_.insert_or_assign(
+            core.id, std::move(snapshot));
+    }
+
+    void RestoreCoreLayout(std::uint64_t coreId) {
+        Core* core = FindCore(coreId);
+        const auto snapshot = lastCoreLayouts_.find(coreId);
+        if (core == nullptr ||
+            snapshot == lastCoreLayouts_.end()) {
+            SetStatus(L"当前会话没有可恢复的上次布局");
+            return;
+        }
+        PushUndo(state_);
+        core->layoutMode = snapshot->second.layoutMode;
+        core->layoutTemplate = snapshot->second.layoutTemplate;
+        core->layoutLocked = snapshot->second.layoutLocked;
+        core->baseRotationDegrees =
+            snapshot->second.baseRotationDegrees;
+        core->growthDirectionDegrees =
+            snapshot->second.growthDirectionDegrees;
+        core->innerDistanceScale = snapshot->second.innerDistanceScale;
+        core->outerDistanceScale = snapshot->second.outerDistanceScale;
+        core->rotationAngle = snapshot->second.rotationAngle;
+        core->userLayoutCustomized = snapshot->second.userLayoutCustomized;
+        core->userAdjustedAt = UnixTimeNow();
+        for (FileItem& item : core->files) {
+            const auto saved =
+                snapshot->second.files.find(item.id);
+            if (saved == snapshot->second.files.end()) {
+                continue;
+            }
+            item.slot = saved->second.slot;
+            item.ring = saved->second.ring;
+            item.ringSlot = saved->second.ringSlot;
+            item.angleDegrees =
+                saved->second.angleDegrees;
+            item.angleOffsetDegrees =
+                saved->second.angleOffsetDegrees;
+            item.radiusOffset =
+                saved->second.radiusOffset;
+            item.manualOffset =
+                saved->second.manualOffset;
+            item.manuallyMoved =
+                saved->second.manuallyMoved;
+            item.lockedPosition =
+                saved->second.lockedPosition;
+        }
+        lastCoreLayouts_.erase(snapshot);
+        ScheduleSave();
+        SetStatus(L"已恢复本核心上一次整理前的布局");
+        Invalidate();
+    }
+
+    bool HasManualLayout(const Core& core) const {
+        return std::any_of(
+            core.files.begin(), core.files.end(),
+            [](const FileItem& item) {
+                return item.manuallyMoved || item.lockedPosition;
+            });
+    }
+
+    enum class ManualArrangeChoice {
+        Keep,
+        Reset,
+        Cancel,
+    };
+
+    ManualArrangeChoice AskManualArrangeChoice() {
+        const int result = MessageBoxW(
+            window_,
+            L"当前布局包含手动调整或锁定的文件。\n\n"
+            L"“是”：保留手动位置，只整理其他文件\n"
+            L"“否”：全部恢复标准双环\n"
+            L"“取消”：不执行整理",
+            L"整理文件位置",
+            MB_YESNOCANCEL | MB_ICONQUESTION | MB_DEFBUTTON1);
+        if (result == IDYES) {
+            return ManualArrangeChoice::Keep;
+        }
+        if (result == IDNO) {
+            return ManualArrangeChoice::Reset;
+        }
+        return ManualArrangeChoice::Cancel;
+    }
+
+    bool ConfirmExplicitLayoutCommand(const Core& core,
+                                      const wchar_t* command) const {
+        if (!core.layoutLocked) {
+            return true;
+        }
+        const std::wstring message =
+            L"当前布局已锁定。\n\n执行“" +
+            std::wstring(command) +
+            L"”会解除锁定并重新整理文件。是否继续？";
+        return MessageBoxW(
+                   window_, message.c_str(), L"布局已锁定",
+                   MB_YESNO | MB_ICONQUESTION | MB_DEFBUTTON2) == IDYES;
+    }
+
+    void OptimizeCoreLayout(Core& core, bool preserveManual = true) {
+        const float previousRotation = core.baseRotationDegrees;
+        if (!preserveManual) {
+            for (FileItem& item : core.files) {
+                item.manuallyMoved = false;
+                item.lockedPosition = false;
+                item.manualOffset = D2D1::Point2F();
+            }
+        } else if (std::abs(previousRotation) > 0.001f) {
+            for (FileItem& item : core.files) {
+                if (item.manuallyMoved || item.lockedPosition) {
+                    item.angleDegrees = NormalizeDegrees(
+                        item.angleDegrees + previousRotation);
+                }
+            }
+        }
+
+        core.layoutMode = LayoutMode::Standard;
+        core.baseRotationDegrees = 0.0f;
+        core.growthDirectionDegrees = 0.0f;
+        // Explicit automatic organizing is the only operation allowed to
+        // replace the per-ring user controls.
+        core.innerDistanceScale = 1.0f;
+        core.outerDistanceScale = 1.0f;
+        core.rotationAngle = 0.0f;
+        core.userLayoutCustomized = false;
+        core.userAdjustedAt = 0;
+        core.layoutVersion = kLayoutVersion;
+
+        std::vector<FileItem*> ordered;
+        ordered.reserve(core.files.size());
+        for (FileItem& item : core.files) {
+            if (!preserveManual ||
+                (!item.manuallyMoved && !item.lockedPosition)) {
+                ordered.push_back(&item);
+                item.slot = -1;
+                item.ring = -1;
+                item.ringSlot = -1;
+            }
+        }
+        std::stable_sort(
+            ordered.begin(), ordered.end(),
+            [this, &core](const FileItem* first,
+                          const FileItem* second) {
+                const int firstScore = PriorityScore(core, *first);
+                const int secondScore = PriorityScore(core, *second);
+                return firstScore != secondScore
+                           ? firstScore > secondScore
+                           : first->id < second->id;
+            });
+
+        const int visibleCount = std::min(
+            TemplateVisibleLimit(core.layoutTemplate),
+            static_cast<int>(AttachedFileCount(core)));
+        const std::array<int, 2> counts =
+            TemplateRingCounts(core.layoutTemplate, visibleCount);
+        struct TargetSlot {
+            int slot = -1;
+            int ring = -1;
+            int ringSlot = -1;
+            float angle = -90.0f;
+        };
+        std::vector<TargetSlot> targets;
+        targets.reserve(kPriorityPlacementSlots);
+        for (int ringSlot = 0; ringSlot < counts[0]; ++ringSlot) {
+            targets.push_back(
+                {TemplateGlobalSlot(core.layoutTemplate, 0, ringSlot),
+                 0, ringSlot,
+                 TemplateAngleDegrees(core.layoutTemplate, 0, ringSlot,
+                                      counts[0], counts[1])});
+        }
+        for (int ringSlot = 0; ringSlot < counts[1]; ++ringSlot) {
+            targets.push_back(
+                {TemplateGlobalSlot(core.layoutTemplate, 1, ringSlot),
+                 1, ringSlot,
+                 TemplateAngleDegrees(core.layoutTemplate, 1, ringSlot,
+                                      counts[0], counts[1])});
+        }
+
+        std::set<int> occupied;
+        if (preserveManual) {
+            for (FileItem& item : core.files) {
+                if ((item.manuallyMoved || item.lockedPosition) &&
+                    item.slot >= 0 &&
+                    item.slot < kPriorityPlacementSlots) {
+                    occupied.insert(item.slot);
+                }
+            }
+        }
+
+        std::size_t targetIndex = 0;
+        for (FileItem* item : ordered) {
+            while (targetIndex < targets.size() &&
+                   occupied.contains(targets[targetIndex].slot)) {
+                ++targetIndex;
+            }
+            if (targetIndex >= targets.size()) {
+                item->slot = -1;
+                item->ring = -1;
+                item->ringSlot = -1;
+                continue;
+            }
+            const TargetSlot& target = targets[targetIndex++];
+            item->slot = target.slot;
+            item->ring = target.ring;
+            item->ringSlot = target.ringSlot;
+            item->angleDegrees = NormalizeDegrees(target.angle);
+            item->angleOffsetDegrees = 0.0f;
+            item->radiusOffset = 0.0f;
+            occupied.insert(item->slot);
+        }
+    }
+
+    void RestoreSystemRecommendedLayout(std::uint64_t coreId) {
+        Core* core = FindCore(coreId);
+        if (core == nullptr || core->files.empty() ||
+            !ConfirmExplicitLayoutCommand(*core, L"恢复系统推荐布局")) {
+            return;
+        }
+        CaptureCoreLayout(*core);
+        PushUndo(state_);
+        core->layoutLocked = false;
+        core->layoutTemplate =
+            AttachedFileCount(*core) <= 15
+                ? LayoutTemplate::AutoCompact
+                : LayoutTemplate::HighCapacityDouble;
+        // This is an explicit one-shot command. It intentionally resets all
+        // individual offsets to the current system recommendation; no later
+        // repaint or focus transition may repeat the operation.
+        OptimizeCoreLayout(*core, false);
+        layoutDirty_ = true;
+        ScheduleSave();
+        SetStatus(AttachedFileCount(*core) <= 15
+                      ? L"已恢复系统推荐布局（5＋10，容量15）"
+                      : L"已恢复系统推荐布局（6＋12，容量18）");
+        Invalidate();
+    }
+
+    void DistributeCurrentRingAngles(std::uint64_t coreId) {
+        Core* core = FindCore(coreId);
+        if (core == nullptr || core->files.empty() ||
+            !ConfirmExplicitLayoutCommand(*core,
+                                          L"按当前圈层平均分配角度")) {
+            return;
+        }
+        CaptureCoreLayout(*core);
+        PushUndo(state_);
+        core->layoutLocked = false;
+        std::array<std::vector<FileItem*>, 2> rings;
+        for (FileItem& item : core->files) {
+            if (item.parentFileId != 0 || item.detachedFromUpper) {
+                continue;
+            }
+            const int ring = std::clamp(
+                item.ring >= 0 ? item.ring : RingForSlot(item.slot),
+                0, 1);
+            rings[ring].push_back(&item);
+        }
+        for (std::vector<FileItem*>& ringItems : rings) {
+            std::stable_sort(
+                ringItems.begin(), ringItems.end(),
+                [this, core](const FileItem* first,
+                             const FileItem* second) {
+                    const float firstAngle = NormalizeDegrees(
+                        first->angleDegrees +
+                        EffectiveCoreRotationDegrees(*core) +
+                        first->angleOffsetDegrees);
+                    const float secondAngle = NormalizeDegrees(
+                        second->angleDegrees +
+                        EffectiveCoreRotationDegrees(*core) +
+                        second->angleOffsetDegrees);
+                    return std::abs(firstAngle - secondAngle) > 0.0001f
+                               ? firstAngle < secondAngle
+                               : first->id < second->id;
+                });
+            const float count = static_cast<float>(ringItems.size());
+            for (std::size_t index = 0; index < ringItems.size(); ++index) {
+                FileItem& item = *ringItems[index];
+                const int ring = std::clamp(
+                    item.ring >= 0 ? item.ring : RingForSlot(item.slot),
+                    0, 1);
+                const float previousAngle =
+                    (item.angleDegrees +
+                     EffectiveCoreRotationDegrees(*core) +
+                     item.angleOffsetDegrees) *
+                    kPi / 180.0f;
+                const float ringRadius = RingRadiusForCore(*core, ring);
+                const float vectorX =
+                    std::cos(previousAngle) *
+                        (ringRadius + item.radiusOffset) +
+                    item.manualOffset.x;
+                const float vectorY =
+                    std::sin(previousAngle) *
+                        (ringRadius + item.radiusOffset) +
+                    item.manualOffset.y;
+                const float preservedRadius =
+                    std::sqrt(vectorX * vectorX + vectorY * vectorY);
+                // The core's persisted rotation remains the common start
+                // direction. Individual radius offsets and manual radial
+                // placement are converted to the same radial model, then
+                // preserved exactly while only the angle changes.
+                item.angleDegrees = NormalizeDegrees(
+                    -90.0f + 360.0f * static_cast<float>(index) / count);
+                item.angleOffsetDegrees = 0.0f;
+                item.radiusOffset = preservedRadius - ringRadius;
+                item.manualOffset = D2D1::Point2F();
+            }
+        }
+        core->layoutMode = LayoutMode::KeepAngles;
+        core->layoutVersion = kLayoutVersion;
+        layoutDirty_ = true;
+        ScheduleSave();
+        SetStatus(L"已按当前圈层平均分配角度；距离和圈层保持不变");
+        Invalidate();
+    }
+
+    void EnableFreeLayout(std::uint64_t coreId) {
+        Core* core = FindCore(coreId);
+        if (core == nullptr) {
+            return;
+        }
+        CaptureCoreLayout(*core);
+        PushUndo(state_);
+        core->layoutMode = LayoutMode::Free;
+        ScheduleSave();
+        SetStatus(L"自由布局已开启；拖动可同时改变角度和距离");
+        Invalidate();
+    }
+
+    void GrowCoreToSpace(
+        std::uint64_t coreId,
+        std::optional<bool> preserveManualChoice = std::nullopt,
+        bool recordUndo = true) {
+        (void)preserveManualChoice;
+        Core* core = FindCore(coreId);
+        if (core == nullptr || core->files.empty() ||
+            !ConfirmExplicitLayoutCommand(*core, L"向空白处生长")) {
+            return;
+        }
+        const bool unlockLayout = core->layoutLocked;
+
+        const float previousRotation =
+            core->baseRotationDegrees;
+        CaptureCoreLayout(*core);
+        if (recordUndo) {
+            PushUndo(state_);
+        }
+        if (unlockLayout) {
+            core->layoutLocked = false;
+        }
+        // This command changes growth direction only.  Rebuilding a template
+        // here used to replace the user's radii before the direction search,
+        // which made "grow to empty space" pull files closer to the core.
+        layoutDirty_ = true;
+        StableLayouts();
+
+        const D2D1_SIZE_F client = ClientDipSize();
+        const D2D1_POINT_2F center =
+            WorldToScreen(DisplayCoreWorld(*core));
+        std::vector<D2D1_RECT_F> obstacles;
+        for (const auto& [otherCoreId, entries] :
+             layoutCache_) {
+            if (otherCoreId == coreId) {
+                continue;
+            }
+            for (const ItemLayout& entry : entries) {
+                if (entry.item == nullptr || entry.isMore) {
+                    continue;
+                }
+                obstacles.push_back(StableFootprint(
+                    WorldToScreen(entry.position),
+                    entry.item->sizeTier, 1.0f,
+                    entry.showLabel));
+            }
+        }
+        for (const Core& other : state_.cores) {
+            if (other.id == coreId) {
+                continue;
+            }
+            const D2D1_POINT_2F otherCenter =
+                WorldToScreen(DisplayCoreWorld(other));
+            const float half =
+                metrics_.coreSize * state_.zoom / 2.0f +
+                12.0f;
+            obstacles.push_back(D2D1::RectF(
+                otherCenter.x - half,
+                otherCenter.y - half,
+                otherCenter.x + half,
+                otherCenter.y + half +
+                    metrics_.coreFontSize + 20.0f));
+        }
+
+        float bestRotation = 0.0f;
+        double bestPenalty = DBL_MAX;
+        for (int rotation = 0; rotation < 360;
+             rotation += 5) {
+            std::vector<D2D1_RECT_F> candidateBounds;
+            double penalty = 0.0;
+            for (const FileItem& item : core->files) {
+                if (item.slot < 0 ||
+                    item.slot >= kPriorityPlacementSlots) {
+                    continue;
+                }
+                const int ring =
+                    item.ring >= 0
+                        ? item.ring
+                        : RingForSlot(item.slot);
+                const bool fixed =
+                    item.manuallyMoved ||
+                    item.lockedPosition;
+                const float angle =
+                    (item.angleDegrees +
+                     (fixed
+                          ? EffectiveCoreRotationDegrees(*core)
+                          : static_cast<float>(rotation) +
+                                core->rotationAngle) +
+                     item.angleOffsetDegrees) *
+                    kPi / 180.0f;
+                const float radius =
+                    (RingRadiusForCore(*core, ring) +
+                     item.radiusOffset) *
+                    state_.zoom;
+                const D2D1_POINT_2F position =
+                    D2D1::Point2F(
+                        center.x + std::cos(angle) * radius +
+                            item.manualOffset.x * state_.zoom,
+                        center.y + std::sin(angle) * radius +
+                            item.manualOffset.y * state_.zoom);
+                const D2D1_RECT_F bounds =
+                    StableFootprint(
+                        position, item.sizeTier,
+                        state_.zoom, true);
+                constexpr float margin = 8.0f;
+                const double overflow =
+                    std::max(0.0f, margin - bounds.left) +
+                    std::max(0.0f, margin - bounds.top) +
+                    std::max(
+                        0.0f,
+                        bounds.right -
+                            (client.width - margin)) +
+                    std::max(
+                        0.0f,
+                        bounds.bottom -
+                            (client.height - margin));
+                penalty += overflow * 100000.0;
+                for (const D2D1_RECT_F& obstacle :
+                     obstacles) {
+                    if (RectanglesIntersect(
+                            InflateRectangle(bounds, 24.0f),
+                            InflateRectangle(obstacle, 24.0f))) {
+                        penalty += 1000000.0;
+                    }
+                }
+                for (const D2D1_RECT_F& existing :
+                     candidateBounds) {
+                    if (RectanglesIntersect(
+                            InflateRectangle(bounds, 4.0f),
+                            InflateRectangle(existing, 4.0f))) {
+                        penalty += 1000000.0;
+                    }
+                }
+                const float edgeClearance = std::max(
+                    0.0f,
+                    std::min(
+                        {bounds.left,
+                         bounds.top,
+                         client.width - bounds.right,
+                         client.height - bounds.bottom}));
+                penalty -=
+                    std::min(240.0f, edgeClearance) * 0.25;
+                candidateBounds.push_back(bounds);
+            }
+            const float delta = std::abs(
+                NormalizeDegrees(
+                    static_cast<float>(rotation) -
+                    previousRotation));
+            penalty +=
+                std::min(delta, 360.0f - delta) * 0.5;
+            if (penalty < bestPenalty) {
+                bestPenalty = penalty;
+                bestRotation =
+                    static_cast<float>(rotation);
+            }
+        }
+
+        const float previousEffectiveRotation =
+            EffectiveCoreRotationDegrees(*core);
+        const float nextEffectiveRotation = NormalizeDegrees(
+            bestRotation + core->rotationAngle);
+        for (FileItem& item : core->files) {
+            if (!item.manuallyMoved && !item.lockedPosition) continue;
+            item.angleDegrees = NormalizeDegrees(
+                item.angleDegrees + previousEffectiveRotation -
+                nextEffectiveRotation);
+        }
+        core->layoutMode = LayoutMode::GrowToSpace;
+        core->baseRotationDegrees = bestRotation;
+        core->growthDirectionDegrees = bestRotation;
+        layoutDirty_ = true;
+        StableLayouts();
+        ScheduleSave();
+        SetStatus(
+            L"已向空白处生长：保留双环骨架并选择确定性的安全朝向");
+        Invalidate();
+    }
+
+    void ApplyLayoutTemplate(std::uint64_t coreId,
+                             LayoutTemplate layoutTemplate,
+                             const wchar_t* status) {
+        Core* core = FindCore(coreId);
+        if (core == nullptr || core->files.empty()) {
+            return;
+        }
+        if (layoutTemplate == LayoutTemplate::CompactDouble &&
+            AttachedFileCount(*core) > 15) {
+            SetStatus(
+                L"当前核心超过15个文件；请先移出多余文件，或使用高容量双环（6＋12）");
+            return;
+        }
+        if (!ConfirmExplicitLayoutCommand(*core, status)) {
+            return;
+        }
+        CaptureCoreLayout(*core);
+        PushUndo(state_);
+        core->layoutLocked = false;
+        core->layoutTemplate = layoutTemplate;
+        // A template command is explicit user intent. It rebuilds the full
+        // template once instead of leaving a hidden automatic mode active.
+        OptimizeCoreLayout(*core, false);
+        layoutDirty_ = true;
+        ScheduleSave();
+        SetStatus(status);
+        Invalidate();
+    }
+
+    void SetStartDirection(std::uint64_t coreId, float degrees,
+                           const wchar_t* status) {
+        Core* core = FindCore(coreId);
+        if (core == nullptr) {
+            return;
+        }
+        if (core->layoutLocked) {
+            SetStatus(L"当前核心布局已锁定；请先在“整理文件位置”中解锁");
+            return;
+        }
+        CaptureCoreLayout(*core);
+        PushUndo(state_);
+        core->baseRotationDegrees = NormalizeDegrees(degrees);
+        core->growthDirectionDegrees = core->baseRotationDegrees;
+        core->layoutMode = LayoutMode::Standard;
+        layoutDirty_ = true;
+        ScheduleSave();
+        SetStatus(status);
+        Invalidate();
+    }
+
+    void ToggleCoreLayoutLock(std::uint64_t coreId) {
+        Core* core = FindCore(coreId);
+        if (core == nullptr) {
+            return;
+        }
+        CaptureCoreLayout(*core);
+        PushUndo(state_);
+        core->layoutLocked = !core->layoutLocked;
+        ScheduleSave();
+        SetStatus(core->layoutLocked
+                      ? L"当前核心布局已锁定；自动整理和方向调整不会改动它"
+                      : L"当前核心布局已解锁；可再次进行整理和方向调整");
+        Invalidate();
+    }
+
+    void OptimizeCore(std::uint64_t coreId) {
+        Core* core = FindCore(coreId);
+        if (core == nullptr || core->files.empty()) {
+            return;
+        }
+        if (core->layoutLocked) {
+            SetStatus(L"当前核心布局已锁定；请先在“整理文件位置”中解锁");
+            return;
+        }
+        bool preserveManual = true;
+        if (HasManualLayout(*core)) {
+            const ManualArrangeChoice choice =
+                AskManualArrangeChoice();
+            if (choice == ManualArrangeChoice::Cancel) {
+                return;
+            }
+            preserveManual =
+                choice == ManualArrangeChoice::Keep;
+        }
+        CaptureCoreLayout(*core);
+        PushUndo(state_);
+        OptimizeCoreLayout(*core, preserveManual);
+        ScheduleSave();
+        SetStatus(L"簇团已按当前布局模板重新整理");
+        Invalidate();
+    }
+
+    void OptimizeAllCores() {
+        if (state_.cores.empty()) {
+            return;
+        }
+        bool preserveManual = true;
+        const bool hasManual = std::any_of(
+            state_.cores.begin(), state_.cores.end(),
+            [this](const Core& core) {
+                return HasManualLayout(core);
+            });
+        if (hasManual) {
+            const ManualArrangeChoice choice =
+                AskManualArrangeChoice();
+            if (choice == ManualArrangeChoice::Cancel) {
+                return;
+            }
+            preserveManual =
+                choice == ManualArrangeChoice::Keep;
+        }
+        for (const Core& core : state_.cores) {
+            CaptureCoreLayout(core);
+        }
+        PushUndo(state_);
+        for (Core& core : state_.cores) {
+            OptimizeCoreLayout(core, preserveManual);
+        }
+        ScheduleSave();
+        SetStatus(L"所有核心已按各自布局模板重新整理");
+        Invalidate();
+    }
+
+    void SeparateOverlappingCores() {
+        std::vector<Core*> cores;
+        for (Core& core : state_.cores) {
+            if (!core.archived && CoreBodyVisible(core)) {
+                cores.push_back(&core);
+            }
+        }
+        if (cores.size() < 2) {
+            SetStatus(L"当前没有需要分散的重叠核心");
+            return;
+        }
+        WorkspaceState before = state_;
+        const D2D1_SIZE_F client = ClientDipSize();
+        bool changed = false;
+        for (int pass = 0; pass < 8; ++pass) {
+            bool passChanged = false;
+            for (std::size_t firstIndex = 0;
+                 firstIndex < cores.size();
+                 ++firstIndex) {
+                for (std::size_t secondIndex = firstIndex + 1;
+                     secondIndex < cores.size();
+                     ++secondIndex) {
+                    Core& first = *cores[firstIndex];
+                    Core& second = *cores[secondIndex];
+                    D2D1_POINT_2F firstScreen =
+                        WorldToScreen(first.position);
+                    D2D1_POINT_2F secondScreen =
+                        WorldToScreen(second.position);
+                    float deltaX =
+                        secondScreen.x - firstScreen.x;
+                    float deltaY =
+                        secondScreen.y - firstScreen.y;
+                    float distance = std::sqrt(
+                        deltaX * deltaX + deltaY * deltaY);
+                    const float required =
+                        CoreScreenRadius(first) +
+                        CoreScreenRadius(second) + 48.0f;
+                    if (distance >= required) {
+                        continue;
+                    }
+                    if (distance < 0.01f) {
+                        deltaX = (second.id & 1u) != 0
+                            ? 1.0f : -1.0f;
+                        deltaY = 0.35f;
+                        distance = std::sqrt(
+                            deltaX * deltaX +
+                            deltaY * deltaY);
+                    }
+                    const float overlap =
+                        required - distance;
+                    const float unitX = deltaX / distance;
+                    const float unitY = deltaY / distance;
+                    const float shift = overlap * 0.5f + 0.5f;
+                    firstScreen.x -= unitX * shift;
+                    firstScreen.y -= unitY * shift;
+                    secondScreen.x += unitX * shift;
+                    secondScreen.y += unitY * shift;
+                    const float firstRadius =
+                        CoreScreenRadius(first) + 8.0f;
+                    const float secondRadius =
+                        CoreScreenRadius(second) + 8.0f;
+                    firstScreen.x = std::clamp(
+                        firstScreen.x, firstRadius,
+                        std::max(
+                            firstRadius,
+                            client.width - firstRadius));
+                    firstScreen.y = std::clamp(
+                        firstScreen.y, 50.0f + firstRadius,
+                        std::max(
+                            50.0f + firstRadius,
+                            client.height - firstRadius));
+                    secondScreen.x = std::clamp(
+                        secondScreen.x, secondRadius,
+                        std::max(
+                            secondRadius,
+                            client.width - secondRadius));
+                    secondScreen.y = std::clamp(
+                        secondScreen.y, 50.0f + secondRadius,
+                        std::max(
+                            50.0f + secondRadius,
+                            client.height - secondRadius));
+                    first.position =
+                        ScreenToWorld(firstScreen);
+                    second.position =
+                        ScreenToWorld(secondScreen);
+                    passChanged = true;
+                    changed = true;
+                }
+            }
+            if (!passChanged) {
+                break;
+            }
+        }
+        if (!changed) {
+            SetStatus(L"当前核心没有重叠，无需移动");
+            return;
+        }
+        const std::wstring monitorId = CurrentMonitorId();
+        for (Core* core : cores) {
+            const D2D1_POINT_2F screen =
+                WorldToScreen(core->position);
+            core->xRatio = std::clamp(
+                screen.x / std::max(1.0f, client.width),
+                0.0f, 1.0f);
+            core->yRatio = std::clamp(
+                screen.y / std::max(1.0f, client.height),
+                0.0f, 1.0f);
+            core->monitorId = monitorId;
+        }
+        PushUndo(std::move(before));
+        layoutDirty_ = true;
+        ScheduleSave();
+        SetStatus(L"仅重叠核心已按最小移动原则分开");
+        Invalidate();
+    }
+
+    void DisperseCores(bool recordUndo = true) {
+        if (state_.cores.empty()) {
+            return;
+        }
+        if (recordUndo) {
+            PushUndo(state_);
+        }
+        ResetFocusImmediately();
+        RefreshResponsiveMetrics(false);
+
+        const D2D1_SIZE_F client = ClientDipSize();
+        const int columns = std::max(1, metrics_.gridColumns);
+        const int rows = std::max(1, metrics_.gridRows);
+        const float cellWidth =
+            client.width / static_cast<float>(columns);
+        const float cellHeight =
+            client.height / static_cast<float>(rows);
+
+        std::vector<D2D1_POINT_2F> cells;
+        cells.reserve(static_cast<std::size_t>(columns * rows));
+        for (int row = 0; row < rows; ++row) {
+            for (int column = 0; column < columns; ++column) {
+                cells.push_back(D2D1::Point2F(
+                    (static_cast<float>(column) + 0.5f) * cellWidth,
+                    (static_cast<float>(row) + 0.5f) * cellHeight));
+            }
+        }
+
+        std::vector<Core*> cores;
+        cores.reserve(state_.cores.size());
+        for (Core& core : state_.cores) {
+            cores.push_back(&core);
+        }
+        std::stable_sort(
+            cores.begin(), cores.end(),
+            [](const Core* first, const Core* second) {
+                if (first->files.size() != second->files.size()) {
+                    return first->files.size() > second->files.size();
+                }
+                return first->id < second->id;
+            });
+
+        std::vector<bool> used(cells.size(), false);
+        const std::wstring monitorId = CurrentMonitorId();
+        for (Core* core : cores) {
+            const D2D1_POINT_2F current =
+                WorldToScreen(core->position);
+            std::size_t bestIndex = cells.size();
+            float bestDistance = FLT_MAX;
+            for (std::size_t index = 0; index < cells.size(); ++index) {
+                if (used[index]) {
+                    continue;
+                }
+                const float distance =
+                    DistanceSquared(current, cells[index]);
+                if (distance < bestDistance) {
+                    bestDistance = distance;
+                    bestIndex = index;
+                }
+            }
+            if (bestIndex == cells.size()) {
+                break;
+            }
+            used[bestIndex] = true;
+            const D2D1_POINT_2F center = cells[bestIndex];
+            core->position = ScreenToWorld(center);
+            core->xRatio = std::clamp(
+                center.x / std::max(1.0f, client.width),
+                0.0f, 1.0f);
+            core->yRatio = std::clamp(
+                center.y / std::max(1.0f, client.height),
+                0.0f, 1.0f);
+            core->monitorId = monitorId;
+        }
+
+        layoutDirty_ = true;
+        StableLayouts();
+        ScheduleSave();
+        SetStatus(
+            L"所有核心已按完整簇团分散；文件槽位、角度和相对结构保持不变");
+        Invalidate();
+    }
+
+    void ArrangeAllCores() {
+        if (state_.cores.empty()) {
+            return;
+        }
+        bool preserveManual = true;
+        const bool hasManual = std::any_of(
+            state_.cores.begin(), state_.cores.end(),
+            [this](const Core& core) {
+                return HasManualLayout(core);
+            });
+        if (hasManual) {
+            const ManualArrangeChoice choice =
+                AskManualArrangeChoice();
+            if (choice == ManualArrangeChoice::Cancel) {
+                return;
+            }
+            preserveManual =
+                choice == ManualArrangeChoice::Keep;
+        }
+
+        for (const Core& core : state_.cores) {
+            CaptureCoreLayout(core);
+        }
+        PushUndo(state_);
+        DisperseCores(false);
+        std::vector<std::uint64_t> coreIds;
+        coreIds.reserve(state_.cores.size());
+        for (const Core& core : state_.cores) {
+            coreIds.push_back(core.id);
+        }
+        for (const std::uint64_t coreId : coreIds) {
+            GrowCoreToSpace(
+                coreId, preserveManual, false);
+        }
+        SetStatus(
+            L"一键整理完成：先分散核心，再逐个向空白处生长");
+        Invalidate();
+    }
+
+    void SyncStoredCoreRadii(Core& core) {
+        const float baseScale = core.radiusScale * core.baselineRadiusScale;
+        core.innerRadius = kDefaultRingRadii[0] * baseScale;
+        core.middleRadius = kDefaultRingRadii[1] * baseScale;
+        core.outerRadius = kDefaultRingRadii[2] * baseScale;
+    }
+
+    void CaptureCoreBaseline(Core& core) {
+        // A baseline is an explicit user snapshot.  Keep the independent
+        // controls separate during normal editing.  Only this explicit menu
+        // command may bake a confirmed final layout into a new base.
+        const float currentInnerRadius = RingRadiusForCore(core, 0);
+        const float currentOuterRadius = RingRadiusForCore(core, 1);
+        core.baseInnerRadius = currentInnerRadius;
+        core.baseOuterRadius = currentOuterRadius;
+        core.baseRotationDegrees = NormalizeDegrees(
+            core.baseRotationDegrees + core.rotationAngle);
+        core.innerDistanceScale = 1.0f;
+        core.outerDistanceScale = 1.0f;
+        core.rotationAngle = 0.0f;
+        core.userLayoutCustomized = true;
+        core.distanceScale = 1.0f;
+        core.baselineInnerDistanceScale = core.innerDistanceScale;
+        core.baselineOuterDistanceScale = core.outerDistanceScale;
+        core.baselineRotationAngle = core.rotationAngle;
+        core.baselineUserLayoutCustomized = core.userLayoutCustomized;
+        core.baselineBaseInnerRadius = core.baseInnerRadius;
+        core.baselineBaseOuterRadius = core.baseOuterRadius;
+        core.baselineLayoutMode = core.layoutMode;
+        core.baselineLayoutTemplate = core.layoutTemplate;
+        core.baselineLayoutLocked = core.layoutLocked;
+        core.baselineBaseRotationDegrees = core.baseRotationDegrees;
+        core.baselineGrowthDirectionDegrees = core.growthDirectionDegrees;
+        core.savedBaselineLayout.clear();
+        core.savedBaselineLayout.reserve(core.files.size());
+        for (const FileItem& item : core.files) {
+            core.savedBaselineLayout.push_back(
+                {item.id, item.slot, item.ring, item.ringSlot,
+                 item.angleDegrees, item.angleOffsetDegrees, item.radiusOffset,
+                 item.manualOffset, item.manuallyMoved, item.lockedPosition});
+        }
+        core.baselineCreatedAt = UnixTimeNow();
+    }
+
+    void SaveCoreBaseline(std::uint64_t coreId) {
+        Core* core = FindCore(coreId);
+        if (core == nullptr) return;
+        PushUndo(state_);
+        CaptureCoreBaseline(*core);
+        layoutDirty_ = true;
+        ScheduleSave();
+        SetStatus(L"当前布局已保存为我的默认布局");
+        Invalidate();
+    }
+
+    void RestoreCoreBaseline(std::uint64_t coreId) {
+        Core* core = FindCore(coreId);
+        if (core == nullptr || core->savedBaselineLayout.empty()) {
+            SetStatus(L"当前核心尚未保存默认布局");
+            return;
+        }
+        PushUndo(state_);
+        core->distanceScale = 1.0f;
+        core->innerDistanceScale = core->baselineInnerDistanceScale;
+        core->outerDistanceScale = core->baselineOuterDistanceScale;
+        core->rotationAngle = core->baselineRotationAngle;
+        core->userLayoutCustomized = core->baselineUserLayoutCustomized;
+        if (core->baselineBaseInnerRadius > 0.0f &&
+            core->baselineBaseOuterRadius >
+                core->baselineBaseInnerRadius + 1.0f) {
+            core->baseInnerRadius = core->baselineBaseInnerRadius;
+            core->baseOuterRadius = core->baselineBaseOuterRadius;
+        } else {
+            // Legacy states did not persist baseline radii.  Reconstruct a
+            // stable template base instead of reusing a possibly compacted
+            // current base and multiplying the old user scales again.
+            Core reference = *core;
+            reference.layoutTemplate = core->baselineLayoutTemplate;
+            reference.userLayoutCustomized = false;
+            reference.innerDistanceScale = 1.0f;
+            reference.outerDistanceScale = 1.0f;
+            reference.rotationAngle = 0.0f;
+            core->baseInnerRadius = RingRadiusForCore(reference, 0);
+            core->baseOuterRadius = RingRadiusForCore(reference, 1);
+        }
+        core->userAdjustedAt = UnixTimeNow();
+        core->layoutMode = core->baselineLayoutMode;
+        core->layoutTemplate = core->baselineLayoutTemplate;
+        core->layoutLocked = core->baselineLayoutLocked;
+        core->baseRotationDegrees = core->baselineBaseRotationDegrees;
+        core->growthDirectionDegrees = core->baselineGrowthDirectionDegrees;
+        std::unordered_map<std::uint64_t, const CoreBaselineFileLayout*> saved;
+        for (const CoreBaselineFileLayout& baseline : core->savedBaselineLayout) {
+            saved.insert_or_assign(baseline.fileId, &baseline);
+        }
+        for (FileItem& item : core->files) {
+            const auto found = saved.find(item.id);
+            if (found == saved.end()) continue;
+            const CoreBaselineFileLayout& baseline = *found->second;
+            item.slot = baseline.slot;
+            item.ring = baseline.ring;
+            item.ringSlot = baseline.ringSlot;
+            item.angleDegrees = baseline.angleDegrees;
+            item.angleOffsetDegrees = baseline.angleOffsetDegrees;
+            item.radiusOffset = baseline.radiusOffset;
+            item.manualOffset = baseline.manualOffset;
+            item.manuallyMoved = baseline.manuallyMoved;
+            item.lockedPosition = baseline.lockedPosition;
+        }
+        layoutDirty_ = true;
+        ScheduleSave();
+        SetStatus(L"已恢复我的默认布局");
+        Invalidate();
+    }
+
+    bool HasSuspectCoreDistanceData(const Core& core) const {
+        if (!core.userLayoutCustomized ||
+            (core.innerDistanceScale >= 0.99f &&
+             core.outerDistanceScale >= 0.99f)) {
+            return false;
+        }
+        Core reference = core;
+        reference.userLayoutCustomized = false;
+        reference.innerDistanceScale = 1.0f;
+        reference.outerDistanceScale = 1.0f;
+        reference.rotationAngle = 0.0f;
+        const float recommendedInner = RingRadiusForCore(reference, 0);
+        const float recommendedOuter = RingRadiusForCore(reference, 1);
+        return core.baseInnerRadius < recommendedInner * 0.60f ||
+               core.baseOuterRadius < recommendedOuter * 0.60f;
+    }
+
+    void RepairCoreDistanceData(std::uint64_t coreId) {
+        Core* core = FindCore(coreId);
+        if (core == nullptr || !core->userLayoutCustomized) {
+            SetStatus(L"此核心尚未保存自定义布局参数");
+            return;
+        }
+        // Preserve a recoverable on-disk copy before replacing only the two
+        // base radii. Slots, file order, angles and relationships are not
+        // touched by this repair.
+        CreateHistoryBackup(true);
+        PushUndo(state_);
+        Core reference = *core;
+        reference.userLayoutCustomized = false;
+        reference.innerDistanceScale = 1.0f;
+        reference.outerDistanceScale = 1.0f;
+        reference.rotationAngle = 0.0f;
+        core->baseInnerRadius = RingRadiusForCore(reference, 0);
+        core->baseOuterRadius = RingRadiusForCore(reference, 1);
+        core->userLayoutCustomized = true;
+        core->userAdjustedAt = UnixTimeNow();
+        layoutDirty_ = true;
+        ScheduleSave();
+        RecordCoreLayoutInvariant(*core, "repair-base-radius");
+        SetStatus(L"已重建本核心距离基准；文件顺序和角度未改变");
+        Invalidate();
+    }
+
+    D2D1_RECT_F ReadableIconBounds(const Core& core,
+                                   const ItemLayout& entry) const {
+        if (entry.item == nullptr) {
+            const D2D1_POINT_2F screen = WorldToScreen(entry.position);
+            return D2D1::RectF(screen.x - 20.0f, screen.y - 12.0f,
+                               screen.x + 20.0f, screen.y + 12.0f);
+        }
+        const D2D1_POINT_2F screen = WorldToScreen(entry.position);
+        // This is deliberately smaller than the decorative icon container,
+        // but large enough to retain a distinct target for both pointer and
+        // touch interaction in a manually compacted ring.
+        const float half = std::max(18.0f,
+            ScreenItemIconSize(core, *entry.item) * 0.44f);
+        return D2D1::RectF(screen.x - half, screen.y - half,
+                           screen.x + half, screen.y + half);
+    }
+
+    DistanceScaleResult ApplyCoreLayoutAdjustmentToCachedLayout(
+        Core& core, float nextInnerDistance, float nextOuterDistance,
+        float nextRotationAngle) {
+        const auto current = layoutCache_.find(core.id);
+        if (current == layoutCache_.end() || current->second.empty()) {
+            // A collapsed core has no visible nodes. Persist the requested
+            // values; its next expansion rebuilds directly from them.
+            core.innerDistanceScale = nextInnerDistance;
+            core.outerDistanceScale = nextOuterDistance;
+            core.rotationAngle = NormalizeDegrees(nextRotationAngle);
+            core.distanceScale = 1.0f;
+            core.userLayoutCustomized = true;
+            core.userAdjustedAt = UnixTimeNow();
+            layoutDirty_ = true;
+            return {true, nextInnerDistance < 0.86f ||
+                           nextOuterDistance < 0.90f};
+        }
+
+        std::vector<ItemLayout> candidate = current->second;
+        std::unordered_map<std::uint64_t, D2D1_POINT_2F> screenDeltas;
+        const D2D1_POINT_2F center =
+            WorldToScreen(DisplayCoreWorld(core));
+
+        // Recompute every primary-ring item from immutable ring bases plus
+        // the saved per-file offsets. This is deliberately not a ratio of the
+        // previous display position: repeated previews, panel close, focus
+        // and restart therefore cannot accumulate another scale. Manual
+        // nodes participate in an explicit whole-ring adjustment while their
+        // individual angle/radius offsets remain unchanged.
+        for (ItemLayout& entry : candidate) {
+            if (entry.item == nullptr || entry.isMore || entry.isChild ||
+                entry.item->detachedFromUpper ||
+                entry.item->parentFileId != 0) {
+                continue;
+            }
+            const int ring = std::clamp(
+                entry.item->ring >= 0
+                    ? entry.item->ring
+                    : (entry.ring >= 0 ? entry.ring
+                                       : RingForSlot(entry.item->slot)),
+                0, 1);
+            const D2D1_POINT_2F previous = WorldToScreen(entry.position);
+            const float angle =
+                (entry.item->angleDegrees +
+                 core.baseRotationDegrees +
+                 NormalizeDegrees(nextRotationAngle) +
+                 entry.item->angleOffsetDegrees) *
+                kPi / 180.0f;
+            const float baseRadius =
+                ring <= 0 ? core.baseInnerRadius
+                          : core.baseOuterRadius;
+            const float distanceScale =
+                ring <= 0 ? nextInnerDistance
+                          : nextOuterDistance;
+            const float radius =
+                (baseRadius * distanceScale +
+                 entry.item->radiusOffset) *
+                state_.zoom;
+            const D2D1_POINT_2F next = D2D1::Point2F(
+                center.x + std::cos(angle) * radius +
+                    entry.item->manualOffset.x * state_.zoom,
+                center.y + std::sin(angle) * radius +
+                    entry.item->manualOffset.y * state_.zoom);
+            screenDeltas.insert_or_assign(
+                entry.item->id, D2D1::Point2F(next.x - previous.x,
+                                               next.y - previous.y));
+            entry.position = ScreenToWorld(next);
+            entry.labelRect = StableLabelRectangle(
+                next, entry.item->sizeTier, 1.0f);
+        }
+
+        // A child follows its parent as a whole. This preserves the local
+        // parent-child geometry instead of rebuilding the relationship tree.
+        for (std::size_t pass = 0; pass < candidate.size(); ++pass) {
+            bool movedChild = false;
+            for (ItemLayout& entry : candidate) {
+                if (!entry.isChild || entry.item == nullptr) continue;
+                const auto delta = screenDeltas.find(entry.item->parentFileId);
+                if (delta == screenDeltas.end() ||
+                    screenDeltas.contains(entry.item->id)) {
+                    continue;
+                }
+                const D2D1_POINT_2F previous = WorldToScreen(entry.position);
+                const D2D1_POINT_2F next = D2D1::Point2F(
+                    previous.x + delta->second.x, previous.y + delta->second.y);
+                entry.position = ScreenToWorld(next);
+                entry.labelRect = StableLabelRectangle(
+                    next, entry.item->sizeTier, 1.0f);
+                screenDeltas.insert_or_assign(entry.item->id, delta->second);
+                movedChild = true;
+            }
+            if (!movedChild) break;
+        }
+
+        const D2D1_SIZE_F client = ClientDipSize();
+        const auto footprint = [this, &core](const ItemLayout& entry) {
+            if (entry.item == nullptr) {
+                const D2D1_POINT_2F position = WorldToScreen(entry.position);
+                return D2D1::RectF(position.x - 56.0f, position.y - 14.0f,
+                                   position.x + 56.0f, position.y + 14.0f);
+            }
+            return StableFootprint(WorldToScreen(entry.position),
+                                   entry.item->sizeTier, 1.0f,
+                                   entry.showLabel);
+        };
+        std::unordered_set<std::uint64_t> movedItemIds;
+        for (const auto& [itemId, delta] : screenDeltas) {
+            if (std::abs(delta.x) > 0.01f || std::abs(delta.y) > 0.01f) {
+                movedItemIds.insert(itemId);
+            }
+        }
+        bool compact = nextInnerDistance < 0.86f || nextOuterDistance < 0.90f;
+        std::vector<std::pair<std::uint64_t, D2D1_RECT_F>> candidateBounds;
+        std::vector<std::pair<std::uint64_t, D2D1_RECT_F>> candidateIconBounds;
+        candidateBounds.reserve(candidate.size());
+        candidateIconBounds.reserve(candidate.size());
+        for (const ItemLayout& entry : candidate) {
+            const D2D1_RECT_F bounds = footprint(entry);
+            if (bounds.left < 8.0f || bounds.top < 8.0f ||
+                bounds.right > client.width - 8.0f ||
+                bounds.bottom > client.height - 8.0f) {
+                return {};
+            }
+            for (const auto& [existingId, existing] : candidateBounds) {
+                // Label/occupancy collisions are a compact-layout warning.
+                // They are permitted for a deliberate manual adjustment.
+                if ((movedItemIds.contains(entry.item == nullptr ? 0 : entry.item->id) ||
+                     movedItemIds.contains(existingId)) &&
+                    RectanglesIntersect(InflateRectangle(bounds, 4.0f),
+                                        InflateRectangle(existing, 4.0f))) {
+                    compact = true;
+                }
+            }
+            const std::uint64_t itemId = entry.item == nullptr ? 0 : entry.item->id;
+            const D2D1_RECT_F iconBounds = ReadableIconBounds(core, entry);
+            for (const auto& [existingId, existing] : candidateIconBounds) {
+                if ((movedItemIds.contains(itemId) || movedItemIds.contains(existingId)) &&
+                    RectanglesIntersect(iconBounds, existing)) {
+                    compact = true;
+                    const float deltaX =
+                        (iconBounds.left + iconBounds.right -
+                         existing.left - existing.right) /
+                        2.0f;
+                    const float deltaY =
+                        (iconBounds.top + iconBounds.bottom -
+                         existing.top - existing.bottom) /
+                        2.0f;
+                    constexpr float hardSeparation = 14.0f;
+                    if (deltaX * deltaX + deltaY * deltaY <
+                        hardSeparation * hardSeparation) {
+                        return {};
+                    }
+                }
+            }
+            candidateBounds.emplace_back(itemId, bounds);
+            candidateIconBounds.emplace_back(itemId, iconBounds);
+        }
+
+        for (const auto& [otherCoreId, otherLayout] : layoutCache_) {
+            if (otherCoreId == core.id) continue;
+            const Core* otherCore = FindCore(otherCoreId);
+            if (otherCore == nullptr || otherCore->archived) continue;
+            for (const ItemLayout& entry : otherLayout) {
+                const D2D1_RECT_F otherBounds = entry.item == nullptr
+                    ? D2D1::RectF(WorldToScreen(entry.position).x - 56.0f,
+                                  WorldToScreen(entry.position).y - 14.0f,
+                                  WorldToScreen(entry.position).x + 56.0f,
+                                  WorldToScreen(entry.position).y + 14.0f)
+                    : StableFootprint(WorldToScreen(entry.position),
+                                      entry.item->sizeTier, 1.0f,
+                                      entry.showLabel);
+                for (const auto& [itemId, bounds] : candidateBounds) {
+                    if (movedItemIds.contains(itemId) &&
+                        RectanglesIntersect(InflateRectangle(bounds, 20.0f),
+                                            InflateRectangle(otherBounds, 8.0f))) {
+                        compact = true;
+                    }
+                }
+                if (entry.item != nullptr) {
+                    const D2D1_RECT_F otherIconBounds =
+                        ReadableIconBounds(*otherCore, entry);
+                    for (const auto& [itemId, iconBounds] : candidateIconBounds) {
+                        if (movedItemIds.contains(itemId) &&
+                            RectanglesIntersect(iconBounds, otherIconBounds)) {
+                            compact = true;
+                        }
+                    }
+                }
+            }
+        }
+
+        for (const Core& otherCore : state_.cores) {
+            if (otherCore.archived) continue;
+            const D2D1_POINT_2F otherCenter =
+                WorldToScreen(DisplayCoreWorld(otherCore));
+            const float half = metrics_.coreSize * state_.zoom *
+                CoreFormalLayoutScale(otherCore) / 2.0f + 8.0f;
+            const D2D1_RECT_F body = D2D1::RectF(
+                otherCenter.x - half, otherCenter.y - half,
+                otherCenter.x + half, otherCenter.y + half);
+            for (const auto& [itemId, bounds] : candidateBounds) {
+                if (movedItemIds.contains(itemId) &&
+                    RectanglesIntersect(bounds, body)) compact = true;
+            }
+            for (const auto& [itemId, iconBounds] : candidateIconBounds) {
+                if (!movedItemIds.contains(itemId) ||
+                    !RectanglesIntersect(iconBounds, body)) {
+                    continue;
+                }
+                if (otherCore.id == core.id) {
+                    return {};
+                }
+                compact = true;
+            }
+        }
+
+        core.innerDistanceScale = nextInnerDistance;
+        core.outerDistanceScale = nextOuterDistance;
+        core.rotationAngle = NormalizeDegrees(nextRotationAngle);
+        core.distanceScale = 1.0f;
+        core.userLayoutCustomized = true;
+        core.userAdjustedAt = UnixTimeNow();
+        layoutDirty_ = true;
+        StableLayouts();
+        return {true, compact};
+    }
+
+    bool SetCoreLayoutControlValue(std::uint64_t coreId,
+                                   CoreLayoutControl control, float value) {
+        Core* core = FindCore(coreId);
+        if (core == nullptr) return false;
+        if (!core->userLayoutCustomized) {
+            // Freeze the exact automatic proposal once, before the first
+            // manual edit.  Every later preview and rebuild refers to these
+            // immutable values instead of a previous runtime position.
+            core->baseInnerRadius = RingRadiusForCore(*core, 0);
+            core->baseOuterRadius = RingRadiusForCore(*core, 1);
+        }
+        float nextInner = core->innerDistanceScale;
+        float nextOuter = core->outerDistanceScale;
+        float nextRotation = core->rotationAngle;
+        if (control == CoreLayoutControl::InnerDistance) {
+            nextInner = std::clamp(value, 0.60f, 1.40f);
+            if (std::abs(nextInner - 1.0f) < 0.025f) nextInner = 1.0f;
+        } else if (control == CoreLayoutControl::OuterDistance) {
+            nextOuter = std::clamp(value, 0.70f, 1.60f);
+            if (std::abs(nextOuter - 1.0f) < 0.025f) nextOuter = 1.0f;
+        } else if (control == CoreLayoutControl::Rotation) {
+            nextRotation = NormalizeDegrees(value);
+        } else {
+            return false;
+        }
+        if (std::abs(core->innerDistanceScale - nextInner) < 0.0001f &&
+            std::abs(core->outerDistanceScale - nextOuter) < 0.0001f &&
+            std::abs(core->rotationAngle - nextRotation) < 0.0001f) {
+            distanceLimitReached_ = false;
+            distanceCompactWarning_ = nextInner < 0.86f || nextOuter < 0.90f;
+            return true;
+        }
+        const DistanceScaleResult result =
+            ApplyCoreLayoutAdjustmentToCachedLayout(*core, nextInner,
+                                                    nextOuter, nextRotation);
+        distanceLimitReached_ = !result.applied;
+        distanceCompactWarning_ = result.applied && result.compact;
+        if (result.applied) {
+            TraceCoreLayoutAdjustment(*core, "slider-preview");
+            Invalidate();
+        }
+        return result.applied;
+    }
+
+    void OpenDataFolder() {
+        const std::filesystem::path folder = stateFile_.parent_path();
+        std::error_code error;
+        std::filesystem::create_directories(folder, error);
+        if (error) {
+            SetStatus(L"无法创建数据目录");
+            return;
+        }
+        if (reinterpret_cast<INT_PTR>(ShellExecuteW(
+                window_, L"open", folder.c_str(), nullptr, nullptr,
+                SW_SHOWNORMAL)) <= 32) {
+            SetStatus(L"无法打开数据目录");
+        }
+        Invalidate();
+    }
+
+    void ShowCoreFileList(std::uint64_t coreId, int x, int y) {
+        Core* core = FindCore(coreId);
+        if (core == nullptr || core->files.empty()) {
+            return;
+        }
+        std::vector<FileItem*> items;
+        items.reserve(core->files.size());
+        for (FileItem& item : core->files) {
+            items.push_back(&item);
+        }
+        std::stable_sort(
+            items.begin(), items.end(),
+            [this, core](const FileItem* first,
+                         const FileItem* second) {
+                const int firstScore = PriorityScore(*core, *first);
+                const int secondScore = PriorityScore(*core, *second);
+                return firstScore != secondScore
+                           ? firstScore > secondScore
+                           : first->id < second->id;
+            });
+
+        HMENU menu = CreatePopupMenu();
+        if (menu == nullptr) {
+            return;
+        }
+        const std::wstring summary =
+            L"当前最多显示 " +
+            std::to_wstring(
+                TemplateVisibleLimit(core->layoutTemplate)) + L" / 共 " +
+            std::to_wstring(core->files.size());
+        AppendMenuW(menu, MF_STRING | MF_DISABLED, 0,
+                    summary.c_str());
+        AppendMenuW(menu, MF_SEPARATOR, 0, nullptr);
+        constexpr UINT firstCommand = 24000;
+        for (std::size_t index = 0; index < items.size(); ++index) {
+            const std::wstring name = Shorten(
+                items[index]->originalName.empty()
+                    ? FileDisplayName(items[index]->path)
+                    : items[index]->originalName,
+                36);
+            AppendMenuW(
+                menu, MF_STRING,
+                firstCommand + static_cast<UINT>(index),
+                name.c_str());
+        }
+        POINT screen{x, y};
+        ClientToScreen(window_, &screen);
+        const UINT command = TrackPopupMenuPreservingSelection(
+            menu, TPM_RETURNCMD | TPM_RIGHTBUTTON,
+            screen.x, screen.y);
+        DestroyMenu(menu);
+        if (command >= firstCommand &&
+            command < firstCommand + items.size()) {
+            OpenItem(coreId,
+                     items[command - firstCommand]->id);
+        }
+    }
+
+    void OnLeftButtonDown(int x, int y) {
+        EndRename(true);
+        const D2D1_POINT_2F dip = PixelToDip(x, y);
+        if (state_.workspaceCollapsed) {
+            SetWorkspaceCollapsed(false);
+            return;
+        }
+        if (HandleTutorialClick(dip)) {
+            return;
+        }
+        if (state_.workspacePaused) return;
+        if (corePlacementMode_) {
+            for (int index = 0;
+                 index < kWorkspaceControlCount;
+                 ++index) {
+                if (!PointInside(
+                        dip,
+                        WorkspaceControlRectangle(
+                            ClientDipSize(), index))) {
+                    continue;
+                }
+                CancelCorePlacementMode();
+                if (index != 0) {
+                    HandleWorkspaceChromePointer(dip);
+                }
+                return;
+            }
+            CompleteCorePlacement(dip);
+            return;
+        }
+        if (HandleCoreAppearancePanelPointer(dip)) {
+            return;
+        }
+        if (HandleCoreDistanceSliderPointer(dip)) {
+            return;
+        }
+        if (IsDividerHit(dip)) {
+            BeginDividerDrag(x, y);
+            return;
+        }
+        if (HandleWorkspaceChromePointer(dip)) {
+            return;
+        }
+        if (IsFreshWorkspaceEmpty()) {
+            if (PointInside(dip, EmptyCreateButtonRectangle(ClientDipSize()))) {
+                CreateCore(ScreenToWorld(D2D1::Point2F(
+                    ClientDipSize().width * 0.5f, ClientDipSize().height * 0.5f)));
+            }
+            return;
+        }
+        const D2D1_POINT_2F world = ScreenToWorld(dip);
+        if ((GetKeyState(VK_SPACE) & 0x8000) != 0) {
+            BeginPan(x, y);
+            return;
+        }
+
+        const HitResult hit = HitTest(world);
+        if (hit.kind == HitKind::Item) {
+            if (FileItem* item = FindItem(hit.coreId, hit.itemId);
+                item != nullptr) {
+                if (Core* core = FindCore(hit.coreId); core != nullptr &&
+                    ChildCount(*core, item->id) > 0) {
+                    const auto found = layoutCache_.find(hit.coreId);
+                    if (found != layoutCache_.end()) {
+                        const auto entry = std::find_if(found->second.begin(), found->second.end(),
+                            [item](const ItemLayout& candidate) {
+                                return candidate.item != nullptr && candidate.item->id == item->id;
+                            });
+                        if (entry != found->second.end()) {
+                            const D2D1_POINT_2F p = WorldToScreen(entry->position);
+                            const float half = TierContainerPixels(item->sizeTier) *
+                                               ItemVisualScale(*core, *item) / 2.0f;
+                            const D2D1_POINT_2F badge = D2D1::Point2F(
+                                p.x + half * 0.72f, p.y - half * 0.72f);
+                            const D2D1_POINT_2F screen = PixelToDip(x, y);
+                            if (DistanceSquared(screen, badge) <= 144.0f) {
+                                PushUndo(state_);
+                                item->childrenCollapsed = !item->childrenCollapsed;
+                                layoutDirty_ = true;
+                                ScheduleSave();
+                                SetStatus(item->childrenCollapsed ? L"子树已收起" : L"子树已展开");
+                                Invalidate();
+                                return;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        if (hit.kind == HitKind::More) {
+            ShowCoreFileList(hit.coreId, x, y);
+            SetSelection({HitKind::Core, hit.coreId, 0}, true);
+            hover_ = {};
+            UpdateMarqueeTimerForHover();
+            Invalidate();
+            return;
+        }
+        if (hit.kind == HitKind::None && focusedCoreId_ != 0) {
+            BeginUnfocusTransition();
+            ClearSelection();
+            hover_ = {};
+            Invalidate();
+            return;
+        }
+        SetSelection(hit);
+        pointerStartDip_ = dip;
+        pointerStartWorld_ = world;
+        dragWorld_ = world;
+        dragMoved_ = false;
+        dragSnapshot_ = state_;
+        if (hit.kind == HitKind::Core) {
+            draggingCore_ = true;
+            dragCoreId_ = hit.coreId;
+            if (Core* core = FindCore(hit.coreId)) {
+                coreStartPosition_ = core->position;
+            }
+            SetCapture(window_);
+        } else if (hit.kind == HitKind::Item) {
+            draggingItem_ = true;
+            dragCoreId_ = hit.coreId;
+            dragItemId_ = hit.itemId;
+            if (Core* core = FindCore(hit.coreId)) {
+                if (FileItem* item = FindItem(hit.coreId, hit.itemId)) {
+                    dragItemStartWorld_ =
+                        BaseDisplayItemPosition(*core, *item);
+                    if (const auto found = layoutCache_.find(hit.coreId);
+                        found != layoutCache_.end()) {
+                        const auto entry = std::find_if(
+                            found->second.begin(), found->second.end(),
+                            [&hit](const ItemLayout& candidate) {
+                                return candidate.item != nullptr &&
+                                       candidate.item->id == hit.itemId;
+                            });
+                        if (entry != found->second.end()) {
+                            dragItemStartWorld_ = entry->position;
+                        }
+                    }
+                    dragWorld_ = dragItemStartWorld_;
+                }
+            }
+            SetCapture(window_);
+        } else {
+            BeginPan(x, y);
+        }
+        Invalidate();
+    }
+
+    void OnLeftButtonUp(int x, int y) {
+        if (draggingCoreAppearancePanel_) {
+            draggingCoreAppearancePanel_ = false;
+            if (GetCapture() == window_) ReleaseCapture();
+            Invalidate();
+            return;
+        }
+        if (draggingCoreAppearanceSlider_) {
+            EndCoreAppearanceSliderDrag(true);
+            return;
+        }
+        if (draggingCoreDistancePanel_) {
+            draggingCoreDistancePanel_ = false;
+            if (GetCapture() == window_) ReleaseCapture();
+            Invalidate();
+            return;
+        }
+        if (draggingCoreDistanceSlider_) {
+            EndCoreDistanceSliderDrag(true);
+            return;
+        }
+        if (draggingDivider_) {
+            UpdateWorkspaceRatioFromScreenPoint(x, y);
+            EndDividerDrag();
+            return;
+        }
+        const D2D1_POINT_2F world = ScreenToWorld(PixelToDip(x, y));
+        if (draggingCore_ && dragMoved_) {
+            StableLayouts();
+            if (Core* core = FindCore(dragCoreId_)) {
+                core->position = DisplayCoreWorld(*core);
+                layoutDirty_ = true;
+            }
+            PushUndo(std::move(dragSnapshot_));
+            ScheduleSave();
+            WarnIfClustersOverlap(dragCoreId_);
+        } else if (draggingCore_ && !dragMoved_) {
+            // Ordinary desktop click selects a core.  It must not enter the
+            // dimming focus mode or change any geometry.
+            SetSelection({HitKind::Core, dragCoreId_, 0}, true);
+        }
+        if (draggingItem_ && dragMoved_) {
+            const bool relationshipReady = relationTargetItemId_ != 0 &&
+                std::chrono::duration_cast<std::chrono::milliseconds>(
+                    std::chrono::steady_clock::now() - relationHoverStarted_).count() >=
+                    kRelationHoverDelayMs;
+            if (relationshipReady) {
+                EstablishParentRelation(dragCoreId_, dragItemId_,
+                                        relationTargetCoreId_, relationTargetItemId_,
+                                        dragItemStartWorld_);
+            } else {
+            const std::uint64_t targetId = DropCoreAt(world);
+            FileItem* draggedItem = FindItem(dragCoreId_, dragItemId_);
+            const HitResult dropHit = HitTest(world);
+            const bool connectToCore = draggedItem != nullptr && targetId != 0 &&
+                (draggedItem->detachedFromUpper ||
+                 (draggedItem->parentFileId != 0 && dropHit.kind == HitKind::Core));
+            if (connectToCore) {
+                AttachItemToCore(dragCoreId_, dragItemId_, targetId,
+                                 std::move(dragSnapshot_));
+            } else if (targetId != 0 && targetId != dragCoreId_) {
+                MoveItemToCore(dragCoreId_, dragItemId_, targetId, std::move(dragSnapshot_));
+            } else {
+                FileItem* item = FindItem(dragCoreId_, dragItemId_);
+                if (item != nullptr) {
+                    Core* core = FindCore(dragCoreId_);
+                    D2D1_POINT_2F desired =
+                        WorldToScreen(dragWorld_);
+                    if (core != nullptr) {
+                        if (item->detachedFromUpper) {
+                            PushUndo(std::move(dragSnapshot_));
+                            // An independent file is deliberately outside the
+                            // core ring. Dragging it only updates its saved
+                            // world position; it must never snap back to the
+                            // core or alter unrelated files.
+                            item->detachedWorldPosition = dragWorld_;
+                            layoutDirty_ = true;
+                            ScheduleSave();
+                            SetStatus(L"独立文件位置已保存");
+                        } else if (item->parentFileId != 0) {
+                            const auto found = layoutCache_.find(core->id);
+                            if (found != layoutCache_.end()) {
+                                const auto parentEntry = std::find_if(
+                                    found->second.begin(), found->second.end(),
+                                    [item](const ItemLayout& entry) {
+                                        return entry.item != nullptr &&
+                                               entry.item->id == item->parentFileId;
+                                    });
+                                if (parentEntry != found->second.end()) {
+                                const D2D1_POINT_2F parent = WorldToScreen(parentEntry->position);
+                                const float deltaX = desired.x - parent.x;
+                                const float deltaY = desired.y - parent.y;
+                                PushUndo(std::move(dragSnapshot_));
+                                item->relativeAngle = NormalizeDegrees(
+                                    std::atan2(deltaY, deltaX) * 180.0f / kPi);
+                                item->relativeRadius = std::clamp(
+                                    std::sqrt(deltaX*deltaX + deltaY*deltaY) / state_.zoom,
+                                    36.0f, 8192.0f);
+                                item->relativeManualOffset = D2D1::Point2F();
+                                item->relativeManualLock = true;
+                                layoutDirty_ = true;
+                                ScheduleSave();
+                                SetStatus(L"子文件位置已相对父文件锁定");
+                                }
+                            }
+                        } else {
+                        const D2D1_POINT_2F center =
+                            WorldToScreen(DisplayCoreWorld(*core));
+                        bool compact = false;
+                        const auto currentLayout =
+                            layoutCache_.find(core->id);
+                        if (currentLayout != layoutCache_.end()) {
+                            for (const ItemLayout& other :
+                                 currentLayout->second) {
+                                if (other.item == nullptr ||
+                                    other.item->id == item->id ||
+                                    other.isMore) {
+                                    continue;
+                                }
+                                const D2D1_POINT_2F otherScreen =
+                                    WorldToScreen(other.position);
+                                float awayX =
+                                    desired.x - otherScreen.x;
+                                float awayY =
+                                    desired.y - otherScreen.y;
+                                float separation = std::sqrt(
+                                    awayX * awayX + awayY * awayY);
+                                constexpr float minimumSeparation =
+                                    14.0f;
+                                if (separation < minimumSeparation) {
+                                    compact = true;
+                                    if (separation < 0.01f) {
+                                        awayX =
+                                            desired.x - center.x;
+                                        awayY =
+                                            desired.y - center.y;
+                                        separation = std::sqrt(
+                                            awayX * awayX +
+                                            awayY * awayY);
+                                    }
+                                    if (separation < 0.01f) {
+                                        awayX = 1.0f;
+                                        awayY = 0.0f;
+                                        separation = 1.0f;
+                                    }
+                                    desired = D2D1::Point2F(
+                                        otherScreen.x +
+                                            awayX / separation *
+                                                minimumSeparation,
+                                        otherScreen.y +
+                                            awayY / separation *
+                                                minimumSeparation);
+                                } else {
+                                    const D2D1_RECT_F desiredBounds =
+                                        StableFootprint(
+                                            desired,
+                                            item->sizeTier,
+                                            1.0f, true);
+                                    const D2D1_RECT_F otherBounds =
+                                        StableFootprint(
+                                            otherScreen,
+                                            other.item->sizeTier,
+                                            1.0f,
+                                            other.showLabel);
+                                    compact = compact ||
+                                        RectanglesIntersect(
+                                            desiredBounds,
+                                            otherBounds);
+                                }
+                            }
+                        }
+
+                        float vectorX = desired.x - center.x;
+                        float vectorY = desired.y - center.y;
+                        float desiredRadius = std::sqrt(
+                            vectorX * vectorX + vectorY * vectorY);
+                        const float minimumCoreDistance =
+                            (metrics_.coreSize *
+                                 CoreFormalLayoutScale(*core) /
+                                 2.0f +
+                             12.0f) *
+                            state_.zoom;
+                        if (desiredRadius < minimumCoreDistance) {
+                            compact = true;
+                            if (desiredRadius < 0.01f) {
+                                vectorX = 1.0f;
+                                vectorY = 0.0f;
+                                desiredRadius = 1.0f;
+                            }
+                            desired = D2D1::Point2F(
+                                center.x +
+                                    vectorX / desiredRadius *
+                                        minimumCoreDistance,
+                                center.y +
+                                    vectorY / desiredRadius *
+                                        minimumCoreDistance);
+                        }
+
+                        D2D1_RECT_F desiredBounds =
+                            StableFootprint(
+                                desired, item->sizeTier,
+                                1.0f, true);
+                        const D2D1_SIZE_F client =
+                            ClientDipSize();
+                        constexpr float margin = 8.0f;
+                        if (desiredBounds.left < margin) {
+                            desired.x +=
+                                margin - desiredBounds.left;
+                        }
+                        if (desiredBounds.right >
+                            client.width - margin) {
+                            desired.x -=
+                                desiredBounds.right -
+                                client.width + margin;
+                        }
+                        if (desiredBounds.top < margin) {
+                            desired.y +=
+                                margin - desiredBounds.top;
+                        }
+                        if (desiredBounds.bottom >
+                            client.height - margin) {
+                            desired.y -=
+                                desiredBounds.bottom -
+                                client.height + margin;
+                        }
+
+                        vectorX = desired.x - center.x;
+                        vectorY = desired.y - center.y;
+                        desiredRadius = std::sqrt(
+                            vectorX * vectorX + vectorY * vectorY);
+                        const float desiredAngle =
+                            NormalizeDegrees(
+                                std::atan2(vectorY, vectorX) *
+                                180.0f / kPi);
+                        const int ring =
+                            std::clamp(
+                                item->ring >= 0
+                                    ? item->ring
+                                    : RingForSlot(item->slot),
+                                0, 1);
+                        const float baseRadius =
+                            RingRadiusForCore(*core, ring);
+                        PushUndo(std::move(dragSnapshot_));
+                        item->angleDegrees = NormalizeDegrees(
+                            desiredAngle -
+                            EffectiveCoreRotationDegrees(*core));
+                        item->angleOffsetDegrees = 0.0f;
+                        item->radiusOffset =
+                            desiredRadius /
+                                std::max(0.01f, state_.zoom) -
+                            baseRadius;
+                        item->manualOffset =
+                            D2D1::Point2F();
+                        item->manuallyMoved = true;
+                        item->lockedPosition = true;
+                        layoutDirty_ = true;
+                        StableLayouts();
+                        ScheduleSave();
+                        SetStatus(
+                            compact
+                                ? L"文件位置已保存；当前位置较紧凑"
+                                : L"文件距离和角度已单独保存");
+                        }
+                    }
+                }
+            }
+            }
+        }
+        EndPointerOperation();
+        SyncCoreSelectionRippleTimer();
+        Invalidate();
+    }
+
+    void OnDoubleClick(int x, int y) {
+        const D2D1_POINT_2F dip = PixelToDip(x, y);
+        if (corePlacementMode_) {
+            return;
+        }
+        if (CoreAppearancePanelOpen()) {
+            // Appearance panel interaction is isolated from the canvas.  A
+            // double-click on it must never expand, move or otherwise touch
+            // the core below the panel.
+            return;
+        }
+        if (CoreDistanceSliderOpen()) {
+            const D2D1_RECT_F track = CoreLayoutControlTrackRectangle(
+                ClientDipSize(), activeCoreLayoutControl_);
+            if (dip.x >= track.left - 14.0f && dip.x <= track.right + 38.0f &&
+                dip.y >= track.top - 16.0f && dip.y <= track.bottom + 16.0f) {
+                PushUndo(state_);
+                SetCoreLayoutControlValue(coreDistanceSliderCoreId_,
+                    activeCoreLayoutControl_,
+                    activeCoreLayoutControl_ == CoreLayoutControl::Rotation
+                        ? 0.0f : 1.0f);
+                ScheduleSave(false);
+                if (const Core* core =
+                        FindCore(coreDistanceSliderCoreId_)) {
+                    RecordCoreLayoutInvariant(*core, "slider-reset");
+                }
+                SetStatus(L"当前布局控制已恢复为默认值");
+                return;
+            }
+        }
+        if (IsDividerHit(dip)) {
+            SetWorkspaceRatio(0.50f, true);
+            SetStatus(L"右侧工作区已恢复默认 50% 宽度");
+            return;
+        }
+        const HitResult hit = HitTest(ScreenToWorld(dip));
+        if (hit.kind == HitKind::More) {
+            ShowCoreFileList(hit.coreId, x, y);
+            SetSelection({HitKind::Core, hit.coreId, 0}, true);
+            Invalidate();
+        } else if (hit.kind == HitKind::Core) {
+            if (Core* core = FindCore(hit.coreId)) {
+                PushUndo(state_);
+                ToggleCoreExpansion(*core);
+                SetSelection(hit, true);
+                ScheduleSave();
+                Invalidate();
+            }
+        } else if (hit.kind == HitKind::Item) {
+            SetSelection(hit);
+            OpenItem(hit.coreId, hit.itemId);
+        }
+    }
+
+    void BeginPan(int x, int y) {
+        EndRename(true);
+        panning_ = true;
+        pointerStartDip_ = PixelToDip(x, y);
+        panStartOffset_ = state_.viewOffset;
+        SetCapture(window_);
+    }
+
+    void UpdateMarqueeTimerForHover() {
+        bool active = false;
+        if (hover_.kind == HitKind::Item) {
+            if (const FileItem* item =
+                    FindItem(hover_.coreId, hover_.itemId)) {
+                active = NeedsMarquee(*item);
+            }
+        }
+        if (active &&
+            (!hasMarqueeLabels_ || marqueeItemId_ != hover_.itemId)) {
+            marqueeStarted_ = std::chrono::steady_clock::now();
+        }
+        hasMarqueeLabels_ = active;
+        marqueeItemId_ = active ? hover_.itemId : 0;
+        if (window_ != nullptr) {
+            if (active) {
+                SetTimer(window_, kMarqueeTimer, 16, nullptr);
+            } else {
+                KillTimer(window_, kMarqueeTimer);
+            }
+        }
+    }
+
+    void OnPointerLeave() {
+        mouseTracking_ = false;
+        if (!draggingDivider_) {
+            dividerHovered_ = false;
+        }
+        if (appearancePreviewColor_.has_value()) {
+            appearancePreviewColor_.reset();
+        }
+        hover_ = {};
+        KillTimer(window_, kHoverTooltipTimer);
+        UpdateMarqueeTimerForHover();
+        Invalidate();
+    }
+
+    void SetInteractionCursor(HWND source) {
+        POINT cursor{};
+        GetCursorPos(&cursor);
+        ScreenToClient(source, &cursor);
+        const D2D1_POINT_2F dip =
+            PixelToDip(cursor.x, cursor.y);
+        const bool onDistancePanel =
+            CoreDistanceSliderOpen() &&
+            PointInside(
+                dip,
+                CoreDistanceSliderCardRectangle(ClientDipSize()));
+        const bool onAppearancePanel =
+            CoreAppearancePanelOpen() &&
+            PointInside(
+                dip,
+                CoreAppearancePanelRectangle(ClientDipSize()));
+        bool onControl = false;
+        for (int index = 0;
+             index < kWorkspaceControlCount;
+             ++index) {
+            onControl = onControl ||
+                PointInside(
+                    dip,
+                    WorkspaceControlRectangle(ClientDipSize(), index));
+        }
+        const HitResult hit = HitTest(ScreenToWorld(dip));
+        if (corePlacementMode_) {
+            SetCursor(LoadCursorW(nullptr, IDC_CROSS));
+        } else if (IsDividerHit(dip) || draggingDivider_) {
+            SetCursor(LoadCursorW(nullptr, IDC_SIZEWE));
+        } else {
+            SetCursor(LoadCursorW(
+                nullptr,
+                onDistancePanel || onAppearancePanel || onControl ||
+                        hit.kind != HitKind::None
+                    ? IDC_HAND
+                    : IDC_ARROW));
+        }
+    }
+
+    void OnMouseMove(int x, int y) {
+        if (!mouseTracking_) {
+            TRACKMOUSEEVENT tracking{
+                sizeof(tracking), TME_LEAVE,
+                interactionWindow_ != nullptr
+                    ? interactionWindow_
+                    : window_,
+                0};
+            TrackMouseEvent(&tracking);
+            mouseTracking_ = true;
+        }
+
+        const D2D1_POINT_2F dip = PixelToDip(x, y);
+        if (corePlacementMode_) {
+            corePlacementPreviewDip_ = dip;
+            Invalidate();
+            return;
+        }
+        if (draggingCoreAppearancePanel_) {
+            coreAppearancePanelAnchorDip_ = D2D1::Point2F(
+                dip.x - coreAppearancePanelDragOffsetDip_.x + 18.0f,
+                dip.y - coreAppearancePanelDragOffsetDip_.y - 12.0f);
+            Invalidate();
+            return;
+        }
+        if (draggingCoreAppearanceSlider_) {
+            SetCoreAppearanceControlValue(coreAppearancePanelCoreId_,
+                activeCoreAppearanceControl_,
+                CoreAppearanceValueFromSliderX(
+                    dip.x, activeCoreAppearanceControl_));
+            return;
+        }
+        if (CoreAppearancePanelOpen()) {
+            UpdateAppearanceColorPreview(dip);
+            if (PointInside(dip,
+                            CoreAppearancePanelRectangle(ClientDipSize()))) {
+                return;
+            }
+        }
+        if (draggingCoreDistancePanel_) {
+            coreDistanceSliderAnchorDip_ = D2D1::Point2F(
+                dip.x - coreDistancePanelDragOffsetDip_.x + 18.0f,
+                dip.y - coreDistancePanelDragOffsetDip_.y - 12.0f);
+            Invalidate();
+            return;
+        }
+        if (draggingCoreDistanceSlider_) {
+            SetCoreLayoutControlValue(coreDistanceSliderCoreId_,
+                activeCoreLayoutControl_,
+                CoreLayoutControlValueFromSliderX(
+                    dip.x, activeCoreLayoutControl_));
+            return;
+        }
+        if (draggingDivider_) {
+            UpdateWorkspaceRatioFromScreenPoint(x, y);
+            return;
+        }
+        const bool dividerHovered = IsDividerHit(dip);
+        if (dividerHovered_ != dividerHovered) {
+            dividerHovered_ = dividerHovered;
+            Invalidate();
+        }
+        const D2D1_POINT_2F world = ScreenToWorld(dip);
+        if (panning_) {
+            state_.viewOffset.x = panStartOffset_.x + dip.x - pointerStartDip_.x;
+            state_.viewOffset.y = panStartOffset_.y + dip.y - pointerStartDip_.y;
+            dragMoved_ = true;
+            ScheduleSave();
+            Invalidate();
+            return;
+        }
+
+        const float moved = DistanceSquared(dip, pointerStartDip_);
+        if (draggingCore_) {
+            if (moved > 9.0f) {
+                dragMoved_ = true;
+            }
+            if (dragMoved_) {
+                if (Core* core = FindCore(dragCoreId_)) {
+                    core->position.x = coreStartPosition_.x + world.x - pointerStartWorld_.x;
+                    core->position.y = coreStartPosition_.y + world.y - pointerStartWorld_.y;
+                }
+                layoutDirty_ = true;
+                Invalidate();
+            }
+            return;
+        }
+        if (draggingItem_) {
+            if (moved > 9.0f) {
+                dragMoved_ = true;
+            }
+            dragWorld_ = D2D1::Point2F(
+                dragItemStartWorld_.x + world.x - pointerStartWorld_.x,
+                dragItemStartWorld_.y + world.y - pointerStartWorld_.y);
+            dragTargetCoreId_ = dragMoved_ ? DropCoreAt(world) : 0;
+            const HitResult target = dragMoved_ ? HitTest(world) : HitResult{};
+            const bool validTarget = target.kind == HitKind::Item &&
+                target.itemId != dragItemId_;
+            if (validTarget && (target.itemId != relationTargetItemId_ ||
+                                target.coreId != relationTargetCoreId_)) {
+                relationTargetItemId_ = target.itemId;
+                relationTargetCoreId_ = target.coreId;
+                relationHoverStarted_ = std::chrono::steady_clock::now();
+                SetTimer(window_, kRelationPreviewTimer, kRelationHoverDelayMs, nullptr);
+            } else if (!validTarget) {
+                relationTargetItemId_ = 0;
+                relationTargetCoreId_ = 0;
+                KillTimer(window_, kRelationPreviewTimer);
+            }
+            Invalidate();
+            return;
+        }
+
+        const HitResult hit = HitTest(world);
+        if (hit != hover_) {
+            hover_ = hit;
+            hoverStarted_ =
+                std::chrono::steady_clock::now();
+            if (window_ != nullptr) {
+                KillTimer(window_, kHoverTooltipTimer);
+                if (hover_.kind == HitKind::Item) {
+                    SetTimer(
+                        window_, kHoverTooltipTimer,
+                        kHoverTooltipDelayMs, nullptr);
+                }
+            }
+            UpdateMarqueeTimerForHover();
+            Invalidate();
+        }
+    }
+
+    void EndPointerOperation() {
+        if (GetCapture() == window_) {
+            ReleaseCapture();
+        }
+        CancelPointerOperation();
+    }
+
+    void CancelPointerOperation() {
+        if (draggingCoreAppearancePanel_ &&
+            GetCapture() == window_) {
+            ReleaseCapture();
+        }
+        draggingCoreAppearancePanel_ = false;
+        if (draggingCoreAppearanceSlider_) {
+            EndCoreAppearanceSliderDrag(false);
+        }
+        if (draggingCoreDistancePanel_ &&
+            GetCapture() == window_) {
+            ReleaseCapture();
+        }
+        draggingCoreDistancePanel_ = false;
+        if (draggingCoreDistanceSlider_) {
+            EndCoreDistanceSliderDrag(false);
+        }
+        draggingDivider_ = false;
+        dividerHovered_ = false;
+        panning_ = false;
+        draggingCore_ = false;
+        draggingItem_ = false;
+        dragMoved_ = false;
+        relationTargetItemId_ = 0;
+        relationTargetCoreId_ = 0;
+        if (window_ != nullptr) KillTimer(window_, kRelationPreviewTimer);
+        dragTargetCoreId_ = 0;
+        dragCoreId_ = 0;
+        dragItemId_ = 0;
+    }
+
+    void OnMouseWheel(int screenX, int screenY, int delta) {
+        EndRename(true);
+        POINT clientPoint{screenX, screenY};
+        ScreenToClient(window_, &clientPoint);
+        const D2D1_POINT_2F dip = PixelToDip(clientPoint.x, clientPoint.y);
+        const D2D1_POINT_2F anchor = ScreenToWorld(dip);
+        const float factor = std::pow(1.12f, static_cast<float>(delta) / WHEEL_DELTA);
+        const float newZoom = std::clamp(state_.zoom * factor, 0.75f, 1.5f);
+        state_.zoom = newZoom;
+        state_.viewOffset.x = dip.x - anchor.x * newZoom;
+        state_.viewOffset.y = dip.y - anchor.y * newZoom;
+        ScheduleSave();
+        PositionEditWindow();
+        Invalidate();
+    }
+
+    void ApplyCoreThemeColor(std::uint64_t coreId, UINT32 color) {
+        Core* core = FindCore(coreId);
+        if (core == nullptr || (core->themeColor == color &&
+                                core->themeColorCustomized)) {
+            return;
+        }
+        PushUndo(state_);
+        core->themeColor = color;
+        core->themeColorCustomized = true;
+        // Theme colour is presentation state only.  It must never make the
+        // layout cache dirty or trigger a positional recomputation.
+        ScheduleSave(false);
+        SetStatus(L"核心颜色已更新");
+    }
+
+    void ShowCoreColorMenu(std::uint64_t coreId) {
+        const Core* core = FindCore(coreId);
+        if (core == nullptr) {
+            return;
+        }
+        struct Preset {
+            UINT command;
+            UINT32 color;
+            const wchar_t* name;
+        };
+        constexpr std::array<Preset, 9> presets{{
+            {MenuSetCoreColorBlue,   0x3978D3, L"蓝"},
+            {MenuSetCoreColorPurple, 0x7E69DA, L"紫"},
+            {MenuSetCoreColorPink,   0xD86A9E, L"粉"},
+            {MenuSetCoreColorRed,    0xC8545E, L"红"},
+            {MenuSetCoreColorOrange, 0xD68A2C, L"橙"},
+            {MenuSetCoreColorYellow, 0xB99A27, L"黄"},
+            {MenuSetCoreColorGreen,  0x46966B, L"绿"},
+            {MenuSetCoreColorCyan,   0x2C9BA8, L"青"},
+            {MenuSetCoreColorGray,   0x778392, L"灰"},
+        }};
+        HMENU menu = CreatePopupMenu();
+        if (menu == nullptr) {
+            return;
+        }
+        for (const Preset& preset : presets) {
+            const UINT flags = core->themeColor == preset.color
+                ? MF_STRING | MF_CHECKED
+                : MF_STRING;
+            AppendMenuW(menu, flags, preset.command, preset.name);
+        }
+        POINT point{};
+        GetCursorPos(&point);
+        const UINT command = TrackPopupMenuPreservingSelection(
+            menu, TPM_RETURNCMD | TPM_RIGHTBUTTON,
+            point.x, point.y);
+        DestroyMenu(menu);
+
+        const auto found = std::find_if(
+            presets.begin(), presets.end(),
+            [command](const Preset& preset) { return preset.command == command; });
+        if (found != presets.end()) {
+            ApplyCoreThemeColor(coreId, found->color);
+        }
+    }
+
+    HMENU CreateConnectionStyleMenu() const {
+        HMENU menu = CreatePopupMenu();
+        if (menu == nullptr) {
+            return nullptr;
+        }
+        const ConnectionWidthPreset current =
+            ConnectionWidthPresetFor(state_.connectionLineWidth);
+        AppendMenuW(
+            menu,
+            MF_STRING |
+                (current == ConnectionWidthPreset::Thin
+                     ? MF_CHECKED : 0),
+            MenuConnectionStyleThin, L"细线");
+        AppendMenuW(
+            menu,
+            MF_STRING |
+                (current == ConnectionWidthPreset::Standard
+                     ? MF_CHECKED : 0),
+            MenuConnectionStyleStandard, L"标准");
+        AppendMenuW(
+            menu,
+            MF_STRING |
+                (current == ConnectionWidthPreset::Emphasis
+                     ? MF_CHECKED : 0),
+            MenuConnectionStyleEmphasis, L"强调");
+        AppendMenuW(
+            menu,
+            MF_STRING | MF_GRAYED |
+                (current == ConnectionWidthPreset::Custom
+                     ? MF_CHECKED : 0),
+            MenuConnectionStyleCustom, L"自定义");
+        return menu;
+    }
+
+    void SetConnectionLineWidthPreset(ConnectionWidthPreset preset) {
+        float width = kConnectionLineWidthStandard;
+        const wchar_t* name = L"标准";
+        switch (preset) {
+        case ConnectionWidthPreset::Thin:
+            width = kConnectionLineWidthThin;
+            name = L"细线";
+            break;
+        case ConnectionWidthPreset::Emphasis:
+            width = kConnectionLineWidthEmphasis;
+            name = L"强调";
+            break;
+        case ConnectionWidthPreset::Standard:
+            break;
+        case ConnectionWidthPreset::Custom:
+            return;
+        }
+        if (std::abs(state_.connectionLineWidth - width) <= 0.001f) {
+            return;
+        }
+        state_.connectionLineWidth = width;
+        // Presets and the appearance slider write the same global value.
+        // No core-local multiplier or layout coordinate is touched.
+        ScheduleSave(false);
+        SetStatus(
+            std::wstring(L"连线粗细：") + name +
+            L"（全局）");
+        Invalidate();
+    }
+
+    void OnContextMenu(int x, int y) {
+        if (tutorialActive_ || state_.workspaceCollapsed || state_.workspacePaused) return;
+        if (corePlacementMode_) {
+            CancelCorePlacementMode();
+            return;
+        }
+        EndRename(true);
+        const D2D1_POINT_2F dip = PixelToDip(x, y);
+        const bool insideDistancePanel =
+            CoreDistanceSliderOpen() &&
+            PointInside(
+                dip,
+                CoreDistanceSliderCardRectangle(ClientDipSize()));
+        const bool insideAppearancePanel =
+            CoreAppearancePanelOpen() &&
+            PointInside(
+                dip,
+                CoreAppearancePanelRectangle(ClientDipSize()));
+        if (insideDistancePanel || insideAppearancePanel) {
+            return;
+        }
+        CloseTransientPanels();
+        if (IsDividerHit(dip)) {
+            ShowDividerMenu(x, y);
+            return;
+        }
+        const D2D1_POINT_2F world = ScreenToWorld(dip);
+        const HitResult hit = HitTest(world);
+        if (hit.kind == HitKind::None) {
+            // In island mode, empty desktop belongs to Explorer. The global
+            // GravityDesktop commands live on the top-right control strip.
+            return;
+        }
+        SetSelection(hit);
+        contextWorld_ = world;
+        contextDip_ = dip;
+
+        HMENU menu = CreatePopupMenu();
+        if (menu == nullptr) {
+            return;
+        }
+        if (hit.kind == HitKind::Core || hit.kind == HitKind::More) {
+            const Core* core = FindCore(hit.coreId);
+            SetSelection({HitKind::Core, hit.coreId, 0}, true);
+            AppendMenuW(menu, MF_STRING, MenuToggleCore,
+                        core != nullptr && core->expanded ? L"收起核心" : L"展开核心");
+            AppendMenuW(menu, MF_STRING, MenuRenameCore, L"重命名核心\tF2");
+            AppendMenuW(menu, MF_STRING, MenuCoreAppearanceSettings,
+                        L"核心外观设置...");
+            AppendMenuW(menu, MF_SEPARATOR, 0, nullptr);
+            AppendMenuW(menu, MF_STRING, MenuOptimizeCore,
+                        L"恢复推荐布局");
+            AppendMenuW(menu, MF_STRING, MenuKeepAngles,
+                        L"按圈均匀排列");
+            AppendMenuW(menu, MF_STRING, MenuSingleRing,
+                        L"单环均匀排列");
+            const std::size_t attachedCount =
+                core != nullptr ? AttachedFileCount(*core) : 0;
+            const std::wstring compactLabel =
+                attachedCount > 15
+                    ? L"紧凑双环（内5＋外10，当前" +
+                          std::to_wstring(attachedCount) +
+                          L"项，最多15项）"
+                    : L"紧凑双环（内5＋外10）";
+            AppendMenuW(
+                menu,
+                MF_STRING | (attachedCount > 15 ? MF_GRAYED : 0),
+                MenuCompactDouble, compactLabel.c_str());
+            const std::wstring extendedLabel =
+                attachedCount > 18
+                    ? L"扩展双环（内6＋外12，当前" +
+                          std::to_wstring(attachedCount) +
+                          L"项，最多18项）"
+                    : L"扩展双环（内6＋外12）";
+            AppendMenuW(
+                menu,
+                MF_STRING | (attachedCount > 18 ? MF_GRAYED : 0),
+                MenuHighCapacityDouble, extendedLabel.c_str());
+            AppendMenuW(menu, MF_STRING, MenuGrowToSpace,
+                        L"向空白处展开");
+            HMENU layoutAdjustmentMenu = CreatePopupMenu();
+            HMENU connectionStyleMenu = CreateConnectionStyleMenu();
+            if (layoutAdjustmentMenu != nullptr &&
+                connectionStyleMenu != nullptr) {
+                AppendMenuW(
+                    layoutAdjustmentMenu, MF_STRING,
+                    MenuAdjustCoreDistance,
+                    L"打开布局调节面板...");
+                AppendMenuW(
+                    layoutAdjustmentMenu, MF_POPUP,
+                    reinterpret_cast<UINT_PTR>(connectionStyleMenu),
+                    L"调整连线样式");
+                AppendMenuW(
+                    menu, MF_POPUP,
+                    reinterpret_cast<UINT_PTR>(layoutAdjustmentMenu),
+                    L"调整布局");
+            } else {
+                if (connectionStyleMenu != nullptr) {
+                    DestroyMenu(connectionStyleMenu);
+                }
+                if (layoutAdjustmentMenu != nullptr) {
+                    DestroyMenu(layoutAdjustmentMenu);
+                }
+                AppendMenuW(
+                    menu, MF_STRING, MenuAdjustCoreDistance,
+                    L"调整布局...");
+            }
+            AppendMenuW(menu, MF_SEPARATOR, 0, nullptr);
+            AppendMenuW(
+                menu, MF_STRING, MenuToggleLayoutLock,
+                core != nullptr && core->layoutLocked
+                    ? L"解除布局锁定"
+                    : L"锁定布局");
+            AppendMenuW(menu, MF_STRING, MenuSaveCoreBaseline,
+                        L"设为默认布局");
+            const bool hasSavedBaseline =
+                core != nullptr && !core->savedBaselineLayout.empty();
+            AppendMenuW(menu,
+                        MF_STRING | (!hasSavedBaseline ? MF_GRAYED : 0),
+                        MenuRestoreCoreBaseline,
+                        hasSavedBaseline
+                            ? L"恢复默认布局"
+                            : L"恢复默认布局（尚未保存）");
+            if (hit.coreId != kUnclassifiedCoreId) {
+                AppendMenuW(menu, MF_SEPARATOR, 0, nullptr);
+                AppendMenuW(menu, MF_STRING, MenuArchiveCore,
+                            L"归档核心");
+                AppendMenuW(menu, MF_STRING, MenuDissolveCore,
+                            L"解散核心并移至未分类");
+                AppendMenuW(menu, MF_STRING, MenuDeleteCore,
+                            L"移除核心及所有引用");
+            }
+        } else {
+            FileItem* item = FindItem(hit.coreId, hit.itemId);
+            AppendMenuW(menu, MF_STRING, MenuOpenItem, L"打开");
+            AppendMenuW(menu, MF_STRING, MenuOpenContainingFolder, L"打开所在文件夹");
+            AppendMenuW(menu, MF_STRING, MenuRevealInExplorer, L"在资源管理器中选中");
+            AppendMenuW(menu, MF_STRING, MenuShowFullPath, L"查看完整路径");
+            AppendMenuW(menu, MF_SEPARATOR, 0, nullptr);
+            AppendMenuW(menu, MF_STRING, MenuTogglePinned,
+                        item != nullptr && item->pinned ? L"取消固定" : L"固定");
+            AppendMenuW(menu, MF_STRING, MenuToggleFavorite,
+                        item != nullptr && item->favorite ? L"取消收藏" : L"收藏");
+            AppendMenuW(menu, MF_STRING, MenuToggleInProgress,
+                        item != nullptr && item->inProgress ? L"取消“进行中”"
+                                                          : L"标记为“进行中”");
+            AppendMenuW(menu, MF_STRING, MenuRelocateItem, L"重新定位");
+            if (item != nullptr && !item->detachedFromUpper) {
+                AppendMenuW(menu, MF_STRING, MenuDetachParent,
+                            L"断开上层连接（保持独立）");
+            }
+            AppendMenuW(menu, MF_SEPARATOR, 0, nullptr);
+            AppendMenuW(menu, MF_STRING, MenuRemoveItem, L"移除视觉关联");
+        }
+
+        POINT screen{x, y};
+        ClientToScreen(window_, &screen);
+        const UINT command = TrackPopupMenuPreservingSelection(
+            menu, TPM_RETURNCMD | TPM_RIGHTBUTTON, screen.x, screen.y);
+        DestroyMenu(menu);
+        ExecuteMenuCommand(command);
+        Invalidate();
+    }
+
+    void ExecuteMenuCommand(UINT command) {
+        switch (command) {
+        case MenuCreateCore:
+            CreateCore(contextWorld_);
+            break;
+        case MenuUndo:
+            Undo();
+            break;
+        case MenuResetView:
+            FitView();
+            break;
+        case MenuToggleCore:
+            if (Core* core = FindCore(selected_.coreId)) {
+                PushUndo(state_);
+                ToggleCoreExpansion(*core);
+                ScheduleSave();
+            }
+            break;
+        case MenuToggleCoreFocus:
+            ToggleCoreFocus(selected_.coreId);
+            break;
+        case MenuRenameCore:
+            BeginRename(selected_.coreId);
+            break;
+        case MenuCoreAppearanceSettings:
+            OpenCoreAppearancePanel(selected_.coreId);
+            break;
+        case MenuResetCoreAppearance:
+            ResetCoreAppearance(selected_.coreId);
+            break;
+        case MenuChangeCoreColor:
+            ShowCoreColorMenu(selected_.coreId);
+            break;
+        case MenuSetCoreColorBlue:
+            ApplyCoreThemeColor(selected_.coreId, 0x3978D3);
+            break;
+        case MenuSetCoreColorPurple:
+            ApplyCoreThemeColor(selected_.coreId, 0x7E69DA);
+            break;
+        case MenuSetCoreColorPink:
+            ApplyCoreThemeColor(selected_.coreId, 0xD86A9E);
+            break;
+        case MenuSetCoreColorRed:
+            ApplyCoreThemeColor(selected_.coreId, 0xC8545E);
+            break;
+        case MenuSetCoreColorOrange:
+            ApplyCoreThemeColor(selected_.coreId, 0xD68A2C);
+            break;
+        case MenuSetCoreColorYellow:
+            ApplyCoreThemeColor(selected_.coreId, 0xB99A27);
+            break;
+        case MenuSetCoreColorGreen:
+            ApplyCoreThemeColor(selected_.coreId, 0x46966B);
+            break;
+        case MenuSetCoreColorCyan:
+            ApplyCoreThemeColor(selected_.coreId, 0x2C9BA8);
+            break;
+        case MenuSetCoreColorGray:
+            ApplyCoreThemeColor(selected_.coreId, 0x778392);
+            break;
+        case MenuDeleteCore:
+            DeleteCore(selected_.coreId);
+            break;
+        case MenuOpenItem:
+            OpenItem(selected_.coreId, selected_.itemId);
+            break;
+        case MenuOpenContainingFolder:
+            OpenContainingFolder(selected_.coreId, selected_.itemId);
+            break;
+        case MenuRevealInExplorer:
+            RevealItemInExplorer(selected_.coreId, selected_.itemId);
+            break;
+        case MenuShowFullPath:
+            ShowItemPath(selected_.coreId, selected_.itemId);
+            break;
+        case MenuTogglePinned:
+            TogglePinned(selected_.coreId, selected_.itemId);
+            break;
+        case MenuToggleFavorite:
+            ToggleFavorite(selected_.coreId, selected_.itemId);
+            break;
+        case MenuToggleInProgress:
+            ToggleInProgress(selected_.coreId, selected_.itemId);
+            break;
+        case MenuRemoveItem:
+            RemoveItem(selected_.coreId, selected_.itemId);
+            break;
+        case MenuRelocateItem:
+            RelocateItem(selected_.coreId, selected_.itemId);
+            break;
+        case MenuDetachParent:
+            DetachParentRelation(selected_.coreId, selected_.itemId);
+            break;
+        case MenuArchiveCore:
+            ArchiveCore(selected_.coreId);
+            break;
+        case MenuDissolveCore:
+            DissolveCore(selected_.coreId);
+            break;
+        case MenuRestoreCore:
+            RestoreCore(selected_.coreId);
+            break;
+        case MenuTrayShowHide:
+            SetWorkspaceVisible(IsWindowVisible(window_) == FALSE);
+            break;
+        case MenuTrayPauseResume:
+            ToggleWorkspacePause();
+            break;
+        case MenuTrayTutorial:
+            StartTutorial();
+            break;
+        case MenuExportLayout:
+            ExportLayout();
+            break;
+        case MenuImportLayout:
+            ImportLayout();
+            break;
+        case MenuRefreshReferences:
+            CheckReferences();
+            break;
+        case MenuTrayExit:
+            RequestExit();
+            break;
+        case MenuOptimizeCore:
+            RestoreSystemRecommendedLayout(selected_.coreId);
+            break;
+        case MenuCompactDouble:
+            ApplyLayoutTemplate(selected_.coreId,
+                                LayoutTemplate::CompactDouble,
+                                L"已按紧凑双环（5＋10，容量15）整理");
+            break;
+        case MenuSingleRing:
+            ApplyLayoutTemplate(selected_.coreId,
+                                LayoutTemplate::SingleRing,
+                                L"已按单环平均排列整理；超过6项将折叠");
+            break;
+        case MenuHighCapacityDouble:
+            ApplyLayoutTemplate(selected_.coreId,
+                                LayoutTemplate::HighCapacityDouble,
+                                L"已按高容量双环（6＋12，容量18）整理");
+            break;
+        case MenuGrowToSpace:
+            GrowCoreToSpace(selected_.coreId);
+            break;
+        case MenuDirectionUp:
+        case MenuDirectionDefault:
+            SetStartDirection(selected_.coreId, 0.0f,
+                              L"当前布局从正上方开始");
+            break;
+        case MenuDirectionUpperRight:
+            SetStartDirection(selected_.coreId, 30.0f,
+                              L"当前布局已转向右上方（30°）");
+            break;
+        case MenuToggleLayoutLock:
+            ToggleCoreLayoutLock(selected_.coreId);
+            break;
+        case MenuKeepAngles:
+            DistributeCurrentRingAngles(selected_.coreId);
+            break;
+        case MenuFreeLayout:
+            EnableFreeLayout(selected_.coreId);
+            break;
+        case MenuRestoreCoreLayout:
+            RestoreCoreLayout(selected_.coreId);
+            break;
+        case MenuOptimizeAll:
+            SeparateOverlappingCores();
+            break;
+        case MenuDisperseCores:
+            DisperseCores();
+            break;
+        case MenuArrangeAll:
+            ArrangeAllCores();
+            break;
+        case MenuSaveNow:
+            if (SaveState()) {
+                SetStatus(L"布局已保存");
+            }
+            break;
+        case MenuOpenDataFolder:
+            OpenDataFolder();
+            break;
+        case MenuAdjustCoreDistance:
+            OpenCoreDistanceSlider(selected_.coreId);
+            break;
+        case MenuConnectionStyleThin:
+            SetConnectionLineWidthPreset(
+                ConnectionWidthPreset::Thin);
+            break;
+        case MenuConnectionStyleStandard:
+            SetConnectionLineWidthPreset(
+                ConnectionWidthPreset::Standard);
+            break;
+        case MenuConnectionStyleEmphasis:
+            SetConnectionLineWidthPreset(
+                ConnectionWidthPreset::Emphasis);
+            break;
+        case MenuConnectionStyleCustom:
+            break;
+        case MenuRepairCoreDistanceData:
+            RepairCoreDistanceData(selected_.coreId);
+            break;
+        case MenuSaveCoreBaseline:
+            SaveCoreBaseline(selected_.coreId);
+            break;
+        case MenuRestoreCoreBaseline:
+            RestoreCoreBaseline(selected_.coreId);
+            break;
+        case MenuDensityCompact:
+        case MenuDensityStandard:
+        case MenuDensityClear:
+            state_.densityMode =
+                command == MenuDensityCompact
+                    ? DensityMode::Compact
+                    : (command == MenuDensityClear ? DensityMode::Clear
+                                                   : DensityMode::Standard);
+            RefreshResponsiveMetrics(true);
+            ScheduleSave();
+            SetStatus(command == MenuDensityCompact
+                          ? L"布局密度：紧凑"
+                          : (command == MenuDensityClear ? L"布局密度：清晰"
+                                                         : L"布局密度：标准"));
+            break;
+        case MenuAnimationOff:
+        case MenuAnimationSimple:
+        case MenuAnimationStandard:
+        case MenuAnimationSoft:
+            state_.animationMode =
+                command == MenuAnimationOff
+                    ? AnimationMode::Off
+                    : (command == MenuAnimationSimple
+                           ? AnimationMode::Simple
+                           : (command == MenuAnimationSoft
+                                  ? AnimationMode::Soft
+                                  : AnimationMode::Standard));
+            ScheduleSave();
+            SetStatus(command == MenuAnimationOff
+                          ? L"动画强度：关闭"
+                          : (command == MenuAnimationSimple
+                                 ? L"动画强度：简洁"
+                                 : (command == MenuAnimationSoft
+                                        ? L"动画强度：柔和"
+                                        : L"动画强度：标准")));
+            break;
+        case MenuCoreSelectionEffectRotate:
+        case MenuCoreSelectionEffectOnce:
+        case MenuCoreSelectionEffectStatic:
+            state_.coreSelectionEffect =
+                command == MenuCoreSelectionEffectOnce
+                    ? CoreSelectionEffect::RippleOnceThenStatic
+                    : (command == MenuCoreSelectionEffectStatic
+                           ? CoreSelectionEffect::Static
+                           : CoreSelectionEffect::GentleRipple);
+            if (SelectedCoreForVisualEffect() != 0) {
+                coreSelectionRippleStarted_ = std::chrono::steady_clock::now();
+                coreSelectionRippleCompleted_ = false;
+            }
+            SyncCoreSelectionRippleTimer();
+            ScheduleSave(false);
+            Invalidate();
+            break;
+        default:
+            break;
+        }
+    }
+
+    void OnKeyDown(WPARAM key) {
+        if (corePlacementMode_) {
+            if (key == VK_ESCAPE) {
+                CancelCorePlacementMode();
+            }
+            return;
+        }
+        if (CoreAppearancePanelOpen()) {
+            if (key == VK_ESCAPE) {
+                CloseCoreAppearancePanel();
+                SyncSelectionDismissTimer();
+                Invalidate();
+                return;
+            }
+            return;
+        }
+        if (CoreDistanceSliderOpen()) {
+            if (key == VK_ESCAPE) {
+                CloseCoreDistanceSlider();
+                SyncSelectionDismissTimer();
+                Invalidate();
+                return;
+            }
+            if (key == VK_LEFT || key == VK_RIGHT) {
+                if (const Core* core = FindCore(coreDistanceSliderCoreId_)) {
+                    PushUndo(state_);
+                    const float step = activeCoreLayoutControl_ ==
+                        CoreLayoutControl::Rotation ? 5.0f : 0.02f;
+                    const float delta = key == VK_LEFT ? -step : step;
+                    SetCoreLayoutControlValue(core->id, activeCoreLayoutControl_,
+                        CoreLayoutControlValue(*core, activeCoreLayoutControl_) + delta);
+                    ScheduleSave(false);
+                }
+                return;
+            }
+        }
+        if (tutorialActive_) {
+            if (key == VK_ESCAPE) {
+                FinishTutorial(true);
+            } else if (key == VK_LEFT && tutorialStep_ > 0) {
+                --tutorialStep_;
+                Invalidate();
+            } else if (key == VK_RIGHT || key == VK_RETURN || key == VK_SPACE) {
+                if (tutorialStep_ < 2) ++tutorialStep_;
+                else FinishTutorial(false);
+                Invalidate();
+            }
+            return;
+        }
+        if (key == VK_F11) {
+            ToggleFullScreenWorkMode();
+            return;
+        }
+        if (key == VK_ESCAPE &&
+            (focusedCoreId_ != 0 || FocusAnimationActive())) {
+            BeginUnfocusTransition();
+            hover_ = {};
+            Invalidate();
+            return;
+        }
+        if ((GetKeyState(VK_CONTROL) & 0x8000) != 0 && key == 'Z') {
+            Undo();
+            return;
+        }
+        if (key == VK_F2 && selected_.kind == HitKind::Core) {
+            BeginRename(selected_.coreId);
+            return;
+        }
+        if (key == VK_DELETE) {
+            if (selected_.kind == HitKind::Item) {
+                RemoveItem(selected_.coreId, selected_.itemId);
+            } else if (selected_.kind == HitKind::Core) {
+                DeleteCore(selected_.coreId);
+            }
+            return;
+        }
+        if (key == VK_RETURN) {
+            if (selected_.kind == HitKind::Item) {
+                OpenItem(selected_.coreId, selected_.itemId);
+            } else if (selected_.kind == HitKind::Core) {
+                if (Core* core = FindCore(selected_.coreId)) {
+                    PushUndo(state_);
+                    ToggleCoreExpansion(*core);
+                    ScheduleSave();
+                    Invalidate();
+                }
+            }
+        }
+    }
+
+    bool ExternalDropDataHasFiles(IDataObject* data) const {
+        if (data == nullptr) {
+            return false;
+        }
+        FORMATETC format{
+            CF_HDROP, nullptr, DVASPECT_CONTENT,
+            -1, TYMED_HGLOBAL};
+        return data->QueryGetData(&format) == S_OK;
+    }
+
+    bool UpdateExternalDropPreview(
+        POINTL point, bool hasFiles) {
+        std::uint64_t nextCoreId = 0;
+        std::uint64_t nextItemId = 0;
+        if (hasFiles && !tutorialActive_ &&
+            !state_.workspacePaused &&
+            !state_.workspaceCollapsed) {
+            POINT clientPoint{
+                static_cast<LONG>(point.x),
+                static_cast<LONG>(point.y)};
+            ScreenToClient(window_, &clientPoint);
+            const D2D1_POINT_2F dip =
+                PixelToDip(clientPoint.x, clientPoint.y);
+            const HitResult hit =
+                HitTest(ScreenToWorld(dip));
+            if (hit.kind == HitKind::Item) {
+                if (FindItem(hit.coreId, hit.itemId) != nullptr) {
+                    nextCoreId = hit.coreId;
+                    nextItemId = hit.itemId;
+                }
+            } else if (hit.kind == HitKind::Core ||
+                hit.kind == HitKind::More) {
+                if (const Core* core = FindCore(hit.coreId);
+                    core != nullptr &&
+                    AttachedFileCount(*core) <
+                        static_cast<std::size_t>(
+                            kCoreFileCapacity)) {
+                    nextCoreId = hit.coreId;
+                }
+            }
+        }
+        if (externalDropCoreId_ != nextCoreId ||
+            externalDropItemId_ != nextItemId) {
+            externalDropCoreId_ = nextCoreId;
+            externalDropItemId_ = nextItemId;
+            Invalidate();
+        }
+        return nextCoreId != 0;
+    }
+
+    void ClearExternalDropPreview() {
+        if (externalDropCoreId_ == 0 &&
+            externalDropItemId_ == 0) {
+            return;
+        }
+        externalDropCoreId_ = 0;
+        externalDropItemId_ = 0;
+        Invalidate();
+    }
+
+    bool DropExternalFiles(
+        IDataObject* data, POINTL point) {
+        if (data == nullptr || externalDropCoreId_ == 0) {
+            return false;
+        }
+        FORMATETC format{
+            CF_HDROP, nullptr, DVASPECT_CONTENT,
+            -1, TYMED_HGLOBAL};
+        STGMEDIUM medium{};
+        if (FAILED(data->GetData(&format, &medium)) ||
+            medium.tymed != TYMED_HGLOBAL ||
+            medium.hGlobal == nullptr) {
+            return false;
+        }
+        const SIZE_T bytes = GlobalSize(medium.hGlobal);
+        HGLOBAL copy =
+            bytes > 0
+                ? GlobalAlloc(GMEM_MOVEABLE, bytes)
+                : nullptr;
+        void* source =
+            medium.hGlobal != nullptr
+                ? GlobalLock(medium.hGlobal)
+                : nullptr;
+        void* destination =
+            copy != nullptr ? GlobalLock(copy) : nullptr;
+        bool copied =
+            source != nullptr && destination != nullptr &&
+            bytes >= sizeof(DROPFILES);
+        if (copied) {
+            std::memcpy(destination, source, bytes);
+            POINT clientPoint{
+                static_cast<LONG>(point.x),
+                static_cast<LONG>(point.y)};
+            ScreenToClient(window_, &clientPoint);
+            auto* header =
+                static_cast<DROPFILES*>(destination);
+            header->pt = clientPoint;
+            header->fNC = FALSE;
+        }
+        if (destination != nullptr) {
+            GlobalUnlock(copy);
+        }
+        if (source != nullptr) {
+            GlobalUnlock(medium.hGlobal);
+        }
+        ReleaseStgMedium(&medium);
+        if (!copied) {
+            if (copy != nullptr) {
+                GlobalFree(copy);
+            }
+            return false;
+        }
+        // OnDropFiles owns and releases the cloned HDROP.
+        OnDropFiles(reinterpret_cast<HDROP>(copy));
+        return true;
+    }
+
+    bool AddExternalFileAsChild(
+        const std::wstring& path,
+        std::uint64_t targetCoreId,
+        std::uint64_t parentId,
+        D2D1_POINT_2F dropWorld) {
+        Core* target = FindCore(targetCoreId);
+        FileItem* parent = FindItem(targetCoreId, parentId);
+        if (target == nullptr || parent == nullptr) {
+            SetStatus(L"无法添加子文件：目标文件已不存在");
+            return false;
+        }
+
+        Core* owner = nullptr;
+        FileItem* existing = FindItemByPath(path, &owner);
+        if (existing != nullptr && owner != nullptr &&
+            owner->id != targetCoreId) {
+            SetStatus(L"该文件已属于其他核心");
+            return false;
+        }
+        const bool creatingReference = existing == nullptr;
+        if (creatingReference &&
+            AttachedFileCount(*target) >=
+                static_cast<std::size_t>(kCoreFileCapacity)) {
+            SetStatus(L"当前核心已达到18项容量上限；未添加子文件");
+            return false;
+        }
+
+        WorkspaceState before = state_;
+        const bool dirtyBefore = dirty_;
+        if (creatingReference && target->layoutLocked) {
+            const int choice = MessageBoxW(
+                window_,
+                L"当前核心布局已锁定。\n\n是否解除锁定并加入子文件？",
+                L"加入子文件",
+                MB_YESNO | MB_ICONQUESTION | MB_DEFBUTTON2);
+            if (choice != IDYES) {
+                return false;
+            }
+            target->layoutLocked = false;
+        }
+
+        std::uint64_t childId = 0;
+        D2D1_POINT_2F childOriginalWorld = dropWorld;
+        if (creatingReference) {
+            const DWORD attributes =
+                GetFileAttributesW(path.c_str());
+            FileItem item;
+            item.id = state_.nextId++;
+            item.path = path;
+            item.isDirectory =
+                attributes != INVALID_FILE_ATTRIBUTES &&
+                (attributes & FILE_ATTRIBUTE_DIRECTORY) != 0;
+            item.missing =
+                attributes == INVALID_FILE_ATTRIBUTES;
+            item.originalName = FileDisplayName(item.path);
+            item.displayName =
+                MakeDisplayName(item.path, item.isDirectory);
+            item.sizeTier = InferSizeTier(item);
+            GenerateStableOffsets(item);
+            AssignDroppedItemLayout(
+                *target, item, dropWorld, 0);
+            childId = item.id;
+            target->files.push_back(std::move(item));
+        } else {
+            childId = existing->id;
+        }
+
+        target = FindCore(targetCoreId);
+        FileItem* child = FindItem(targetCoreId, childId);
+        if (target == nullptr || child == nullptr) {
+            state_ = std::move(before);
+            dirty_ = dirtyBefore;
+            layoutCache_.clear();
+            layoutDirty_ = true;
+            SetStatus(L"无法添加子文件：引用创建失败");
+            return false;
+        }
+
+        childOriginalWorld =
+            BaseDisplayItemPosition(*target, *child);
+        const LayoutMap& layouts = StableLayouts();
+        if (const auto found = layouts.find(targetCoreId);
+            found != layouts.end()) {
+            const auto entry = std::find_if(
+                found->second.begin(), found->second.end(),
+                [childId](const ItemLayout& candidate) {
+                    return candidate.item != nullptr &&
+                           candidate.item->id == childId;
+                });
+            if (entry != found->second.end()) {
+                childOriginalWorld = entry->position;
+            }
+        }
+
+        if (!ApplyParentRelation(
+                targetCoreId, childId, targetCoreId,
+                parentId, childOriginalWorld)) {
+            state_ = std::move(before);
+            dirty_ = dirtyBefore;
+            layoutCache_.clear();
+            layoutDirty_ = true;
+            Invalidate();
+            return false;
+        }
+
+        target = FindCore(targetCoreId);
+        if (target == nullptr) {
+            state_ = std::move(before);
+            dirty_ = dirtyBefore;
+            layoutCache_.clear();
+            layoutDirty_ = true;
+            SetStatus(L"无法添加子文件：目标核心状态已变化");
+            return false;
+        }
+        target->expanded = true;
+        RefreshAutomaticCoreIdentity(*target);
+        if (AttachedFileCount(*target) > 15 &&
+            target->layoutTemplate !=
+                LayoutTemplate::HighCapacityDouble) {
+            target->layoutTemplate =
+                LayoutTemplate::HighCapacityDouble;
+        }
+
+        dirty_ = true;
+        layoutDirty_ = true;
+        if (!SaveState()) {
+            state_ = std::move(before);
+            dirty_ = dirtyBefore;
+            layoutCache_.clear();
+            layoutDirty_ = true;
+            SetStatus(L"添加子文件失败：状态未能保存，已完整回滚");
+            Invalidate();
+            return false;
+        }
+
+        PushUndo(std::move(before));
+        SetSelection(
+            {HitKind::Item, targetCoreId, childId});
+        Invalidate();
+        return true;
+    }
+
+    void OnDropFiles(HDROP drop) {
+        if (tutorialActive_ || state_.workspacePaused || state_.workspaceCollapsed) {
+            DragFinish(drop);
+            return;
+        }
+        POINT point{};
+        DragQueryPoint(drop, &point);
+        const D2D1_POINT_2F world = ScreenToWorld(PixelToDip(point.x, point.y));
+        const HitResult directHit = HitTest(world);
+        const std::uint64_t parentItemId =
+            directHit.kind == HitKind::Item
+                ? directHit.itemId
+                : 0;
+        // The bootstrap "unclassified" core is intentionally invisible in a
+        // fresh workspace.  It must never act as a ghost drop target.
+        std::uint64_t targetId =
+            IsFreshWorkspaceEmpty()
+                ? 0
+                : ((directHit.kind == HitKind::Item ||
+                    directHit.kind == HitKind::Core ||
+                    directHit.kind == HitKind::More)
+                       ? directHit.coreId
+                       : DropCoreAt(world));
+        if (targetId == 0) {
+            targetId = ChooseCoreForBlankDrop(world, point.x, point.y);
+            if (targetId == 0) {
+                DragFinish(drop);
+                return;
+            }
+        }
+        Core* target = FindCore(targetId);
+        if (target == nullptr) {
+            DragFinish(drop);
+            return;
+        }
+        const UINT count = DragQueryFileW(drop, 0xFFFFFFFF, nullptr, 0);
+        if (parentItemId != 0 && count != 1) {
+            DragFinish(drop);
+            ClearExternalDropPreview();
+            SetStatus(L"一次只能添加一个子文件");
+            return;
+        }
+        std::vector<std::wstring> paths;
+        paths.reserve(count);
+        for (UINT index = 0; index < count; ++index) {
+            const UINT length = DragQueryFileW(drop, index, nullptr, 0);
+            std::wstring path(static_cast<std::size_t>(length) + 1, L'\0');
+            DragQueryFileW(drop, index, path.data(), length + 1);
+            path.resize(length);
+            paths.push_back(NormalizePath(path));
+        }
+        DragFinish(drop);
+        if (paths.empty()) {
+            return;
+        }
+        if (parentItemId != 0) {
+            AddExternalFileAsChild(
+                paths.front(), targetId,
+                parentItemId, world);
+            ClearExternalDropPreview();
+            return;
+        }
+
+        WorkspaceState before = state_;
+        if (target->layoutLocked) {
+            const int choice = MessageBoxW(
+                window_, L"当前核心布局已锁定。\n\n是否解除锁定并加入文件？",
+                L"加入文件", MB_YESNO | MB_ICONQUESTION | MB_DEFBUTTON2);
+            if (choice != IDYES) {
+                return;
+            }
+            target->layoutLocked = false;
+        }
+        int added = 0;
+        int moved = 0;
+        int skipped = 0;
+        bool capacityReached = false;
+        int dropOrdinal = 0;
+        for (const std::wstring& path : paths) {
+            Core* owner = nullptr;
+            FileItem* existing = FindItemByPath(path, &owner);
+            if (existing != nullptr && owner != nullptr) {
+                if (owner->id != targetId &&
+                    AttachedFileCount(*target) < kCoreFileCapacity) {
+                    const std::uint64_t itemId = existing->id;
+                    if (MoveItemToCoreInternal(
+                            owner->id, itemId, targetId)) {
+                        target = FindCore(targetId);
+                        if (target != nullptr) {
+                            if (FileItem* movedItem =
+                                    FindItem(targetId, itemId)) {
+                                AssignDroppedItemLayout(
+                                    *target, *movedItem, world,
+                                    dropOrdinal++);
+                            }
+                        }
+                        ++moved;
+                    } else {
+                        ++skipped;
+                    }
+                } else {
+                    capacityReached = AttachedFileCount(*target) >=
+                        static_cast<std::size_t>(kCoreFileCapacity);
+                    ++skipped;
+                }
+                continue;
+            }
+            if (AttachedFileCount(*target) >= kCoreFileCapacity) {
+                capacityReached = true;
+                ++skipped;
+                continue;
+            }
+            const DWORD attributes = GetFileAttributesW(path.c_str());
+            FileItem item;
+            item.id = state_.nextId++;
+            item.path = path;
+            item.isDirectory =
+                attributes != INVALID_FILE_ATTRIBUTES &&
+                (attributes & FILE_ATTRIBUTE_DIRECTORY) != 0;
+            item.missing = attributes == INVALID_FILE_ATTRIBUTES;
+            item.originalName = FileDisplayName(item.path);
+            item.displayName =
+                MakeDisplayName(item.path, item.isDirectory);
+            item.sizeTier = InferSizeTier(item);
+            GenerateStableOffsets(item);
+            AssignDroppedItemLayout(
+                *target, item, world, dropOrdinal++);
+            target->files.push_back(std::move(item));
+            ++added;
+        }
+
+        if (added > 0 || moved > 0) {
+            PushUndo(std::move(before));
+            bool upgradedCapacity = false;
+            bool appliedRecommendation = false;
+            if (Core* core = FindCore(targetId)) {
+                core->expanded = true;
+                RefreshAutomaticCoreIdentity(*core);
+                if (AttachedFileCount(*core) > 15 &&
+                    core->layoutTemplate !=
+                        LayoutTemplate::HighCapacityDouble) {
+                    upgradedCapacity = true;
+                    core->layoutTemplate =
+                        LayoutTemplate::HighCapacityDouble;
+                    const bool keepManualLayout =
+                        core->layoutLocked ||
+                        core->userLayoutCustomized ||
+                        HasManualLayout(*core);
+                    if (!keepManualLayout) {
+                        OptimizeCoreLayout(*core, false);
+                        appliedRecommendation = true;
+                    } else if (!core->layoutLocked &&
+                               MessageBoxW(
+                                   window_,
+                                   L"核心容量已升级为18。\n\n"
+                                   L"是否立即应用6＋12推荐布局？\n"
+                                   L"选择“否”将保留当前手动布局。",
+                                   L"核心容量升级",
+                                   MB_YESNO | MB_ICONQUESTION |
+                                       MB_DEFBUTTON2) == IDYES) {
+                        OptimizeCoreLayout(*core, false);
+                        appliedRecommendation = true;
+                    }
+                }
+            }
+            layoutDirty_ = true;
+            ScheduleSave();
+            std::wstring status =
+                L"已添加 " + std::to_wstring(added) + L" 项，转移 " +
+                std::to_wstring(moved) + L" 项";
+            if (upgradedCapacity) {
+                status += appliedRecommendation
+                    ? L"；核心容量已升级为18并应用推荐布局"
+                    : L"；核心容量已升级为18，当前布局保持不变";
+            }
+            SetStatus(status);
+        } else {
+            SetStatus(capacityReached
+                          ? L"当前核心已达到18项容量上限；请移至其他核心或创建新核心"
+                          : (skipped > 0
+                                 ? L"没有新增项目：文件已存在"
+                                 : L"没有可添加的项目"));
+        }
+        Invalidate();
+    }
+
+    std::uint64_t ChooseCoreForBlankDrop(D2D1_POINT_2F world, int x, int y) {
+        HMENU menu = CreatePopupMenu();
+        if (menu == nullptr) return 0;
+        constexpr UINT createCommand = 31800;
+        constexpr UINT firstCoreCommand = 31810;
+        std::vector<std::uint64_t> available;
+        AppendMenuW(menu, MF_STRING | MF_DISABLED, 0, L"把文件加入到：");
+        AppendMenuW(menu, MF_STRING, createCommand, L"＋ 创建新核心");
+        AppendMenuW(menu, MF_SEPARATOR, 0, nullptr);
+        for (const Core& core : state_.cores) {
+            if (core.archived ||
+                AttachedFileCount(core) >= kCoreFileCapacity) {
+                continue;
+            }
+            available.push_back(core.id);
+            AppendMenuW(menu, MF_STRING,
+                        firstCoreCommand + static_cast<UINT>(available.size() - 1),
+                        core.name.c_str());
+        }
+        POINT screen{x, y};
+        ClientToScreen(window_, &screen);
+        const UINT command = TrackPopupMenuPreservingSelection(
+            menu, TPM_RETURNCMD | TPM_RIGHTBUTTON,
+            screen.x, screen.y);
+        DestroyMenu(menu);
+        if (command == createCommand) {
+            CreateCore(world, false);
+            return selected_.coreId;
+        }
+        if (command >= firstCoreCommand &&
+            command < firstCoreCommand + available.size()) {
+            return available[command - firstCoreCommand];
+        }
+        return 0;
+    }
+
+    void CreateCore(D2D1_POINT_2F position, bool beginRename = true) {
+        WorkspaceState before = state_;
+        Core core;
+        core.id = state_.nextId++;
+        core.name = L"新核心 " + std::to_wstring(state_.cores.size());
+        core.position = position;
+        const D2D1_SIZE_F workspace = ClientDipSize();
+        const D2D1_POINT_2F screen = WorldToScreen(position);
+        core.xRatio = std::clamp(screen.x / std::max(1.0f, workspace.width),
+                                 0.0f, 1.0f);
+        core.yRatio = std::clamp(screen.y / std::max(1.0f, workspace.height),
+                                 0.0f, 1.0f);
+        core.monitorId = CurrentMonitorId();
+        core.radiusScale = 1.0f;
+        const bool hasExistingUserCore = std::any_of(
+            state_.cores.begin(), state_.cores.end(),
+            [](const Core& existing) {
+                return !existing.archived && existing.id != kUnclassifiedCoreId;
+            });
+        // Only the very first user core opens by default.  Later cores stay
+        // quiet until selected, keeping the fixed companion workspace dense.
+        core.expanded = !hasExistingUserCore;
+        core.iconKind = CoreIconKind::General;
+        core.themeColor = DefaultCoreColor(core.iconKind);
+        const std::uint64_t id = core.id;
+        state_.cores.push_back(std::move(core));
+        SetSelection({HitKind::Core, id, 0}, true);
+        PushUndo(std::move(before));
+        ScheduleSave();
+        if (beginRename) BeginRename(id);
+    }
+
+    void DissolveCore(std::uint64_t id) {
+        if (id == kUnclassifiedCoreId) {
+            SetStatus(L"“未分类”是系统兜底核心，不能解散");
+            return;
+        }
+        const Core* source = FindCore(id);
+        const Core* unclassified = FindCore(kUnclassifiedCoreId);
+        if (source == nullptr || unclassified == nullptr) {
+            return;
+        }
+        const std::size_t referenceCount = source->files.size();
+        const std::wstring warning =
+            L"将解散核心“" + source->name + L"”。\n\n" +
+            L"其中 " + std::to_wstring(referenceCount) +
+            L" 个文件引用将转入“未分类”。\n"
+            L"真实文件不会被移动或删除。";
+        if (MessageBoxW(
+                window_, warning.c_str(), L"解散核心并移至未分类",
+                MB_OKCANCEL | MB_ICONINFORMATION | MB_DEFBUTTON2) != IDOK) {
+            return;
+        }
+
+        WorkspaceState before = state_;
+        Core* mutableSource = FindCore(id);
+        if (mutableSource == nullptr) {
+            return;
+        }
+        std::vector<FileItem> movedFiles =
+            std::move(mutableSource->files);
+        std::vector<std::uint64_t> movedRootIds;
+        movedRootIds.reserve(movedFiles.size());
+        for (FileItem& item : movedFiles) {
+            if (!item.detachedFromUpper && item.parentFileId == 0) {
+                movedRootIds.push_back(item.id);
+                item.slot = -1;
+                item.ring = -1;
+                item.ringSlot = -1;
+                item.manualOffset = D2D1::Point2F();
+                item.manuallyMoved = false;
+                item.lockedPosition = false;
+            }
+        }
+        for (FileFamily& family : state_.families) {
+            if (family.coreId == id) {
+                family.coreId = kUnclassifiedCoreId;
+            }
+        }
+        if (focusedCoreId_ == id) {
+            ResetFocusImmediately();
+        }
+        state_.cores.erase(
+            std::remove_if(
+                state_.cores.begin(), state_.cores.end(),
+                [id](const Core& core) {
+                    return core.id == id;
+                }),
+            state_.cores.end());
+
+        Core* target = FindCore(kUnclassifiedCoreId);
+        if (target == nullptr) {
+            state_ = std::move(before);
+            SetStatus(L"未找到“未分类”核心，解散操作已取消");
+            return;
+        }
+        const std::size_t resultingAttachedCount =
+            AttachedFileCount(*target) +
+            static_cast<std::size_t>(std::count_if(
+                movedFiles.begin(), movedFiles.end(),
+                [](const FileItem& item) {
+                    return !item.detachedFromUpper;
+                }));
+        if (resultingAttachedCount > 15) {
+            target->layoutTemplate =
+                LayoutTemplate::HighCapacityDouble;
+        }
+        for (FileItem& item : movedFiles) {
+            if (!item.detachedFromUpper && item.parentFileId == 0) {
+                AssignNewItemLayout(*target, item);
+            } else {
+                item.slot = -1;
+                item.ring = -1;
+                item.ringSlot = -1;
+            }
+            target->files.push_back(std::move(item));
+        }
+        for (const std::uint64_t rootId : movedRootIds) {
+            ArrangeAttachedSubtreeOutward(*target, rootId);
+        }
+        target->expanded = true;
+        SetSelection({HitKind::Core, kUnclassifiedCoreId, 0}, true);
+        layoutDirty_ = true;
+        PushUndo(std::move(before));
+        ScheduleSave();
+        SetStatus(
+            L"核心已解散；所有文件引用已移至“未分类”，真实文件未受影响");
+        Invalidate();
+    }
+
+    void DeleteCore(std::uint64_t id) {
+        if (id == kUnclassifiedCoreId || FindCore(id) == nullptr) {
+            if (id == kUnclassifiedCoreId) {
+                SetStatus(L"“未分类”是系统兜底核心，不能移除");
+            }
+            return;
+        }
+        const Core* source = FindCore(id);
+        if (source == nullptr) return;
+        const std::wstring warning =
+            L"将从引力桌面中移除核心“" + source->name +
+            L"”及其中 " +
+            std::to_wstring(source->files.size()) +
+            L" 个文件引用。\n\n"
+            L"真实文件不会受到影响。";
+        if (MessageBoxW(
+                window_, warning.c_str(), L"移除核心及所有引用",
+                MB_OKCANCEL | MB_ICONWARNING | MB_DEFBUTTON2) != IDOK) {
+            return;
+        }
+
+        WorkspaceState before = state_;
+        state_.families.erase(
+            std::remove_if(
+                state_.families.begin(), state_.families.end(),
+                [id](const FileFamily& family) {
+                    return family.coreId == id;
+                }),
+            state_.families.end());
+        state_.cores.erase(
+            std::remove_if(
+                state_.cores.begin(), state_.cores.end(),
+                [id](const Core& core) {
+                    return core.id == id;
+                }),
+            state_.cores.end());
+        if (focusedCoreId_ == id) {
+            ResetFocusImmediately();
+        }
+        ClearSelection();
+        layoutDirty_ = true;
+        PushUndo(std::move(before));
+        ScheduleSave();
+        SetStatus(L"核心及所有引用已移除；真实文件未受影响");
+        Invalidate();
+    }
+
+    bool CreateHistoryBackup(bool force) {
+        if (stateFile_.empty() ||
+            GetFileAttributesW(stateFile_.c_str()) == INVALID_FILE_ATTRIBUTES) {
+            return false;
+        }
+        const std::int64_t now = UnixTimeNow();
+        if (!force && now - lastHistoryBackupTime_ < 300) return true;
+        const std::filesystem::path folder = stateFile_.parent_path() / L"backups";
+        std::error_code error;
+        std::filesystem::create_directories(folder, error);
+        if (error) return false;
+        const std::filesystem::path target =
+            folder / (L"state-" + BackupTimestamp() + L".json");
+        std::filesystem::copy_file(stateFile_, target,
+            std::filesystem::copy_options::none, error);
+        if (!error) lastHistoryBackupTime_ = now;
+        return !error;
+    }
+
+    static int ReferenceCount(const WorkspaceState& state) {
+        int count = 0;
+        for (const Core& core : state.cores) {
+            count += static_cast<int>(core.files.size());
+        }
+        return count;
+    }
+
+    WorkspaceState MergeImportedState(const WorkspaceState& imported) const {
+        WorkspaceState merged = state_;
+        std::set<std::uint64_t> usedIds;
+        std::set<std::wstring> usedPaths;
+        for (const Core& core : merged.cores) {
+            usedIds.insert(core.id);
+            for (const FileItem& item : core.files) {
+                usedIds.insert(item.id);
+                usedPaths.insert(NormalizePath(item.path));
+            }
+        }
+        for (const FileFamily& family : merged.families) usedIds.insert(family.id);
+        auto allocateId = [&merged, &usedIds]() {
+            while (usedIds.contains(merged.nextId)) ++merged.nextId;
+            const std::uint64_t result = merged.nextId++;
+            usedIds.insert(result);
+            return result;
+        };
+
+        std::unordered_map<std::uint64_t, std::uint64_t> coreIds;
+        std::unordered_map<std::uint64_t, std::uint64_t> itemIds;
+        std::unordered_map<std::uint64_t, std::uint64_t> familyIds;
+        for (const Core& sourceCore : imported.cores) {
+            if (sourceCore.id == kUnclassifiedCoreId) {
+                coreIds[sourceCore.id] = kUnclassifiedCoreId;
+                continue;
+            }
+            Core copied = sourceCore;
+            copied.files.clear();
+            copied.id = usedIds.contains(copied.id) ? allocateId() : copied.id;
+            usedIds.insert(copied.id);
+            coreIds[sourceCore.id] = copied.id;
+            merged.cores.push_back(std::move(copied));
+        }
+
+        for (const Core& sourceCore : imported.cores) {
+            const auto coreId = coreIds.find(sourceCore.id);
+            if (coreId == coreIds.end()) continue;
+            auto target = std::find_if(merged.cores.begin(), merged.cores.end(),
+                [&coreId](const Core& core) { return core.id == coreId->second; });
+            if (target == merged.cores.end()) continue;
+            for (const FileItem& sourceItem : sourceCore.files) {
+                if (usedPaths.contains(NormalizePath(sourceItem.path))) continue;
+                FileItem copied = sourceItem;
+                copied.id = usedIds.contains(copied.id) ? allocateId() : copied.id;
+                usedIds.insert(copied.id);
+                usedPaths.insert(NormalizePath(copied.path));
+                itemIds[sourceItem.id] = copied.id;
+                target->files.push_back(std::move(copied));
+            }
+        }
+
+        for (const FileFamily& sourceFamily : imported.families) {
+            const std::uint64_t mapped = usedIds.contains(sourceFamily.id)
+                ? allocateId() : sourceFamily.id;
+            usedIds.insert(mapped);
+            familyIds[sourceFamily.id] = mapped;
+        }
+        for (Core& core : merged.cores) {
+            for (FileItem& item : core.files) {
+                if (!itemIds.contains(item.id)) continue;
+                const auto parent = itemIds.find(item.parentFileId);
+                item.parentFileId = parent == itemIds.end() ? 0 : parent->second;
+                const auto family = familyIds.find(item.familyId);
+                item.familyId = family == familyIds.end() ? 0 : family->second;
+            }
+        }
+        for (const FileFamily& sourceFamily : imported.families) {
+            const auto id = familyIds.find(sourceFamily.id);
+            const auto core = coreIds.find(sourceFamily.coreId);
+            const auto root = itemIds.find(sourceFamily.rootFileId);
+            if (id == familyIds.end() || core == coreIds.end() || root == itemIds.end()) continue;
+            FileFamily copied = sourceFamily;
+            copied.id = id->second;
+            copied.coreId = core->second;
+            copied.rootFileId = root->second;
+            const auto current = itemIds.find(sourceFamily.currentFileId);
+            copied.currentFileId = current == itemIds.end() ? copied.rootFileId : current->second;
+            merged.families.push_back(std::move(copied));
+        }
+        return merged;
+    }
+
+    void ExportLayout() {
+        if (MessageBoxW(window_,
+                        L"导出的布局文件包含核心、视觉位置和本机文件路径，不包含文件内容。是否继续？",
+                        L"导出布局", MB_OKCANCEL | MB_ICONINFORMATION) != IDOK) {
+            return;
+        }
+        std::array<wchar_t, 32768> path{};
+        OPENFILENAMEW dialog{sizeof(dialog)};
+        dialog.hwndOwner = window_;
+        dialog.lpstrFilter = L"引力桌面布局 (*.json)\0*.json\0所有文件\0*.*\0";
+        dialog.lpstrFile = path.data();
+        dialog.nMaxFile = static_cast<DWORD>(path.size());
+        dialog.lpstrDefExt = L"json";
+        dialog.Flags = OFN_OVERWRITEPROMPT | OFN_PATHMUSTEXIST;
+        if (!GetSaveFileNameW(&dialog)) return;
+        if (WriteUtf8Atomic(path.data(), SerializeState(state_))) {
+            SetStatus(L"布局已导出；未导出任何真实文件内容");
+        } else {
+            SetStatus(L"布局导出失败");
+        }
+    }
+
+    void ImportLayout() {
+        std::array<wchar_t, 32768> path{};
+        OPENFILENAMEW dialog{sizeof(dialog)};
+        dialog.hwndOwner = window_;
+        dialog.lpstrFilter = L"引力桌面布局 (*.json)\0*.json\0所有文件\0*.*\0";
+        dialog.lpstrFile = path.data();
+        dialog.nMaxFile = static_cast<DWORD>(path.size());
+        dialog.Flags = OFN_FILEMUSTEXIST | OFN_PATHMUSTEXIST;
+        if (!GetOpenFileNameW(&dialog)) return;
+        const std::optional<std::string> text = ReadUtf8File(path.data());
+        WorkspaceState imported;
+        if (!text || !DeserializeState(*text, imported)) {
+            MessageBoxW(window_, L"无法读取布局文件；当前布局没有改变。",
+                        L"导入布局", MB_OK | MB_ICONERROR);
+            return;
+        }
+        const std::wstring prompt = L"导入预览：" +
+            std::to_wstring(imported.cores.size()) + L" 个核心，" +
+            std::to_wstring(ReferenceCount(imported)) + L" 个文件引用。\n\n"
+            L"此文件可能包含本机路径。\n\n"
+            L"选择“是”覆盖当前布局；选择“否”合并；取消则不导入。";
+        const int choice = MessageBoxW(window_, prompt.c_str(), L"导入布局",
+                                       MB_YESNOCANCEL | MB_ICONQUESTION | MB_DEFBUTTON3);
+        if (choice == IDCANCEL) return;
+        if (!stateRecoveryBlocked_ && !SaveState()) return;
+        CreateHistoryBackup(true);
+        WorkspaceState before = state_;
+        state_ = choice == IDYES ? std::move(imported) : MergeImportedState(imported);
+        NormalizeStateModel();
+        state_.workspacePaused = false;
+        ApplyCompanionWorkspaceFrame();
+        RefreshResponsiveMetrics(true);
+        UpdateCoreRatios();
+        if (!CommitImportedStateWrite(
+                stateRecoveryBlocked_,
+                [&]() {
+                    return WriteUtf8Atomic(stateFile_, SerializeState(state_));
+                })) {
+            state_ = std::move(before);
+            NormalizeStateModel();
+            RefreshResponsiveMetrics(true);
+            SetStatus(L"导入写入失败；已完整恢复导入前布局");
+            return;
+        }
+        dirty_ = false;
+        PushUndo(std::move(before));
+        iconCache_.clear();
+        iconShadowCache_.clear();
+        layoutDirty_ = true;
+        SetStatus(choice == IDYES ? L"布局已覆盖导入" : L"布局已合并导入");
+        Invalidate();
+    }
+
+    void CheckReferences(std::optional<std::uint64_t> onlyCore = std::nullopt) {
+        int changed = 0;
+        int missing = 0;
+        for (Core& core : state_.cores) {
+            if (onlyCore && core.id != *onlyCore) continue;
+            for (FileItem& item : core.files) {
+                const bool isMissing = GetFileAttributesW(item.path.c_str()) ==
+                    INVALID_FILE_ATTRIBUTES;
+                if (item.missing != isMissing) {
+                    item.missing = isMissing;
+                    ++changed;
+                }
+                if (isMissing) ++missing;
+            }
+        }
+        if (changed > 0) ScheduleSave();
+        if (!onlyCore) {
+            SetStatus(missing == 0
+                ? L"引用检查完成：所有文件均可访问"
+                : L"引用检查完成：" + std::to_wstring(missing) + L" 个引用需要重新定位");
+        }
+        Invalidate();
+    }
+
+    void ArchiveCore(std::uint64_t id) {
+        Core* core = FindCore(id);
+        if (core == nullptr || core->id == kUnclassifiedCoreId || core->archived) return;
+        PushUndo(state_);
+        core->archived = true;
+        if (focusedCoreId_ == core->id) ResetFocusImmediately();
+        ClearSelection();
+        layoutDirty_ = true;
+        ScheduleSave();
+        SetStatus(L"核心已归档；所有文件引用和真实文件均保持不变");
+    }
+
+    void RestoreCore(std::uint64_t id) {
+        Core* core = FindCore(id);
+        if (core == nullptr || !core->archived) return;
+        PushUndo(state_);
+        core->archived = false;
+        core->expanded = true;
+        layoutDirty_ = true;
+        ScheduleSave();
+        SetStatus(L"归档核心已恢复");
+    }
+
+    void MoveItemToCore(std::uint64_t sourceId, std::uint64_t itemId,
+                        std::uint64_t targetId, WorkspaceState before) {
+        Core* target = FindCore(targetId);
+        if (target == nullptr) {
+            return;
+        }
+        if (target->layoutLocked) {
+            const int choice = MessageBoxW(
+                window_, L"目标核心布局已锁定。\n\n是否解除锁定并加入文件？",
+                L"移动文件", MB_YESNO | MB_ICONQUESTION | MB_DEFBUTTON2);
+            if (choice != IDYES) {
+                return;
+            }
+            target->layoutLocked = false;
+        }
+        if (AttachedFileCount(*target) >= kCoreFileCapacity) {
+            SetStatus(L"目标核心已经达到 " +
+                      std::to_wstring(kCoreFileCapacity) + L" 项上限");
+            return;
+        }
+        if (MoveItemToCoreInternal(sourceId, itemId, targetId)) {
+            PushUndo(std::move(before));
+            SetSelection({HitKind::Item, targetId, itemId});
+            bool upgradedCapacity = false;
+            if (Core* destination = FindCore(targetId);
+                destination != nullptr &&
+                AttachedFileCount(*destination) > 15 &&
+                destination->layoutTemplate !=
+                    LayoutTemplate::HighCapacityDouble) {
+                // A cross-core move is a user-owned placement. Upgrade the
+                // capacity state but never reorder the destination cluster.
+                destination->layoutTemplate =
+                    LayoutTemplate::HighCapacityDouble;
+                upgradedCapacity = true;
+            }
+            layoutDirty_ = true;
+            ScheduleSave();
+            SetStatus(upgradedCapacity
+                          ? L"已改变视觉归属；核心容量已升级为18，当前布局保持不变"
+                          : L"已改变视觉归属；真实文件位置未变化");
+        }
+    }
+
+    bool MoveItemToCoreInternal(std::uint64_t sourceId, std::uint64_t itemId,
+                                std::uint64_t targetId) {
+        if (sourceId == targetId) {
+            return false;
+        }
+        Core* source = FindCore(sourceId);
+        Core* target = FindCore(targetId);
+        if (source == nullptr || target == nullptr) {
+            return false;
+        }
+        if (AttachedFileCount(*target) >= kCoreFileCapacity) {
+            return false;
+        }
+        const auto iterator = std::find_if(
+            source->files.begin(), source->files.end(),
+            [itemId](const FileItem& item) { return item.id == itemId; });
+        if (iterator == source->files.end()) {
+            return false;
+        }
+        FileItem item = std::move(*iterator);
+        source->files.erase(iterator);
+        if (item.detachedFromUpper) {
+            item.parentFileId = 0;
+            item.detachedFromUpper = false;
+            item.detachedWorldPosition = D2D1::Point2F();
+        }
+        item.manuallyMoved = false;
+        item.lockedPosition = false;
+        item.manualOffset = D2D1::Point2F();
+        item.slot = -1;
+        item.ring = -1;
+        item.ringSlot = -1;
+        AssignNewItemLayout(*target, item);
+        target->files.push_back(std::move(item));
+        target->expanded = true;
+        RefreshAutomaticCoreIdentity(*source);
+        RefreshAutomaticCoreIdentity(*target);
+        return true;
+    }
+
+    void RemoveItem(std::uint64_t coreId, std::uint64_t itemId) {
+        Core* core = FindCore(coreId);
+        if (core == nullptr) {
+            return;
+        }
+        const auto iterator = std::find_if(
+            core->files.begin(), core->files.end(),
+            [itemId](const FileItem& item) { return item.id == itemId; });
+        if (iterator == core->files.end()) {
+            return;
+        }
+        PushUndo(state_);
+        core->files.erase(iterator);
+        RefreshAutomaticCoreIdentity(*core);
+        ClearSelection();
+        ScheduleSave();
+        SetStatus(L"已移除视觉关联；真实文件未被删除");
+        Invalidate();
+    }
+
+    void TogglePinned(std::uint64_t coreId, std::uint64_t itemId) {
+        FileItem* item = FindItem(coreId, itemId);
+        if (item == nullptr) {
+            return;
+        }
+        PushUndo(state_);
+        item->pinned = !item->pinned;
+        item->sizeTier = InferSizeTier(*item);
+        ScheduleSave();
+        SetStatus(item->pinned ? L"已固定：优先级提升但永久位置不变"
+                               : L"已取消固定：永久位置不变");
+        Invalidate();
+    }
+
+    void ToggleFavorite(std::uint64_t coreId, std::uint64_t itemId) {
+        Core* core = FindCore(coreId);
+        FileItem* item = FindItem(coreId, itemId);
+        if (core != nullptr && item != nullptr) {
+            PushUndo(state_);
+            item->favorite = !item->favorite;
+            item->sizeTier = InferSizeTier(*item);
+            ScheduleSave();
+            Invalidate();
+        }
+    }
+
+    void ToggleInProgress(std::uint64_t coreId, std::uint64_t itemId) {
+        Core* core = FindCore(coreId);
+        FileItem* item = FindItem(coreId, itemId);
+        if (core == nullptr || item == nullptr) {
+            return;
+        }
+        PushUndo(state_);
+        item->inProgress = !item->inProgress;
+        item->sizeTier = InferSizeTier(*item);
+        ScheduleSave();
+        Invalidate();
+    }
+
+    void OpenItem(std::uint64_t coreId, std::uint64_t itemId) {
+        FileItem* item = FindItem(coreId, itemId);
+        if (item == nullptr) {
+            return;
+        }
+        const DWORD attributes = GetFileAttributesW(item->path.c_str());
+        if (attributes == INVALID_FILE_ATTRIBUTES) {
+            item->missing = true;
+            ScheduleSave();
+            SetStatus(L"文件位置已变化。请右键选择“重新定位”。");
+            Invalidate();
+            return;
+        }
+
+        SHELLEXECUTEINFOW execute{sizeof(execute)};
+        execute.fMask = SEE_MASK_FLAG_NO_UI;
+        execute.hwnd = window_;
+        execute.lpVerb = L"open";
+        execute.lpFile = item->path.c_str();
+        execute.nShow = SW_SHOWNORMAL;
+        if (ShellExecuteExW(&execute) != FALSE) {
+            item->missing = false;
+            ++item->openCount;
+            item->lastOpened = UnixTimeNow();
+            item->recentOpens.push_back(item->lastOpened);
+            const std::int64_t cutoff = item->lastOpened - 30LL * 24 * 60 * 60;
+            item->recentOpens.erase(
+                std::remove_if(item->recentOpens.begin(), item->recentOpens.end(),
+                               [cutoff](std::int64_t timestamp) {
+                                   return timestamp < cutoff;
+                               }),
+                item->recentOpens.end());
+            if (item->recentOpens.size() > 64) {
+                item->recentOpens.erase(
+                    item->recentOpens.begin(),
+                    item->recentOpens.end() - static_cast<std::ptrdiff_t>(64));
+            }
+            item->sizeTier = InferSizeTier(*item);
+            ScheduleSave();
+            SetStatus(L"已打开：" + FileDisplayName(item->path));
+        } else {
+            SetStatus(L"Windows 无法打开此项目");
+        }
+        Invalidate();
+    }
+
+    void OpenContainingFolder(std::uint64_t coreId, std::uint64_t itemId) {
+        FileItem* item = FindItem(coreId, itemId);
+        if (item == nullptr) return;
+        const std::filesystem::path path(item->path);
+        const std::wstring directory = item->isDirectory ? item->path : path.parent_path().wstring();
+        if (directory.empty() || GetFileAttributesW(directory.c_str()) == INVALID_FILE_ATTRIBUTES) {
+            item->missing = true;
+            ScheduleSave();
+            SetStatus(L"原所在文件夹不可用");
+            return;
+        }
+        ShellExecuteW(window_, L"open", directory.c_str(), nullptr, nullptr, SW_SHOWNORMAL);
+    }
+
+    void RevealItemInExplorer(std::uint64_t coreId, std::uint64_t itemId) {
+        FileItem* item = FindItem(coreId, itemId);
+        if (item == nullptr) return;
+        PIDLIST_ABSOLUTE itemIdList = ILCreateFromPathW(item->path.c_str());
+        if (itemIdList == nullptr) {
+            item->missing = true;
+            ScheduleSave();
+            SetStatus(L"文件位置已变化，无法在资源管理器中选中");
+            return;
+        }
+        const HRESULT result = SHOpenFolderAndSelectItems(itemIdList, 0, nullptr, 0);
+        ILFree(itemIdList);
+        if (FAILED(result)) SetStatus(L"无法在资源管理器中选中此项目");
+    }
+
+    void ShowItemPath(std::uint64_t coreId, std::uint64_t itemId) {
+        const FileItem* item = FindItem(coreId, itemId);
+        if (item == nullptr) return;
+        MessageBoxW(window_, item->path.c_str(), L"原始完整路径", MB_OK | MB_ICONINFORMATION);
+    }
+
+    void RelocateItem(std::uint64_t coreId, std::uint64_t itemId) {
+        FileItem* item = FindItem(coreId, itemId);
+        if (item == nullptr) {
+            return;
+        }
+
+        ComPtr<IFileOpenDialog> dialog;
+        if (FAILED(CoCreateInstance(CLSID_FileOpenDialog, nullptr, CLSCTX_INPROC_SERVER,
+                                    IID_PPV_ARGS(dialog.ReleaseAndGetAddressOf())))) {
+            SetStatus(L"无法打开文件选择器");
+            return;
+        }
+        FILEOPENDIALOGOPTIONS options{};
+        dialog->GetOptions(&options);
+        options |= FOS_FORCEFILESYSTEM | FOS_PATHMUSTEXIST;
+        if (item->isDirectory) {
+            options |= FOS_PICKFOLDERS;
+        } else {
+            options |= FOS_FILEMUSTEXIST;
+        }
+        dialog->SetOptions(options);
+        dialog->SetTitle(L"重新定位关联项目");
+        if (FAILED(dialog->Show(window_))) {
+            return;
+        }
+
+        ComPtr<IShellItem> result;
+        if (FAILED(dialog->GetResult(result.ReleaseAndGetAddressOf()))) {
+            return;
+        }
+        PWSTR selectedPath = nullptr;
+        if (FAILED(result->GetDisplayName(SIGDN_FILESYSPATH, &selectedPath)) ||
+            selectedPath == nullptr) {
+            return;
+        }
+        const std::wstring path = NormalizePath(selectedPath);
+        CoTaskMemFree(selectedPath);
+
+        Core* owner = nullptr;
+        FileItem* duplicate = FindItemByPath(path, &owner);
+        if (duplicate != nullptr && duplicate->id != itemId) {
+            SetStatus(L"该项目已经存在于工作区");
+            return;
+        }
+
+        PushUndo(state_);
+        item = FindItem(coreId, itemId);
+        if (item != nullptr) {
+            item->path = path;
+            item->originalName = FileDisplayName(path);
+            item->missing = false;
+            const DWORD attributes = GetFileAttributesW(path.c_str());
+            item->isDirectory =
+                attributes != INVALID_FILE_ATTRIBUTES &&
+                (attributes & FILE_ATTRIBUTE_DIRECTORY) != 0;
+            item->displayName =
+                MakeDisplayName(path, item->isDirectory);
+        }
+        if (Core* core = FindCore(coreId)) {
+            RefreshAutomaticCoreIdentity(*core);
+        }
+        iconCache_.clear();
+        iconShadowCache_.clear();
+        ScheduleSave();
+        SetStatus(L"关联位置已更新");
+        Invalidate();
+    }
+
+    void BeginRename(std::uint64_t coreId) {
+        EndRename(true);
+        Core* core = FindCore(coreId);
+        if (core == nullptr || coreId == kUnclassifiedCoreId) {
+            if (coreId == kUnclassifiedCoreId) {
+                SetStatus(L"“未分类”是系统核心，名称固定");
+            }
+            return;
+        }
+        editingCoreId_ = coreId;
+        HWND editParent =
+            interactionWindow_ != nullptr
+                ? interactionWindow_
+                : window_;
+        editWindow_ = CreateWindowExW(
+            WS_EX_CLIENTEDGE, L"EDIT", core->name.c_str(),
+            WS_CHILD | WS_VISIBLE | ES_AUTOHSCROLL | ES_CENTER,
+            0, 0, 180, 28, editParent,
+            nullptr, GetModuleHandleW(nullptr), nullptr);
+        if (editWindow_ == nullptr) {
+            editingCoreId_ = 0;
+            return;
+        }
+        SendMessageW(editWindow_, WM_SETFONT,
+                     reinterpret_cast<WPARAM>(GetStockObject(DEFAULT_GUI_FONT)), TRUE);
+        SetWindowLongPtrW(editWindow_, GWLP_USERDATA, reinterpret_cast<LONG_PTR>(this));
+        oldEditProc_ = reinterpret_cast<WNDPROC>(
+            SetWindowLongPtrW(editWindow_, GWLP_WNDPROC,
+                              reinterpret_cast<LONG_PTR>(&GravityApp::EditWindowProc)));
+        PositionEditWindow();
+        interactionShapes_.clear();
+        Invalidate();
+        SetFocus(editWindow_);
+        SendMessageW(editWindow_, EM_SETSEL, 0, -1);
+    }
+
+    void PositionEditWindow() {
+        if (editWindow_ == nullptr) {
+            return;
+        }
+        const Core* core = FindCore(editingCoreId_);
+        if (core == nullptr) {
+            return;
+        }
+        const D2D1_POINT_2F dip =
+            WorldToScreen(VisualCorePosition(*core));
+        const float scale = dpi_ / 96.0f;
+        const int width = static_cast<int>(190.0f * scale);
+        const int height = static_cast<int>(29.0f * scale);
+        const int left = static_cast<int>((dip.x - 95.0f) * scale);
+        const int top = static_cast<int>((dip.y + 43.0f) * scale);
+        SetWindowPos(editWindow_, HWND_TOP, left, top, width, height, SWP_NOACTIVATE);
+    }
+
+    void EndRename(bool commit) {
+        if (editWindow_ == nullptr) {
+            return;
+        }
+        HWND edit = editWindow_;
+        editWindow_ = nullptr;
+        const std::uint64_t coreId = editingCoreId_;
+        editingCoreId_ = 0;
+        std::wstring value;
+        if (commit) {
+            const int length = GetWindowTextLengthW(edit);
+            value.resize(static_cast<std::size_t>(length) + 1);
+            GetWindowTextW(edit, value.data(), length + 1);
+            value.resize(length);
+            value = Trim(std::move(value));
+        }
+        SetWindowLongPtrW(edit, GWLP_WNDPROC, reinterpret_cast<LONG_PTR>(oldEditProc_));
+        oldEditProc_ = nullptr;
+        DestroyWindow(edit);
+        interactionShapes_.clear();
+
+        if (commit && !value.empty()) {
+            if (Core* core = FindCore(coreId); core != nullptr && core->name != value) {
+                PushUndo(state_);
+                core->name = Shorten(value, 40);
+                core->iconKind = InferCoreIconKind(*core);
+                if (!core->themeColorCustomized) {
+                    core->themeColor = DefaultCoreColor(core->iconKind);
+                }
+                ScheduleSave();
+            }
+        }
+        Invalidate();
+    }
+
+    void FitView() {
+        EndRename(true);
+        if (state_.cores.empty()) {
+            state_.zoom = 1.0f;
+            state_.viewOffset = D2D1::Point2F(0, 48.0f);
+            layoutDirty_ = true;
+            return;
+        }
+        float minX = state_.cores.front().position.x;
+        float minY = state_.cores.front().position.y;
+        float maxX = state_.cores.front().position.x;
+        float maxY = state_.cores.front().position.y;
+        for (const Core& core : state_.cores) {
+            minX = std::min(minX, core.position.x);
+            minY = std::min(minY, core.position.y);
+            maxX = std::max(maxX, core.position.x);
+            maxY = std::max(maxY, core.position.y);
+        }
+        const D2D1_SIZE_F client = renderTarget_ != nullptr
+                                       ? renderTarget_->GetSize()
+                                       : D2D1::SizeF(1200.0f, 760.0f);
+        constexpr float clusterMargin = 340.0f;
+        const float availableWidth =
+            std::max(100.0f, client.width - clusterMargin * 2.0f);
+        const float availableHeight =
+            std::max(100.0f, client.height - clusterMargin * 2.0f);
+        const float width = std::max(1.0f, maxX - minX);
+        const float height = std::max(1.0f, maxY - minY);
+        state_.zoom = std::clamp(std::min(availableWidth / width, availableHeight / height),
+                                 0.75f, 1.5f);
+        state_.viewOffset.x =
+            client.width / 2.0f - (minX + maxX) / 2.0f * state_.zoom;
+        state_.viewOffset.y =
+            client.height / 2.0f - (minY + maxY) / 2.0f * state_.zoom;
+        ScheduleSave();
+        Invalidate();
+    }
+
+    void PushUndo(const WorkspaceState& snapshot) {
+        undoStack_.push_back(snapshot);
+        if (undoStack_.size() > 32) {
+            undoStack_.erase(undoStack_.begin());
+        }
+    }
+
+    void PushUndo(WorkspaceState&& snapshot) {
+        undoStack_.push_back(std::move(snapshot));
+        if (undoStack_.size() > 32) {
+            undoStack_.erase(undoStack_.begin());
+        }
+    }
+
+    void Undo() {
+        EndRename(false);
+        if (undoStack_.empty()) {
+            SetStatus(L"没有可撤销的操作");
+            return;
+        }
+        state_ = std::move(undoStack_.back());
+        undoStack_.pop_back();
+        ClearSelection();
+        hover_ = {};
+        ResetFocusImmediately();
+        iconCache_.clear();
+        iconShadowCache_.clear();
+        ScheduleSave();
+        SetStatus(L"已撤销上一步操作");
+        Invalidate();
+    }
+
+    void ScheduleSave(bool requireLayoutRebuild = true) {
+        dirty_ = true;
+        if (requireLayoutRebuild) {
+            layoutDirty_ = true;
+        }
+        if (window_ != nullptr) {
+            SetTimer(window_, kSaveTimer, 600, nullptr);
+        }
+    }
+
+    void OnTimer(WPARAM timer) {
+        if (timer == kSaveTimer) {
+            KillTimer(window_, kSaveTimer);
+            SaveState();
+        } else if (timer == kStatusTimer) {
+            KillTimer(window_, kStatusTimer);
+            status_.clear();
+            Invalidate();
+        } else if (timer == kAnimationTimer) {
+            const float total =
+                focusConfirmationMs_ +
+                std::max(focusMotionMs_, focusFadeMs_);
+            if (FocusAnimationActive() &&
+                AnimationElapsedMilliseconds() >= total) {
+                focusAnimationState_ =
+                    focusedCoreId_ == 0 ? FocusAnimationState::Idle
+                                        : FocusAnimationState::Focused;
+                animationCoreFrom_.clear();
+                animationFromFocus_.clear();
+            }
+            const float expansionElapsed =
+                std::chrono::duration<float, std::milli>(
+                    std::chrono::steady_clock::now() - coreExpansionStarted_).count();
+            if (!coreExpansionFrom_.empty() &&
+                expansionElapsed >=
+                    CoreExpansionDurationMilliseconds()) {
+                coreExpansionFrom_.clear();
+                layoutDirty_ = true;
+            }
+            if (!FocusAnimationActive() && coreExpansionFrom_.empty()) {
+                KillTimer(window_, kAnimationTimer);
+            }
+            Invalidate();
+        } else if (timer == kCoreSelectionHaloTimer) {
+            constexpr float kExpansionMilliseconds = 1400.0f;
+            if (!SelectionRippleShouldAnimate()) {
+                KillTimer(window_, kCoreSelectionHaloTimer);
+                return;
+            }
+            const float elapsed = std::chrono::duration<float, std::milli>(
+                std::chrono::steady_clock::now() - coreSelectionRippleStarted_).count();
+            if (state_.coreSelectionEffect ==
+                    CoreSelectionEffect::RippleOnceThenStatic &&
+                elapsed >= kExpansionMilliseconds) {
+                coreSelectionRippleCompleted_ = true;
+                KillTimer(window_, kCoreSelectionHaloTimer);
+            }
+            // Pure presentation invalidation: no layout cache, collision or
+            // coordinate state is changed by the selected-core ripple.
+            Invalidate();
+        } else if (timer == kSelectionDismissTimer) {
+            PollSelectionDismissal();
+        } else if (timer == kMarqueeTimer) {
+            const bool validHover =
+                hasMarqueeLabels_ &&
+                hover_.kind == HitKind::Item &&
+                hover_.itemId == marqueeItemId_ &&
+                FindItem(hover_.coreId, hover_.itemId) != nullptr;
+            if (!validHover) {
+                hasMarqueeLabels_ = false;
+                marqueeItemId_ = 0;
+                KillTimer(window_, kMarqueeTimer);
+            } else {
+                Invalidate();
+            }
+        } else if (timer == kRelationPreviewTimer) {
+            KillTimer(window_, kRelationPreviewTimer);
+            if (draggingItem_ && relationTargetItemId_ != 0) {
+                Invalidate();
+            }
+        } else if (timer == kReferenceCheckTimer) {
+            KillTimer(window_, kReferenceCheckTimer);
+            if (!state_.workspacePaused) CheckReferences();
+        } else if (timer == kHoverTooltipTimer) {
+            KillTimer(window_, kHoverTooltipTimer);
+            if (hover_.kind == HitKind::Item) {
+                Invalidate();
+            }
+        }
+    }
+
+    void SetStatus(std::wstring message) {
+        status_ = std::move(message);
+        if (window_ != nullptr) {
+            SetTimer(window_, kStatusTimer, 3600, nullptr);
+        }
+        Invalidate();
+    }
+
+    void LoadState() {
+        stateFile_ = StateFilePath();
+        const std::optional<std::string> stateText = ReadUtf8File(stateFile_);
+        if (stateText && DeserializeState(*stateText, state_)) {
+            return;
+        }
+        const std::optional<std::string> backup =
+            ReadUtf8File(stateFile_.wstring() + L".bak");
+        if (backup && DeserializeState(*backup, state_)) {
+            SetStatus(L"主状态文件无效，已从备份恢复");
+            dirty_ = true;
+            return;
+        }
+        const bool existingStateWasUnreadable = stateText.has_value() || backup.has_value();
+        Core unclassified;
+        unclassified.id = kUnclassifiedCoreId;
+        unclassified.name = L"未分类";
+        unclassified.position = D2D1::Point2F(360.0f, 300.0f);
+        unclassified.expanded = true;
+        state_.cores.push_back(std::move(unclassified));
+        state_.nextId = 2;
+        state_.viewOffset = D2D1::Point2F(70.0f, 65.0f);
+        state_.zoom = 1.0f;
+        stateRecoveryBlocked_ = existingStateWasUnreadable;
+        dirty_ = !existingStateWasUnreadable;
+        if (existingStateWasUnreadable) {
+            SetStatus(L"状态文件和备份均无法读取；原文件已保留，未覆盖。请导入备份或导出当前恢复副本。");
+        }
+    }
+
+    void CreateBenchmarkWorkspace() {
+        state_ = {};
+        state_.nextId = 2;
+        state_.viewOffset = D2D1::Point2F(40.0f, 60.0f);
+        state_.zoom = 0.75f;
+        for (int coreIndex = 0; coreIndex < 4; ++coreIndex) {
+            Core core;
+            core.id = coreIndex == 0 ? kUnclassifiedCoreId : state_.nextId++;
+            core.name = coreIndex == 0 ? L"未分类"
+                                       : L"性能核心 " + std::to_wstring(coreIndex);
+            core.position = D2D1::Point2F(
+                340.0f + static_cast<float>(coreIndex % 2) * 760.0f,
+                300.0f + static_cast<float>(coreIndex / 2) * 600.0f);
+            core.expanded = true;
+            core.displayLimit = kNormalVisibleLimit;
+            core.layoutVersion = kLayoutVersion;
+            for (int itemIndex = 0;
+                 itemIndex < kCoreFileCapacity; ++itemIndex) {
+                FileItem item;
+                item.id = state_.nextId++;
+                item.path = L"C:\\GravityBenchmark\\core_" + std::to_wstring(coreIndex) +
+                            L"_file_" + std::to_wstring(itemIndex) +
+                            (itemIndex % 3 == 0 ? L".pdf"
+                                               : (itemIndex % 3 == 1 ? L".png" : L".txt"));
+                item.favorite = itemIndex == 0;
+                item.missing = true;
+                AssignNewItemLayout(core, item);
+                core.files.push_back(std::move(item));
+            }
+            state_.cores.push_back(std::move(core));
+        }
+        dirty_ = false;
+        undoStack_.clear();
+    }
+
+    bool SaveState() {
+        if (benchmarkMode_ || !dirty_ || stateFile_.empty()) {
+            return !stateRecoveryBlocked_;
+        }
+        if (stateRecoveryBlocked_) {
+            SetStatus(L"状态恢复待处理：不会覆盖原始损坏文件");
+            return false;
+        }
+        UpdateCoreRatios();
+        if (WriteUtf8Atomic(stateFile_, SerializeState(state_))) {
+            dirty_ = false;
+            CreateHistoryBackup(false);
+            return true;
+        } else {
+            SetStatus(L"状态保存失败；当前内存中的布局仍然有效");
+            return false;
+        }
+    }
+
+    void Resize() {
+        if (window_ == nullptr || IsIconic(window_)) {
+            return;
+        }
+        RECT client{};
+        GetClientRect(window_, &client);
+        if (client.right <= 1 || client.bottom <= 1) {
+            return;
+        }
+        if (renderTarget_ != nullptr) DiscardDeviceResources();
+        if (draggingDivider_) {
+            // During a divider drag redraw only the changed desktop boundary.
+            // Core ratios, collision recovery and text resources are deferred
+            // until mouse release so saved layouts are not continuously rebuilt.
+            Invalidate();
+            return;
+        }
+        ApplyCoreRatiosToWorkspace();
+        RefreshResponsiveMetrics(true);
+        PositionEditWindow();
+        Invalidate();
+    }
+
+    void OnDpiChanged(WPARAM wParam, LPARAM lParam) {
+        dpi_ = static_cast<float>(HIWORD(wParam));
+        RefreshWindowsVisualProfile();
+        (void)lParam;
+        // The suggested rectangle belongs to a movable normal window.  This
+        // desktop companion must instead reacquire the current monitor work
+        // area and remain attached to its right half/full-workspace mode.
+        ApplyCompanionWorkspaceFrame();
+        if (renderTarget_ != nullptr) DiscardDeviceResources();
+        ApplyCoreRatiosToWorkspace();
+        RefreshResponsiveMetrics(true);
+        PositionEditWindow();
+        Invalidate();
+    }
+
+    void Invalidate() const {
+        if (window_ != nullptr) {
+            InvalidateRect(window_, nullptr, FALSE);
+        }
+    }
+
+    HWND window_ = nullptr;
+    HWND interactionWindow_ = nullptr;
+    HWND lifecycleWindow_ = nullptr;
+    float dpi_ = 96.0f;
+    std::wstring systemUiFontFamily_ = L"Segoe UI";
+    std::wstring desktopIconFontFamily_ = L"Segoe UI";
+    float desktopIconSizeDip_ = 48.0f;
+    float desktopFileFontSizeDip_ = 12.0f;
+    WorkspaceState state_;
+    ResponsiveMetrics metrics_;
+    std::vector<WorkspaceState> undoStack_;
+    std::unordered_map<std::uint64_t, CoreLayoutSnapshot>
+        lastCoreLayouts_;
+    std::filesystem::path stateFile_;
+    bool dirty_ = false;
+    bool benchmarkMode_ = false;
+    bool initialized_ = false;
+    bool shuttingDown_ = false;
+    bool stateRecoveryBlocked_ = false;
+    bool applyingWorkspaceFrame_ = false;
+    bool hidingToTray_ = false;
+    bool exitRequested_ = false;
+    bool workspaceVisible_ = true;
+    bool trayIconAdded_ = false;
+    bool trayRebuildPending_ = false;
+    bool shellHookRegistered_ = false;
+    HWND desktopHost_ = nullptr;
+    bool desktopChildHosted_ = false;
+    bool desktopHostAttachmentAttempted_ = false;
+    bool desktopReconnectPending_ = false;
+    bool desktopReconnectInProgress_ = false;
+    int desktopReconnectAttempts_ = 0;
+    bool interactionDropTargetRegistered_ = false;
+    std::vector<InteractionShape> interactionShapes_;
+    HDC interactionDeviceContext_ = nullptr;
+    HBITMAP interactionBitmap_ = nullptr;
+    HGDIOBJ interactionPreviousBitmap_ = nullptr;
+    void* interactionBits_ = nullptr;
+    SIZE interactionPixelSize_{0, 0};
+    bool selectionDismissTimerActive_ = false;
+    bool selectionDismissButtonsDown_ = false;
+    bool popupMenuOpen_ = false;
+    bool tutorialActive_ = false;
+    int tutorialStep_ = 0;
+    bool layoutDirty_ = true;
+    LayoutMap layoutCache_;
+    std::map<std::uint64_t, D2D1_POINT_2F> coreDisplayPositions_;
+
+    ComPtr<ID2D1Factory> factory_;
+    ComPtr<ID2D1RenderTarget> renderTarget_;
+    ComPtr<IWICBitmap> layeredSurface_;
+    ComPtr<ID2D1SolidColorBrush> brush_;
+    ComPtr<IDWriteFactory> writeFactory_;
+    ComPtr<IDWriteTextFormat> bodyFormat_;
+    ComPtr<IDWriteTextFormat> coreFormat_;
+    ComPtr<IDWriteTextFormat> hudFormat_;
+    ComPtr<IDWriteTextFormat> fileNameFormat_;
+    ComPtr<IDWriteTextFormat> fileImportantFormat_;
+    ComPtr<IDWriteTextFormat> fileMinorFormat_;
+    ComPtr<IDWriteTextFormat> fileMarqueeFormat_;
+    ComPtr<IDWriteTextFormat> tooltipFormat_;
+    ComPtr<IDWriteTextFormat> tooltipBodyFormat_;
+    ComPtr<IDWriteTextFormat> tutorialTitleFormat_;
+    ComPtr<IDWriteTextFormat> tutorialStepFormat_;
+    ComPtr<IDWriteTextFormat> tutorialBodyFormat_;
+    ComPtr<IDWriteTextFormat> tutorialButtonFormat_;
+    ComPtr<IWICImagingFactory> wicFactory_;
+    std::unordered_map<std::wstring, ComPtr<ID2D1Bitmap>> iconCache_;
+    std::unordered_map<std::wstring, ComPtr<ID2D1Bitmap>>
+        iconShadowCache_;
+    std::unordered_map<std::wstring, float> marqueeWidthCache_;
+    bool hasMarqueeLabels_ = false;
+    std::uint64_t marqueeItemId_ = 0;
+    std::chrono::steady_clock::time_point marqueeStarted_ =
+        std::chrono::steady_clock::now();
+    std::chrono::steady_clock::time_point hoverStarted_ =
+        std::chrono::steady_clock::now();
+
+    HitResult selected_;
+    HitResult hover_;
+    std::chrono::steady_clock::time_point coreSelectionRippleStarted_ =
+        std::chrono::steady_clock::now();
+    bool coreSelectionRippleCompleted_ = false;
+    std::uint64_t focusedCoreId_ = 0;
+    FocusAnimationState focusAnimationState_ = FocusAnimationState::Idle;
+    std::chrono::steady_clock::time_point focusAnimationStarted_ =
+        std::chrono::steady_clock::now();
+    float focusConfirmationMs_ = 75.0f;
+    float focusMotionMs_ = 280.0f;
+    float focusFadeMs_ = 240.0f;
+    float animationFromEnvelope_ = 0.0f;
+    std::unordered_map<std::uint64_t, D2D1_POINT_2F> animationCoreFrom_;
+    std::unordered_map<std::uint64_t, float> animationFromFocus_;
+    std::unordered_map<std::uint64_t, float> coreExpansionFrom_;
+    std::unordered_map<std::uint64_t, CoreLayoutInvariant> layoutInvariants_;
+    std::chrono::steady_clock::time_point coreExpansionStarted_ =
+        std::chrono::steady_clock::now();
+    bool mouseTracking_ = false;
+    bool panning_ = false;
+    bool draggingCore_ = false;
+    bool draggingItem_ = false;
+    bool draggingDivider_ = false;
+    bool coreDistanceSliderActive_ = false;
+    bool draggingCoreDistancePanel_ = false;
+    bool draggingCoreDistanceSlider_ = false;
+    bool coreAppearancePanelActive_ = false;
+    bool draggingCoreAppearancePanel_ = false;
+    bool draggingCoreAppearanceSlider_ = false;
+    bool corePlacementMode_ = false;
+    bool distanceLimitReached_ = false;
+    bool distanceCompactWarning_ = false;
+    CoreLayoutControl activeCoreLayoutControl_ =
+        CoreLayoutControl::InnerDistance;
+    CoreAppearanceControl activeCoreAppearanceControl_ =
+        CoreAppearanceControl::CoreScale;
+    bool dividerHovered_ = false;
+    bool dragMoved_ = false;
+    std::uint64_t dragCoreId_ = 0;
+    std::uint64_t dragItemId_ = 0;
+    std::uint64_t dragTargetCoreId_ = 0;
+    std::uint64_t externalDropCoreId_ = 0;
+    std::uint64_t externalDropItemId_ = 0;
+    std::uint64_t relationTargetItemId_ = 0;
+    std::uint64_t relationTargetCoreId_ = 0;
+    std::chrono::steady_clock::time_point relationHoverStarted_ =
+        std::chrono::steady_clock::now();
+    D2D1_POINT_2F pointerStartDip_ = D2D1::Point2F();
+    D2D1_POINT_2F pointerStartWorld_ = D2D1::Point2F();
+    D2D1_POINT_2F coreStartPosition_ = D2D1::Point2F();
+    D2D1_POINT_2F panStartOffset_ = D2D1::Point2F();
+    D2D1_POINT_2F dragWorld_ = D2D1::Point2F();
+    D2D1_POINT_2F dragItemStartWorld_ = D2D1::Point2F();
+    D2D1_POINT_2F contextWorld_ = D2D1::Point2F();
+    D2D1_POINT_2F contextDip_ = D2D1::Point2F();
+    D2D1_POINT_2F coreDistanceSliderAnchorDip_ = D2D1::Point2F();
+    D2D1_POINT_2F coreDistancePanelDragOffsetDip_ = D2D1::Point2F();
+    D2D1_POINT_2F coreAppearancePanelAnchorDip_ = D2D1::Point2F();
+    D2D1_POINT_2F coreAppearancePanelDragOffsetDip_ = D2D1::Point2F();
+    D2D1_POINT_2F corePlacementPreviewDip_ = D2D1::Point2F();
+    std::uint64_t coreDistanceSliderCoreId_ = 0;
+    std::uint64_t coreAppearancePanelCoreId_ = 0;
+    std::optional<UINT32> appearancePreviewColor_;
+    WorkspaceState dragSnapshot_;
+    WorkspaceState coreDistanceDragSnapshot_;
+    WorkspaceState coreAppearanceDragSnapshot_;
+
+    HWND editWindow_ = nullptr;
+    WNDPROC oldEditProc_ = nullptr;
+    std::uint64_t editingCoreId_ = 0;
+    std::wstring status_;
+    std::int64_t lastHistoryBackupTime_ = 0;
+    HDC layeredDeviceContext_ = nullptr;
+    HBITMAP layeredBitmap_ = nullptr;
+    HGDIOBJ layeredPreviousBitmap_ = nullptr;
+    void* layeredBits_ = nullptr;
+    SIZE layeredPixelSize_{0, 0};
+};
+
+LRESULT CALLBACK WindowProcedure(HWND window, UINT message, WPARAM wParam, LPARAM lParam) {
+    GravityApp* app =
+        reinterpret_cast<GravityApp*>(GetWindowLongPtrW(window, GWLP_USERDATA));
+    if (message == WM_NCCREATE) {
+        const auto* create = reinterpret_cast<CREATESTRUCTW*>(lParam);
+        app = static_cast<GravityApp*>(create->lpCreateParams);
+        SetWindowLongPtrW(window, GWLP_USERDATA, reinterpret_cast<LONG_PTR>(app));
+        if (app != nullptr) {
+            app->AttachWindow(window);
+        }
+        return DefWindowProcW(window, message, wParam, lParam);
+    }
+    if (message == WM_CREATE) {
+        if (app == nullptr ||
+            (!app->IsInitialized() &&
+             !app->Initialize(window))) {
+            MessageBoxW(window, L"图形资源初始化失败。", kWindowTitle, MB_OK | MB_ICONERROR);
+            return -1;
+        }
+    }
+    if (app != nullptr) {
+        return app->HandleMessage(
+            window, message, wParam, lParam);
+    }
+    return DefWindowProcW(window, message, wParam, lParam);
+}
+
+LRESULT CALLBACK ShellLifecycleWindowProcedure(
+    HWND window, UINT message, WPARAM wParam, LPARAM lParam) {
+    GravityApp* app =
+        reinterpret_cast<GravityApp*>(
+            GetWindowLongPtrW(window, GWLP_USERDATA));
+    if (message == WM_NCCREATE) {
+        const auto* create =
+            reinterpret_cast<CREATESTRUCTW*>(lParam);
+        app = static_cast<GravityApp*>(
+            create->lpCreateParams);
+        SetWindowLongPtrW(
+            window, GWLP_USERDATA,
+            reinterpret_cast<LONG_PTR>(app));
+        if (app != nullptr) {
+            app->AttachLifecycleWindow(window);
+        }
+        return DefWindowProcW(
+            window, message, wParam, lParam);
+    }
+    if (app != nullptr) {
+        return app->HandleShellLifecycleMessage(
+            window, message, wParam, lParam);
+    }
+    return DefWindowProcW(
+        window, message, wParam, lParam);
+}
+
+LRESULT CALLBACK InteractionWindowProcedure(
+    HWND window, UINT message, WPARAM wParam, LPARAM lParam) {
+    GravityApp* app =
+        reinterpret_cast<GravityApp*>(
+            GetWindowLongPtrW(window, GWLP_USERDATA));
+    if (message == WM_NCCREATE) {
+        const auto* create =
+            reinterpret_cast<CREATESTRUCTW*>(lParam);
+        app = static_cast<GravityApp*>(
+            create->lpCreateParams);
+        SetWindowLongPtrW(
+            window, GWLP_USERDATA,
+            reinterpret_cast<LONG_PTR>(app));
+        if (app != nullptr) {
+            app->AttachInteractionWindow(window);
+        }
+        return DefWindowProcW(
+            window, message, wParam, lParam);
+    }
+    if (app != nullptr) {
+        return app->HandleInteractionMessage(
+            window, message, wParam, lParam);
+    }
+    return DefWindowProcW(
+        window, message, wParam, lParam);
+}
+
+bool RunSelfTest() {
+    const D2D1_SIZE_F viewport = D2D1::SizeF(100.0f, 100.0f);
+    if (IconFullyOutsideViewport(D2D1::Point2F(-10.0f, 50.0f), 20.0f, viewport) ||
+        IconFullyOutsideViewport(D2D1::Point2F(110.0f, 50.0f), 20.0f, viewport) ||
+        !IconFullyOutsideViewport(D2D1::Point2F(-20.0f, 50.0f), 20.0f, viewport) ||
+        !IconFullyOutsideViewport(D2D1::Point2F(120.0f, 50.0f), 20.0f, viewport)) {
+        return false;
+    }
+
+    GravityApp recoveryFailureApp;
+    recoveryFailureApp.stateRecoveryBlocked_ = true;
+    recoveryFailureApp.dirty_ = true;
+    if (CommitImportedStateWrite(
+            recoveryFailureApp.stateRecoveryBlocked_, []() { return false; }) ||
+        !recoveryFailureApp.stateRecoveryBlocked_ ||
+        recoveryFailureApp.SaveState()) {
+        return false;
+    }
+    bool recoveryClearedAfterSuccess = true;
+    if (!CommitImportedStateWrite(
+            recoveryClearedAfterSuccess, []() { return true; }) ||
+        recoveryClearedAfterSuccess) {
+        return false;
+    }
+
+    GravityApp connectionWidthApp;
+    connectionWidthApp.layoutDirty_ = false;
+    connectionWidthApp.dirty_ = false;
+    WorkspaceState expectedConnectionState =
+        connectionWidthApp.state_;
+    expectedConnectionState.connectionLineWidth =
+        kConnectionLineWidthThin;
+    connectionWidthApp.ExecuteMenuCommand(
+        MenuConnectionStyleThin);
+    if (connectionWidthApp.layoutDirty_ ||
+        !connectionWidthApp.dirty_ ||
+        SerializeState(connectionWidthApp.state_) !=
+            SerializeState(expectedConnectionState)) {
+        return false;
+    }
+    connectionWidthApp.SetCoreAppearanceControlValue(
+        0, CoreAppearanceControl::LineWidth, 1.37f);
+    if (std::abs(
+            connectionWidthApp.state_.connectionLineWidth -
+            1.37f) > 0.001f ||
+        ConnectionWidthPresetFor(
+            connectionWidthApp.state_.connectionLineWidth) !=
+            ConnectionWidthPreset::Custom) {
+        return false;
+    }
+    GravityApp connectionColorApp;
+    Core connectionColorCore;
+    connectionColorCore.id = 1;
+    connectionColorApp.state_.cores.push_back(connectionColorCore);
+    connectionColorApp.layoutDirty_ = false;
+    connectionColorApp.dirty_ = false;
+    WorkspaceState expectedConnectionColorState =
+        connectionColorApp.state_;
+    expectedConnectionColorState.cores.front().
+        connectionLineColorMode = ConnectionLineColorMode::Black;
+    connectionColorApp.ApplyConnectionLineColorMode(
+        1, ConnectionLineColorMode::Black);
+    if (connectionColorApp.layoutDirty_ ||
+        !connectionColorApp.dirty_ ||
+        SerializeState(connectionColorApp.state_) !=
+            SerializeState(expectedConnectionColorState)) {
+        return false;
+    }
+
+    std::error_code tempError;
+    const std::filesystem::path saveBlocker =
+        std::filesystem::temp_directory_path(tempError) /
+        (L"GravityDesktop.SaveFailure." +
+         std::to_wstring(GetCurrentProcessId()));
+    if (tempError) {
+        return false;
+    }
+    HANDLE blockerFile = CreateFileW(
+        saveBlocker.c_str(), GENERIC_WRITE, 0, nullptr, CREATE_ALWAYS,
+        FILE_ATTRIBUTE_TEMPORARY, nullptr);
+    if (blockerFile == INVALID_HANDLE_VALUE) {
+        return false;
+    }
+    CloseHandle(blockerFile);
+    GravityApp saveFailureApp;
+    saveFailureApp.stateFile_ = saveBlocker / L"state.json";
+    saveFailureApp.dirty_ = true;
+    saveFailureApp.ExecuteMenuCommand(MenuSaveNow);
+    const bool saveFailureWasNotReportedAsSuccess =
+        saveFailureApp.dirty_ &&
+        saveFailureApp.status_ != L"布局已保存" &&
+        saveFailureApp.status_.find(L"保存失败") != std::wstring::npos;
+    DeleteFileW(saveBlocker.c_str());
+    if (!saveFailureWasNotReportedAsSuccess) {
+        return false;
+    }
+
+    HWND pauseVisual = CreateWindowExW(
+        WS_EX_TOOLWINDOW, L"STATIC", L"", WS_POPUP | WS_VISIBLE,
+        0, 0, 16, 16, nullptr, nullptr, GetModuleHandleW(nullptr), nullptr);
+    HWND pauseInteraction = CreateWindowExW(
+        WS_EX_TOOLWINDOW, L"STATIC", L"", WS_POPUP | WS_VISIBLE,
+        0, 0, 16, 16, nullptr, nullptr, GetModuleHandleW(nullptr), nullptr);
+    if (pauseVisual == nullptr || pauseInteraction == nullptr) {
+        if (pauseInteraction != nullptr) DestroyWindow(pauseInteraction);
+        if (pauseVisual != nullptr) DestroyWindow(pauseVisual);
+        return false;
+    }
+    GravityApp pauseApp;
+    pauseApp.AttachWindow(pauseVisual);
+    pauseApp.AttachInteractionWindow(pauseInteraction);
+    pauseApp.ToggleWorkspacePause();
+    const bool pauseHidBothWindows =
+        pauseApp.state_.workspacePaused &&
+        IsWindowVisible(pauseVisual) == FALSE &&
+        IsWindowVisible(pauseInteraction) == FALSE;
+    DestroyWindow(pauseInteraction);
+    DestroyWindow(pauseVisual);
+    if (!pauseHidBothWindows) {
+        return false;
+    }
+
+    const std::filesystem::path relationTestDirectory =
+        std::filesystem::temp_directory_path(tempError) /
+        (L"GravityDesktop.ExternalRelation." +
+         std::to_wstring(GetCurrentProcessId()) + L"." +
+         std::to_wstring(UnixTimeNow()));
+    if (tempError ||
+        !std::filesystem::create_directories(
+            relationTestDirectory, tempError) ||
+        tempError) {
+        return false;
+    }
+    struct RelationTestCleanup {
+        std::filesystem::path path;
+        ~RelationTestCleanup() {
+            std::error_code ignored;
+            std::filesystem::remove_all(path, ignored);
+        }
+    } relationTestCleanup{relationTestDirectory};
+    const auto makeRelationCore =
+        [](std::uint64_t coreId,
+           std::uint64_t parentId) {
+            Core core;
+            core.id = coreId;
+            core.name = L"关系测试";
+            core.position =
+                D2D1::Point2F(300.0f, 260.0f);
+            core.expanded = true;
+            core.layoutTemplate =
+                LayoutTemplate::CompactDouble;
+            FileItem parent;
+            parent.id = parentId;
+            parent.path =
+                L"C:\\GravityDesktopSelfTest\\parent.txt";
+            parent.originalName = L"parent.txt";
+            parent.displayName = L"parent";
+            parent.slot = 0;
+            parent.ring = 0;
+            parent.ringSlot = 0;
+            core.files.push_back(std::move(parent));
+            return core;
+        };
+    const auto makeTestDrop =
+        [](const std::vector<std::wstring>& paths,
+           POINT point) -> HDROP {
+            std::size_t characterCount = 1;
+            for (const std::wstring& path : paths) {
+                characterCount += path.size() + 1;
+            }
+            const SIZE_T bytes =
+                sizeof(DROPFILES) +
+                characterCount * sizeof(wchar_t);
+            HGLOBAL memory = GlobalAlloc(
+                GMEM_MOVEABLE | GMEM_ZEROINIT, bytes);
+            if (memory == nullptr) {
+                return nullptr;
+            }
+            auto* header = static_cast<DROPFILES*>(
+                GlobalLock(memory));
+            if (header == nullptr) {
+                GlobalFree(memory);
+                return nullptr;
+            }
+            header->pFiles = sizeof(DROPFILES);
+            header->pt = point;
+            header->fNC = FALSE;
+            header->fWide = TRUE;
+            wchar_t* destination =
+                reinterpret_cast<wchar_t*>(
+                    reinterpret_cast<std::byte*>(header) +
+                    sizeof(DROPFILES));
+            for (const std::wstring& path : paths) {
+                std::memcpy(
+                    destination, path.c_str(),
+                    (path.size() + 1) *
+                        sizeof(wchar_t));
+                destination += path.size() + 1;
+            }
+            *destination = L'\0';
+            GlobalUnlock(memory);
+            return reinterpret_cast<HDROP>(memory);
+        };
+
+    const std::wstring newChildPath =
+        L"C:\\GravityDesktopSelfTest\\new-child.txt";
+    GravityApp externalRelationApp;
+    externalRelationApp.stateFile_ =
+        relationTestDirectory / L"relation-success.json";
+    externalRelationApp.state_.nextId = 102;
+    externalRelationApp.state_.cores.push_back(
+        makeRelationCore(100, 101));
+    Core* previewCore =
+        externalRelationApp.FindCore(100);
+    FileItem* previewParent =
+        externalRelationApp.FindItem(100, 101);
+    if (previewCore == nullptr ||
+        previewParent == nullptr) {
+        return false;
+    }
+    const auto& previewLayouts =
+        externalRelationApp.StableLayouts();
+    const auto previewLayout =
+        previewLayouts.find(100);
+    if (previewLayout == previewLayouts.end()) {
+        return false;
+    }
+    const auto previewEntry = std::find_if(
+        previewLayout->second.begin(),
+        previewLayout->second.end(),
+        [](const ItemLayout& entry) {
+            return entry.item != nullptr &&
+                   entry.item->id == 101;
+        });
+    if (previewEntry == previewLayout->second.end()) {
+        return false;
+    }
+    const D2D1_POINT_2F previewParentScreen =
+        externalRelationApp.WorldToScreen(
+            previewEntry->position);
+    const POINTL previewItemPoint{
+        static_cast<LONG>(std::round(
+            previewParentScreen.x)),
+        static_cast<LONG>(std::round(
+            previewParentScreen.y))};
+    if (!externalRelationApp.UpdateExternalDropPreview(
+            previewItemPoint, true) ||
+        externalRelationApp.externalDropCoreId_ != 100 ||
+        externalRelationApp.externalDropItemId_ != 101) {
+        return false;
+    }
+    externalRelationApp.ClearExternalDropPreview();
+    const std::string beforeMultiDrop =
+        SerializeState(externalRelationApp.state_);
+    HDROP multiDrop = makeTestDrop(
+        {L"C:\\GravityDesktopSelfTest\\multi-a.txt",
+         L"C:\\GravityDesktopSelfTest\\multi-b.txt"},
+        POINT{previewItemPoint.x,
+              previewItemPoint.y});
+    if (multiDrop == nullptr) {
+        return false;
+    }
+    externalRelationApp.OnDropFiles(multiDrop);
+    if (SerializeState(externalRelationApp.state_) !=
+            beforeMultiDrop ||
+        !externalRelationApp.undoStack_.empty() ||
+        externalRelationApp.status_ !=
+            L"一次只能添加一个子文件") {
+        return false;
+    }
+    const D2D1_POINT_2F previewCoreScreen =
+        externalRelationApp.WorldToScreen(
+            previewCore->position);
+    const POINTL previewCorePoint{
+        static_cast<LONG>(std::round(
+            previewCoreScreen.x)),
+        static_cast<LONG>(std::round(
+            previewCoreScreen.y))};
+    if (!externalRelationApp.UpdateExternalDropPreview(
+            previewCorePoint, true) ||
+        externalRelationApp.externalDropCoreId_ != 100 ||
+        externalRelationApp.externalDropItemId_ != 0) {
+        return false;
+    }
+    externalRelationApp.ClearExternalDropPreview();
+    HDROP childDrop = makeTestDrop(
+        {newChildPath},
+        POINT{previewItemPoint.x,
+              previewItemPoint.y});
+    if (childDrop == nullptr) {
+        return false;
+    }
+    externalRelationApp.OnDropFiles(childDrop);
+    Core* savedOwner = nullptr;
+    FileItem* savedChild =
+        externalRelationApp.FindItemByPath(
+            newChildPath, &savedOwner);
+    if (savedChild == nullptr || savedOwner == nullptr ||
+        savedOwner->id != 100 ||
+        savedOwner->files.size() != 2 ||
+        savedChild->parentFileId != 101 ||
+        externalRelationApp.undoStack_.size() != 1 ||
+        externalRelationApp.dirty_) {
+        return false;
+    }
+    const std::optional<std::string> savedRelationText =
+        ReadUtf8File(externalRelationApp.stateFile_);
+    WorkspaceState savedRelationState;
+    if (!savedRelationText) {
+        return false;
+    }
+    if (!DeserializeState(
+            *savedRelationText, savedRelationState)) {
+        return false;
+    }
+    const auto savedCore = std::find_if(
+        savedRelationState.cores.begin(),
+        savedRelationState.cores.end(),
+        [](const Core& core) {
+            return core.id == 100;
+        });
+    if (savedCore == savedRelationState.cores.end()) {
+        return false;
+    }
+    if (savedCore->files.size() != 2) {
+        return false;
+    }
+    if (std::none_of(
+            savedCore->files.begin(),
+            savedCore->files.end(),
+            [](const FileItem& item) {
+                return item.parentFileId == 101;
+            })) {
+        return false;
+    }
+    externalRelationApp.Undo();
+    if (externalRelationApp.FindItemByPath(
+            newChildPath) != nullptr ||
+        !externalRelationApp.undoStack_.empty()) {
+        return false;
+    }
+    Core* coreDropTarget =
+        externalRelationApp.FindCore(100);
+    if (coreDropTarget == nullptr) {
+        return false;
+    }
+    externalRelationApp.StableLayouts();
+    const D2D1_POINT_2F coreDropScreen =
+        externalRelationApp.WorldToScreen(
+            externalRelationApp.DisplayCoreWorld(
+                *coreDropTarget));
+    HDROP coreDrop = makeTestDrop(
+        {L"C:\\GravityDesktopSelfTest\\core-only.txt"},
+        POINT{
+            static_cast<LONG>(std::round(
+                coreDropScreen.x)),
+            static_cast<LONG>(std::round(
+                coreDropScreen.y))});
+    if (coreDrop == nullptr) {
+        return false;
+    }
+    externalRelationApp.OnDropFiles(coreDrop);
+    FileItem* coreOnlyItem =
+        externalRelationApp.FindItemByPath(
+            L"C:\\GravityDesktopSelfTest\\core-only.txt");
+    if (coreOnlyItem == nullptr ||
+        coreOnlyItem->parentFileId != 0 ||
+        externalRelationApp.undoStack_.size() != 1) {
+        return false;
+    }
+    GravityApp duplicateRelationApp;
+    duplicateRelationApp.stateFile_ =
+        relationTestDirectory / L"relation-duplicate.json";
+    duplicateRelationApp.state_.nextId = 203;
+    Core duplicateCore =
+        makeRelationCore(200, 201);
+    FileItem duplicateChild;
+    duplicateChild.id = 202;
+    duplicateChild.path =
+        L"C:\\GravityDesktopSelfTest\\existing-child.txt";
+    duplicateChild.originalName = L"existing-child.txt";
+    duplicateChild.displayName = L"existing-child";
+    duplicateChild.slot = 1;
+    duplicateChild.ring = 0;
+    duplicateChild.ringSlot = 1;
+    duplicateCore.files.push_back(
+        std::move(duplicateChild));
+    duplicateRelationApp.state_.cores.push_back(
+        std::move(duplicateCore));
+    if (!duplicateRelationApp.AddExternalFileAsChild(
+            L"C:\\GravityDesktopSelfTest\\existing-child.txt",
+            200, 201,
+            D2D1::Point2F(350.0f, 310.0f))) {
+        return false;
+    }
+    FileItem* reusedChild =
+        duplicateRelationApp.FindItem(
+            200, 202);
+    if (reusedChild == nullptr ||
+        reusedChild->parentFileId != 201 ||
+        duplicateRelationApp.state_.cores.front().files.size() != 2 ||
+        duplicateRelationApp.undoStack_.size() != 1) {
+        return false;
+    }
+
+    GravityApp foreignOwnerApp;
+    foreignOwnerApp.state_.nextId = 305;
+    foreignOwnerApp.state_.cores.push_back(
+        makeRelationCore(300, 301));
+    Core foreignCore;
+    foreignCore.id = 302;
+    foreignCore.name = L"其他核心";
+    FileItem foreignItem;
+    foreignItem.id = 303;
+    foreignItem.path =
+        L"C:\\GravityDesktopSelfTest\\foreign.txt";
+    foreignItem.originalName = L"foreign.txt";
+    foreignItem.displayName = L"foreign";
+    foreignItem.slot = 0;
+    foreignCore.files.push_back(
+        std::move(foreignItem));
+    foreignOwnerApp.state_.cores.push_back(
+        std::move(foreignCore));
+    const std::string foreignBefore =
+        SerializeState(foreignOwnerApp.state_);
+    if (foreignOwnerApp.AddExternalFileAsChild(
+            L"C:\\GravityDesktopSelfTest\\foreign.txt",
+            300, 301,
+            D2D1::Point2F(340.0f, 300.0f)) ||
+        SerializeState(foreignOwnerApp.state_) !=
+            foreignBefore ||
+        foreignOwnerApp.status_ !=
+            L"该文件已属于其他核心") {
+        return false;
+    }
+
+    GravityApp fullCoreApp;
+    fullCoreApp.state_.nextId = 500;
+    Core fullCore = makeRelationCore(400, 401);
+    for (std::uint64_t id = 402;
+         id <= 418; ++id) {
+        FileItem item;
+        item.id = id;
+        item.path =
+            L"C:\\GravityDesktopSelfTest\\full-" +
+            std::to_wstring(id) + L".txt";
+        item.originalName =
+            L"full-" + std::to_wstring(id) + L".txt";
+        item.displayName =
+            L"full-" + std::to_wstring(id);
+        item.slot = static_cast<int>(id - 401);
+        fullCore.files.push_back(std::move(item));
+    }
+    fullCoreApp.state_.cores.push_back(
+        std::move(fullCore));
+    const std::string fullCoreBefore =
+        SerializeState(fullCoreApp.state_);
+    if (fullCoreApp.AddExternalFileAsChild(
+            L"C:\\GravityDesktopSelfTest\\overflow.txt",
+            400, 401,
+            D2D1::Point2F(340.0f, 300.0f)) ||
+        SerializeState(fullCoreApp.state_) !=
+            fullCoreBefore ||
+        !fullCoreApp.undoStack_.empty()) {
+        return false;
+    }
+
+    GravityApp capacityUpgradeApp;
+    capacityUpgradeApp.stateFile_ =
+        relationTestDirectory / L"capacity-upgrade.json";
+    capacityUpgradeApp.state_.nextId = 716;
+    Core capacityCore =
+        makeRelationCore(700, 701);
+    for (std::uint64_t id = 702;
+         id <= 715; ++id) {
+        FileItem item;
+        item.id = id;
+        item.path =
+            L"C:\\GravityDesktopSelfTest\\capacity-" +
+            std::to_wstring(id) + L".txt";
+        item.originalName =
+            L"capacity-" +
+            std::to_wstring(id) + L".txt";
+        item.displayName =
+            L"capacity-" + std::to_wstring(id);
+        item.slot = static_cast<int>(id - 701);
+        capacityCore.files.push_back(std::move(item));
+    }
+    capacityUpgradeApp.state_.cores.push_back(
+        std::move(capacityCore));
+    if (!capacityUpgradeApp.AddExternalFileAsChild(
+            L"C:\\GravityDesktopSelfTest\\sixteenth.txt",
+            700, 701,
+            D2D1::Point2F(340.0f, 300.0f))) {
+        return false;
+    }
+    const Core* upgradedCore =
+        capacityUpgradeApp.FindCore(700);
+    if (upgradedCore == nullptr ||
+        AttachedFileCount(*upgradedCore) != 16 ||
+        upgradedCore->layoutTemplate !=
+            LayoutTemplate::HighCapacityDouble) {
+        return false;
+    }
+
+    const std::filesystem::path relationSaveBlocker =
+        relationTestDirectory / L"save-blocker";
+    blockerFile = CreateFileW(
+        relationSaveBlocker.c_str(), GENERIC_WRITE,
+        0, nullptr, CREATE_ALWAYS,
+        FILE_ATTRIBUTE_TEMPORARY, nullptr);
+    if (blockerFile == INVALID_HANDLE_VALUE) {
+        return false;
+    }
+    CloseHandle(blockerFile);
+    GravityApp relationSaveFailureApp;
+    relationSaveFailureApp.stateFile_ =
+        relationSaveBlocker / L"state.json";
+    relationSaveFailureApp.state_.nextId = 602;
+    relationSaveFailureApp.state_.cores.push_back(
+        makeRelationCore(600, 601));
+    const std::string relationFailureBefore =
+        SerializeState(relationSaveFailureApp.state_);
+    if (relationSaveFailureApp.AddExternalFileAsChild(
+            L"C:\\GravityDesktopSelfTest\\rollback.txt",
+            600, 601,
+            D2D1::Point2F(340.0f, 300.0f)) ||
+        SerializeState(relationSaveFailureApp.state_) !=
+            relationFailureBefore ||
+        !relationSaveFailureApp.undoStack_.empty() ||
+        relationSaveFailureApp.status_.find(
+            L"已完整回滚") == std::wstring::npos) {
+        return false;
+    }
+
+    WorkspaceState source;
+    source.nextId = 12;
+    source.viewOffset = D2D1::Point2F(12.5f, -7.25f);
+    source.zoom = 1.15f;
+    source.densityMode = DensityMode::Clear;
+    source.animationMode = AnimationMode::Soft;
+    source.coreSelectionEffect = CoreSelectionEffect::RippleOnceThenStatic;
+    source.connectionLineWidth = 1.47f;
+    source.coreGlowIntensity = 1.32f;
+    source.workspaceWidthRatio = 0.41f;
+    source.workspaceCollapsed = true;
+    source.tutorialCompleted = true;
+    Core core;
+    core.id = kUnclassifiedCoreId;
+    core.name = L"未分类";
+    core.position = D2D1::Point2F(360.0f, 300.0f);
+    core.displayLimit = kNormalVisibleLimit;
+    core.layoutVersion = kLayoutVersion;
+    core.innerRadius = 96.0f;
+    core.middleRadius = 156.0f;
+    core.outerRadius = 220.0f;
+    core.radiusScale = 1.1f;
+    core.distanceScale = 1.34f;
+    core.innerDistanceScale = 0.82f;
+    core.outerDistanceScale = 1.27f;
+    core.rotationAngle = 47.0f;
+    core.userLayoutCustomized = true;
+    core.userAdjustedAt = 1700000200;
+    core.baselineRadiusScale = 1.18f;
+    core.baselineInnerDistanceScale = 0.92f;
+    core.baselineOuterDistanceScale = 1.18f;
+    core.baselineRotationAngle = 22.0f;
+    core.baselineUserLayoutCustomized = true;
+    core.baseInnerRadius = 92.0f;
+    core.baseOuterRadius = 168.0f;
+    core.baselineBaseInnerRadius = 104.0f;
+    core.baselineBaseOuterRadius = 188.0f;
+    core.baselineCreatedAt = 1700000000;
+    core.xRatio = 0.3f;
+    core.yRatio = 0.4f;
+    core.monitorId = L"DISPLAY-TEST";
+    core.themeColor = 0x7E69DA;
+    core.themeColorCustomized = true;
+    core.appearanceCoreScale = 1.14f;
+    core.connectionLineColorMode =
+        ConnectionLineColorMode::White;
+    core.connectionLineCustomColor = 0x345678;
+    core.iconKind = CoreIconKind::Unclassified;
+    core.layoutMode = LayoutMode::GrowToSpace;
+    core.layoutTemplate = LayoutTemplate::CompactDouble;
+    core.layoutLocked = true;
+    core.baseRotationDegrees = 35.0f;
+    core.growthDirectionDegrees = 35.0f;
+    FileItem item;
+    item.id = 3;
+    item.path = L"C:\\测试\\报价 \"终版\".xlsx";
+    item.originalName = L"报价 \"终版\".xlsx";
+    item.displayName = L"报价 \"终版\"";
+    item.slot = 0;
+    item.ring = 0;
+    item.ringSlot = 0;
+    item.sizeTier = FileSizeTier::Important;
+    item.pinned = true;
+    item.lockedPosition = true;
+    item.angleDegrees = 27.5f;
+    item.angleOffsetDegrees = 63.25f;
+    item.radiusOffset = -104.5f;
+    item.favorite = true;
+    item.inProgress = true;
+    item.openCount = 7;
+    item.recentOpens = {UnixTimeNow() - 60, UnixTimeNow() - 120};
+    core.files.push_back(item);
+    core.baselineLayoutMode = LayoutMode::GrowToSpace;
+    core.baselineLayoutTemplate = LayoutTemplate::CompactDouble;
+    core.baselineLayoutLocked = true;
+    core.baselineBaseRotationDegrees = 35.0f;
+    core.baselineGrowthDirectionDegrees = 35.0f;
+    core.savedBaselineLayout.push_back(
+        {item.id, item.slot, item.ring, item.ringSlot, item.angleDegrees,
+         item.angleOffsetDegrees, item.radiusOffset, item.manualOffset,
+         item.manuallyMoved, item.lockedPosition});
+    source.cores.push_back(core);
+    FileFamily testFamily;
+    testFamily.id = 9;
+    testFamily.coreId = core.id;
+    testFamily.rootFileId = item.id;
+    testFamily.currentFileId = item.id;
+    source.families.push_back(testFamily);
+
+    WorkspaceState restored;
+    if (!DeserializeState(SerializeState(source), restored)) {
+        return false;
+    }
+    if (restored.cores.size() != 1 || restored.cores.front().files.size() != 1 ||
+        restored.families.size() != 1 || restored.families.front().rootFileId != item.id) {
+        return false;
+    }
+    const FileItem& restoredItem = restored.cores.front().files.front();
+    if (restoredItem.path != item.path || !restoredItem.favorite ||
+        !restoredItem.inProgress || restoredItem.openCount != item.openCount ||
+        restoredItem.recentOpens.size() != 2 ||
+        restoredItem.originalName != item.originalName ||
+        restoredItem.displayName != item.displayName ||
+        restoredItem.ring != 0 || restoredItem.ringSlot != 0 ||
+        restoredItem.sizeTier != FileSizeTier::Important ||
+        !restoredItem.pinned ||
+        !restoredItem.lockedPosition ||
+        std::abs(restoredItem.angleDegrees - 27.5f) > 0.001f ||
+        std::abs(restoredItem.angleOffsetDegrees - 63.25f) > 0.001f ||
+        std::abs(restoredItem.radiusOffset + 104.5f) > 0.001f ||
+        restored.cores.front().layoutVersion != kLayoutVersion ||
+        restored.cores.front().displayLimit != kNormalVisibleLimit ||
+        std::abs(restored.cores.front().innerRadius - core.innerRadius) > 0.001f ||
+        std::abs(restored.cores.front().middleRadius - core.middleRadius) > 0.001f ||
+        std::abs(restored.cores.front().outerRadius - core.outerRadius) > 0.001f ||
+        std::abs(restored.cores.front().radiusScale - core.radiusScale) > 0.001f ||
+        std::abs(restored.cores.front().distanceScale - core.distanceScale) > 0.001f ||
+        std::abs(restored.cores.front().innerDistanceScale -
+                 core.innerDistanceScale) > 0.001f ||
+        std::abs(restored.cores.front().outerDistanceScale -
+                 core.outerDistanceScale) > 0.001f ||
+        std::abs(restored.cores.front().rotationAngle -
+                 core.rotationAngle) > 0.001f ||
+        !restored.cores.front().userLayoutCustomized ||
+        restored.cores.front().userAdjustedAt != core.userAdjustedAt ||
+        std::abs(restored.cores.front().baselineRadiusScale -
+                 core.baselineRadiusScale) > 0.001f ||
+        std::abs(restored.cores.front().baselineInnerDistanceScale -
+                 core.baselineInnerDistanceScale) > 0.001f ||
+        std::abs(restored.cores.front().baselineOuterDistanceScale -
+                 core.baselineOuterDistanceScale) > 0.001f ||
+        std::abs(restored.cores.front().baselineRotationAngle -
+                 core.baselineRotationAngle) > 0.001f ||
+        !restored.cores.front().baselineUserLayoutCustomized ||
+        std::abs(restored.cores.front().baseInnerRadius - core.baseInnerRadius) >
+            0.001f ||
+        std::abs(restored.cores.front().baseOuterRadius - core.baseOuterRadius) >
+            0.001f ||
+        std::abs(restored.cores.front().baselineBaseInnerRadius -
+                 core.baselineBaseInnerRadius) > 0.001f ||
+        std::abs(restored.cores.front().baselineBaseOuterRadius -
+                 core.baselineBaseOuterRadius) > 0.001f ||
+        restored.cores.front().baselineCreatedAt != core.baselineCreatedAt ||
+        restored.cores.front().savedBaselineLayout.size() != 1 ||
+        std::abs(restored.cores.front().xRatio - core.xRatio) > 0.001f ||
+        std::abs(restored.cores.front().yRatio - core.yRatio) > 0.001f ||
+        restored.cores.front().monitorId != core.monitorId ||
+        restored.cores.front().themeColor != core.themeColor ||
+        !restored.cores.front().themeColorCustomized ||
+        std::abs(restored.cores.front().appearanceCoreScale - 1.14f) > 0.001f ||
+        restored.cores.front().connectionLineColorMode !=
+            ConnectionLineColorMode::White ||
+        restored.cores.front().connectionLineCustomColor != 0x345678 ||
+        restored.cores.front().iconKind != CoreIconKind::Unclassified ||
+        restored.cores.front().layoutMode != LayoutMode::GrowToSpace ||
+        restored.cores.front().layoutTemplate != LayoutTemplate::CompactDouble ||
+        !restored.cores.front().layoutLocked ||
+        std::abs(restored.cores.front().baseRotationDegrees - 35.0f) > 0.001f ||
+        std::abs(restored.cores.front().growthDirectionDegrees - 35.0f) > 0.001f ||
+        restored.densityMode != DensityMode::Clear ||
+        restored.animationMode != AnimationMode::Soft ||
+        restored.coreSelectionEffect !=
+            CoreSelectionEffect::RippleOnceThenStatic ||
+        std::abs(restored.connectionLineWidth - 1.47f) > 0.001f ||
+        std::abs(restored.coreGlowIntensity - 1.32f) > 0.001f ||
+        std::abs(restored.workspaceWidthRatio - 0.41f) > 0.001f ||
+        !restored.workspaceCollapsed || !restored.tutorialCompleted) {
+        return false;
+    }
+    if (FindFreeSlot(restored.cores.front()) != 1) {
+        return false;
+    }
+    const D2D1_POINT_2F inner = SlotPosition(restored.cores.front(), 0);
+    const D2D1_POINT_2F outer = SlotPosition(restored.cores.front(), 11);
+    if (std::abs(std::sqrt(
+                     (inner.x - core.position.x) * (inner.x - core.position.x) +
+                     (inner.y - core.position.y) * (inner.y - core.position.y)) -
+                 core.innerRadius * core.innerDistanceScale) > 0.01f ||
+        std::abs(std::sqrt(
+                     (outer.x - core.position.x) * (outer.x - core.position.x) +
+                     (outer.y - core.position.y) * (outer.y - core.position.y)) -
+                 core.middleRadius * core.outerDistanceScale) > 0.01f ||
+        RingForSlot(11) != 1 || RingForSlot(18) != 1 ||
+        RingForSlot(19) != -1) {
+        return false;
+    }
+
+    const std::array<std::array<int, 2>, 13> expectedRingCounts{{
+        {0, 0}, {1, 0}, {2, 0}, {3, 0}, {4, 0}, {5, 0}, {6, 0},
+        {4, 3}, {4, 4}, {5, 4}, {5, 5}, {6, 5}, {6, 6}}};
+    for (int count = 0; count <= 12; ++count) {
+        if (StandardRingCounts(count) != expectedRingCounts[count]) {
+            return false;
+        }
+    }
+    if (std::abs(StandardAngleDegrees(0, 0, 6, 6) + 90.0f) > 0.001f ||
+        std::abs(StandardAngleDegrees(1, 0, 6, 6) + 60.0f) > 0.001f) {
+        return false;
+    }
+    if (TemplateRingCounts(LayoutTemplate::CompactDouble, 15) !=
+            std::array<int, 2>{5, 10} ||
+        std::abs(TemplateAngleDegrees(LayoutTemplate::CompactDouble, 1, 0,
+                                      5, 10) + 72.0f) > 0.001f ||
+        TemplateGlobalSlot(LayoutTemplate::CompactDouble, 1, 9) != 15 ||
+        TemplateRingCounts(LayoutTemplate::HighCapacityDouble, 18) !=
+            std::array<int, 2>{6, 12} ||
+        TemplateVisibleLimit(LayoutTemplate::AutoCompact) != 15 ||
+        TemplateVisibleLimit(LayoutTemplate::CompactDouble) != 15 ||
+        TemplateVisibleLimit(LayoutTemplate::HighCapacityDouble) != 18) {
+        return false;
+    }
+
+    std::vector<D2D1_POINT_2F> stablePositions;
+    for (int slot = 0; slot < kPriorityPlacementSlots; ++slot) {
+        const D2D1_POINT_2F position = SlotPosition(restored.cores.front(), slot);
+        for (const D2D1_POINT_2F existing : stablePositions) {
+            const float deltaX = position.x - existing.x;
+            const float deltaY = position.y - existing.y;
+            if (deltaX * deltaX + deltaY * deltaY < 1.0f) {
+                return false;
+            }
+        }
+        stablePositions.push_back(position);
+    }
+
+    const std::string legacy =
+        "{\"version\":1,\"cores\":[{\"id\":1,\"name\":\"legacy\",\"x\":1,\"y\":2,"
+        "\"expanded\":true,\"files\":[{\"id\":2,\"path\":\"C:\\\\old.txt\","
+        "\"slot\":8}]}]}";
+    WorkspaceState legacyState;
+    if (!DeserializeState(legacy, legacyState) || legacyState.cores.empty() ||
+        legacyState.cores.front().layoutVersion != 1 ||
+        std::abs(
+            legacyState.connectionLineWidth -
+            kConnectionLineWidthStandard) > 0.001f ||
+        std::abs(legacyState.coreGlowIntensity - 1.0f) > 0.001f ||
+        legacyState.cores.front().connectionLineColorMode !=
+            ConnectionLineColorMode::FollowCore) {
+        return false;
+    }
+    const std::string legacyConnectionStyle =
+        "{\"version\":15,\"settings\":{\"connection_style\":2},"
+        "\"cores\":[]}";
+    WorkspaceState migratedConnectionState;
+    if (!DeserializeState(
+            legacyConnectionStyle, migratedConnectionState) ||
+        std::abs(
+            migratedConnectionState.connectionLineWidth -
+            kConnectionLineWidthStandard) > 0.001f) {
+        return false;
+    }
+    const std::string versionEight =
+        "{\"version\":8,\"cores\":["
+        "{\"id\":1,\"name\":\"compact\",\"x\":1,\"y\":2,"
+        "\"layout_template\":1,\"files\":[]},"
+        "{\"id\":2,\"name\":\"single\",\"x\":3,\"y\":4,"
+        "\"layout_template\":2,\"files\":[]}]}";
+    WorkspaceState migratedState;
+    if (!DeserializeState(versionEight, migratedState) ||
+        migratedState.cores.size() != 2 ||
+        migratedState.cores[0].layoutTemplate !=
+            LayoutTemplate::CompactDouble ||
+        migratedState.cores[1].layoutTemplate !=
+            LayoutTemplate::SingleRing ||
+        kCoreFileCapacity != 18) {
+        return false;
+    }
+    if (!migratedState.tutorialCompleted) {
+        return false;
+    }
+    return std::abs(restored.zoom - source.zoom) < 0.001f;
+}
+
+} // namespace
+
+int APIENTRY wWinMain(_In_ HINSTANCE instance, _In_opt_ HINSTANCE,
+                      _In_ PWSTR commandLine, _In_ int showCommand) {
+    if (commandLine != nullptr && wcsstr(commandLine, L"--self-test") != nullptr) {
+        return RunSelfTest() ? 0 : 2;
+    }
+
+    SetProcessDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2);
+    const HRESULT comResult = OleInitialize(nullptr);
+    if (FAILED(comResult)) {
+        MessageBoxW(nullptr, L"COM 初始化失败。", kWindowTitle, MB_OK | MB_ICONERROR);
+        return 1;
+    }
+
+    HANDLE instanceMutex =
+        CreateMutexW(nullptr, FALSE, L"Local\\GravityDesktop.SingleInstance.9D19E743");
+    if (instanceMutex == nullptr || GetLastError() == ERROR_ALREADY_EXISTS) {
+        if (instanceMutex != nullptr) {
+            CloseHandle(instanceMutex);
+        }
+        if (HWND existing = FindExistingGravityWindow();
+            existing != nullptr) {
+            PostMessageW(
+                existing, kRestoreExistingInstanceMessage, 0, 0);
+        }
+        OleUninitialize();
+        return 0;
+    }
+
+    WNDCLASSEXW windowClass{sizeof(windowClass)};
+    windowClass.style = CS_HREDRAW | CS_VREDRAW | CS_DBLCLKS;
+    windowClass.lpfnWndProc = WindowProcedure;
+    windowClass.hInstance = instance;
+    windowClass.hCursor = LoadCursorW(nullptr, IDC_ARROW);
+    windowClass.hIcon = LoadIconW(nullptr, IDI_APPLICATION);
+    windowClass.hIconSm = windowClass.hIcon;
+    windowClass.lpszClassName = kWindowClass;
+    if (RegisterClassExW(&windowClass) == 0) {
+        CloseHandle(instanceMutex);
+        OleUninitialize();
+        return 1;
+    }
+    WNDCLASSEXW interactionClass = windowClass;
+    interactionClass.style = CS_DBLCLKS;
+    interactionClass.lpfnWndProc =
+        InteractionWindowProcedure;
+    interactionClass.hIcon = nullptr;
+    interactionClass.hIconSm = nullptr;
+    interactionClass.lpszClassName =
+        kInteractionWindowClass;
+    if (RegisterClassExW(&interactionClass) == 0) {
+        CloseHandle(instanceMutex);
+        OleUninitialize();
+        return 1;
+    }
+    WNDCLASSEXW lifecycleClass = windowClass;
+    lifecycleClass.style = 0;
+    lifecycleClass.lpfnWndProc =
+        ShellLifecycleWindowProcedure;
+    lifecycleClass.hIcon = nullptr;
+    lifecycleClass.hIconSm = nullptr;
+    lifecycleClass.lpszClassName =
+        kShellLifecycleWindowClass;
+    if (RegisterClassExW(&lifecycleClass) == 0) {
+        CloseHandle(instanceMutex);
+        OleUninitialize();
+        return 1;
+    }
+
+    const bool benchmarkMode =
+        commandLine != nullptr && wcsstr(commandLine, L"--benchmark-layout") != nullptr;
+    GravityApp app(benchmarkMode);
+    (void)TaskbarCreatedMessage();
+    constexpr DWORD lifecycleExStyle =
+        WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE;
+    HWND lifecycleWindow = CreateWindowExW(
+        lifecycleExStyle, kShellLifecycleWindowClass, L"",
+        WS_POPUP, -32000, -32000, 1, 1,
+        nullptr, nullptr, instance, &app);
+    if (lifecycleWindow == nullptr) {
+        CloseHandle(instanceMutex);
+        OleUninitialize();
+        return 1;
+    }
+
+    RECT workArea{};
+    if (!SystemParametersInfoW(SPI_GETWORKAREA, 0, &workArea, 0)) {
+        workArea = RECT{0, 0, GetSystemMetrics(SM_CXSCREEN), GetSystemMetrics(SM_CYSCREEN)};
+    }
+    const int workWidth = std::max(1L, workArea.right - workArea.left);
+    const int workHeight = std::max(1L, workArea.bottom - workArea.top);
+    const int windowWidth = std::max(1, workWidth / 2);
+    const int windowHeight = workHeight;
+    const int windowX = workArea.right - windowWidth;
+    const int windowY = workArea.top;
+    // Start as a popup so an elevated launch is always legal. Initialize()
+    // then upgrades it to the Explorer desktop child when UIPI permits it.
+    constexpr DWORD windowStyle = WS_POPUP | WS_CLIPCHILDREN;
+    constexpr DWORD windowExStyle =
+        WS_EX_TOOLWINDOW | WS_EX_LAYERED |
+        WS_EX_TRANSPARENT | WS_EX_NOACTIVATE;
+    HWND window = CreateWindowExW(
+        windowExStyle, kWindowClass, kWindowTitle, windowStyle, windowX, windowY, windowWidth,
+        windowHeight, nullptr, nullptr, instance, &app);
+    if (window == nullptr) {
+        app.Shutdown();
+        DestroyWindow(lifecycleWindow);
+        CloseHandle(instanceMutex);
+        OleUninitialize();
+        return 1;
+    }
+
+    (void)showCommand;
+    ShowWindow(window, SW_SHOWNOACTIVATE);
+    UpdateWindow(window);
+    MSG message{};
+    while (GetMessageW(&message, nullptr, 0, 0) > 0) {
+        TranslateMessage(&message);
+        DispatchMessageW(&message);
+    }
+    app.Shutdown();
+    if (IsWindow(lifecycleWindow) != FALSE) {
+        DestroyWindow(lifecycleWindow);
+    }
+    CloseHandle(instanceMutex);
+    OleUninitialize();
+    return static_cast<int>(message.wParam);
+}
