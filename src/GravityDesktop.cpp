@@ -4778,7 +4778,7 @@ private:
             return result;
         }
         fileNameFormat_->SetTextAlignment(DWRITE_TEXT_ALIGNMENT_CENTER);
-        fileNameFormat_->SetParagraphAlignment(DWRITE_PARAGRAPH_ALIGNMENT_CENTER);
+        fileNameFormat_->SetParagraphAlignment(DWRITE_PARAGRAPH_ALIGNMENT_NEAR);
         fileNameFormat_->SetWordWrapping(DWRITE_WORD_WRAPPING_WRAP);
 
         result = writeFactory_->CreateTextFormat(
@@ -4791,7 +4791,7 @@ private:
         }
         fileImportantFormat_->SetTextAlignment(DWRITE_TEXT_ALIGNMENT_CENTER);
         fileImportantFormat_->SetParagraphAlignment(
-            DWRITE_PARAGRAPH_ALIGNMENT_CENTER);
+            DWRITE_PARAGRAPH_ALIGNMENT_NEAR);
         fileImportantFormat_->SetWordWrapping(DWRITE_WORD_WRAPPING_WRAP);
 
         result = writeFactory_->CreateTextFormat(
@@ -4803,7 +4803,7 @@ private:
             return result;
         }
         fileMinorFormat_->SetTextAlignment(DWRITE_TEXT_ALIGNMENT_CENTER);
-        fileMinorFormat_->SetParagraphAlignment(DWRITE_PARAGRAPH_ALIGNMENT_CENTER);
+        fileMinorFormat_->SetParagraphAlignment(DWRITE_PARAGRAPH_ALIGNMENT_NEAR);
         fileMinorFormat_->SetWordWrapping(DWRITE_WORD_WRAPPING_WRAP);
 
         result = writeFactory_->CreateTextFormat(
@@ -4816,7 +4816,7 @@ private:
         }
         fileMarqueeFormat_->SetTextAlignment(DWRITE_TEXT_ALIGNMENT_LEADING);
         fileMarqueeFormat_->SetParagraphAlignment(
-            DWRITE_PARAGRAPH_ALIGNMENT_CENTER);
+            DWRITE_PARAGRAPH_ALIGNMENT_NEAR);
         fileMarqueeFormat_->SetWordWrapping(DWRITE_WORD_WRAPPING_NO_WRAP);
         marqueeWidthCache_.clear();
 
