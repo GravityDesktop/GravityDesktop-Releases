@@ -5124,6 +5124,13 @@ private:
             EstimatedShortTitleWidth(item), minimum, maximum);
     }
 
+    int FileLabelLineCount(const FileItem& item) const {
+        return EstimatedShortTitleWidth(item) >=
+                       metrics_.labelWidth - 0.5f
+                   ? 2
+                   : 1;
+    }
+
     float NodePitchForCore(const Core& core) const {
         float titleWidth = 44.0f;
         bool usesTwoLines = false;
@@ -7411,6 +7418,13 @@ private:
         const float halfWidth = FileLabelInteractionWidth(item) / 2.0f;
         rectangle.left = center - halfWidth;
         rectangle.right = center + halfWidth;
+        const float lineHeight =
+            std::ceil(metrics_.fileFontSize * 1.35f);
+        rectangle.bottom = std::min(
+            rectangle.bottom,
+            rectangle.top +
+                lineHeight *
+                    static_cast<float>(FileLabelLineCount(item)));
         return rectangle;
     }
 
@@ -10137,7 +10151,7 @@ private:
             const float compactPadding = 2.0f * screenCompensation;
             const float selectionHalfWidth =
                 std::max(
-                    containerHalf + compactPadding,
+                    iconSize / 2.0f + compactPadding,
                     FileLabelInteractionWidth(item) *
                             screenCompensation / 2.0f +
                         compactPadding);
@@ -10148,11 +10162,12 @@ private:
                 position.y + stableContainerHalf -
                 2.0f * screenCompensation;
             const float labelBottom =
-                labelTop + lineHeight * 2.0f +
-                6.0f * screenCompensation;
+                labelTop + lineHeight *
+                    static_cast<float>(
+                        FileLabelLineCount(item));
             const D2D1_RECT_F selectionBounds = D2D1::RectF(
                 position.x - selectionHalfWidth,
-                position.y - containerHalf - compactPadding,
+                position.y - iconSize / 2.0f - compactPadding,
                 position.x + selectionHalfWidth,
                 labelBottom + compactPadding);
             brush_->SetColor(D2D1::ColorF(
