@@ -9718,8 +9718,8 @@ private:
     D2D1_RECT_F DividerHandleRectangle(
         const D2D1_SIZE_F& client) const {
         (void)client;
-        constexpr float width = 30.0f;
-        constexpr float height = 38.0f;
+        constexpr float width = 88.0f;
+        constexpr float height = 40.0f;
         return D2D1::RectF(
             2.0f, 2.0f,
             2.0f + width, 2.0f + height);
@@ -9747,8 +9747,8 @@ private:
         }
 
         const D2D1_RECT_F handle = DividerHandleRectangle(client);
-        const float bodyBottom = handle.bottom - 10.0f;
-        const float centerX = (handle.left + handle.right) * 0.5f;
+        const float bodyBottom = handle.bottom - 12.0f;
+        const float triangleCenterX = handle.left + 12.0f;
         const D2D1_RECT_F body = D2D1::RectF(
             handle.left, handle.top, handle.right, bodyBottom + 3.0f);
         brush_->SetColor(D2D1::ColorF(0x53616B,
@@ -9764,53 +9764,26 @@ private:
         }
         brush_->SetColor(D2D1::ColorF(0x53616B,
                                       active ? 0.72f : 0.28f));
-        const D2D1_POINT_2F triangleLeft =
-            D2D1::Point2F(centerX - 8.0f, bodyBottom);
-        const D2D1_POINT_2F triangleTip =
-            D2D1::Point2F(centerX, handle.bottom);
-        const D2D1_POINT_2F triangleRight =
-            D2D1::Point2F(centerX + 8.0f, bodyBottom);
-        renderTarget_->DrawLine(triangleLeft, triangleTip,
-                                brush_.Get(), active ? 2.0f : 1.0f);
-        renderTarget_->DrawLine(triangleTip, triangleRight,
-                                brush_.Get(), active ? 2.0f : 1.0f);
-        renderTarget_->DrawLine(triangleRight, triangleLeft,
-                                brush_.Get(), active ? 1.5f : 0.8f);
+        constexpr int triangleRows = 7;
+        constexpr float triangleHalfWidth = 10.0f;
+        for (int row = 0; row < triangleRows; ++row) {
+            const float progress = static_cast<float>(row) /
+                static_cast<float>(triangleRows - 1);
+            const float y = bodyBottom +
+                (handle.bottom - bodyBottom) * progress;
+            const float halfWidth = triangleHalfWidth * progress;
+            renderTarget_->DrawLine(
+                D2D1::Point2F(triangleCenterX - halfWidth, y),
+                D2D1::Point2F(triangleCenterX + halfWidth, y),
+                brush_.Get(), active ? 1.6f : 0.85f);
+        }
         brush_->SetColor(D2D1::ColorF(0xF0F4F6,
-                                      active ? 0.90f : 0.52f));
-        const float iconY = (body.top + body.bottom) * 0.5f;
-        const float iconLeft = centerX - 8.0f;
-        const float iconRight = centerX + 8.0f;
-        const float iconArm = 4.0f;
-        const float iconStroke = active ? 1.7f : 1.1f;
-        renderTarget_->DrawLine(
-            D2D1::Point2F(iconLeft, iconY),
-            D2D1::Point2F(iconLeft + iconArm, iconY - iconArm),
-            brush_.Get(), iconStroke);
-        renderTarget_->DrawLine(
-            D2D1::Point2F(iconLeft, iconY),
-            D2D1::Point2F(iconLeft + iconArm, iconY + iconArm),
-            brush_.Get(), iconStroke);
-        renderTarget_->DrawLine(
-            D2D1::Point2F(iconLeft + iconArm, iconY),
-            D2D1::Point2F(iconRight - iconArm, iconY),
-            brush_.Get(), iconStroke);
-        renderTarget_->DrawLine(
-            D2D1::Point2F(iconRight, iconY),
-            D2D1::Point2F(iconRight - iconArm, iconY - iconArm),
-            brush_.Get(), iconStroke);
-        renderTarget_->DrawLine(
-            D2D1::Point2F(iconRight, iconY),
-            D2D1::Point2F(iconRight - iconArm, iconY + iconArm),
-            brush_.Get(), iconStroke);
-        renderTarget_->DrawLine(
-            D2D1::Point2F(centerX - 1.5f, iconY - 4.0f),
-            D2D1::Point2F(centerX - 1.5f, iconY + 4.0f),
-            brush_.Get(), iconStroke);
-        renderTarget_->DrawLine(
-            D2D1::Point2F(centerX + 1.5f, iconY - 4.0f),
-            D2D1::Point2F(centerX + 1.5f, iconY + 4.0f),
-            brush_.Get(), iconStroke);
+                                      active ? 0.92f : 0.58f));
+        constexpr wchar_t label[] = L"调整范围";
+        renderTarget_->DrawTextW(
+            label, static_cast<UINT32>(wcslen(label)),
+            bodyFormat_.Get(), body, brush_.Get(),
+            D2D1_DRAW_TEXT_OPTIONS_CLIP);
 
         if (active) {
             const int percent = static_cast<int>(std::round(
