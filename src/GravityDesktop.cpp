@@ -83,6 +83,8 @@ constexpr UINT_PTR kSelectionDismissTimer = 9;
 constexpr UINT_PTR kDesktopHostWatchTimer = 10;
 constexpr UINT_PTR kDesktopReconnectTimer = 11;
 constexpr UINT_PTR kInteractionLayerRepairTimer = 12;
+constexpr auto kManagedCollectionConfirmationWindow =
+    std::chrono::minutes(10);
 constexpr UINT kDesktopHostWatchIntervalMs = 2000;
 constexpr UINT kDesktopReconnectIntervalMs = 250;
 constexpr UINT kInteractionLayerRepairDelayMs = 600;
@@ -8126,6 +8128,13 @@ private:
                     CoreAppearancePanelRectangle(client),
                     2.0f);
             }
+            if (managedCollectionUndoStatusAvailable_ &&
+                !status_.empty()) {
+                AddInteractionShape(
+                    shapes,
+                    ManagedCollectionUndoStatusRectangle(client),
+                    2.0f);
+            }
         }
 
         const auto addEditInteractionShape =
@@ -11669,6 +11678,21 @@ private:
         }
     }
 
+    D2D1_RECT_F ManagedCollectionUndoStatusRectangle(
+        const D2D1_SIZE_F client) const {
+        if (!managedCollectionUndoStatusAvailable_ || status_.empty() ||
+            client.width <= 40.0f || client.height <= 54.0f) {
+            return D2D1::RectF();
+        }
+        const float width = std::min(620.0f, client.width - 40.0f);
+        const D2D1_RECT_F box = D2D1::RectF(
+            20.0f, client.height - 54.0f, 20.0f + width,
+            client.height - 16.0f);
+        return D2D1::RectF(
+            box.right - 62.0f, box.top + 5.0f, box.right - 8.0f,
+            box.bottom - 5.0f);
+    }
+
     void DrawHud(const D2D1_SIZE_F client) {
         if (!status_.empty()) {
             const float width = std::min(620.0f, client.width - 40.0f);
@@ -11677,10 +11701,26 @@ private:
             brush_->SetColor(D2D1::ColorF(0x172846, 0.94f));
             renderTarget_->FillRoundedRectangle(D2D1::RoundedRect(box, 8.0f, 8.0f),
                                                 brush_.Get());
+            D2D1_RECT_F textBox = box;
+            managedCollectionUndoStatusBounds_ = D2D1::RectF();
+            if (managedCollectionUndoStatusAvailable_) {
+                managedCollectionUndoStatusBounds_ =
+                    ManagedCollectionUndoStatusRectangle(client);
+                textBox.right = managedCollectionUndoStatusBounds_.left - 7.0f;
+            }
             brush_->SetColor(D2D1::ColorF(0xDCEAFF));
             renderTarget_->DrawTextW(status_.c_str(), static_cast<UINT32>(status_.size()),
-                                     hudFormat_.Get(), box, brush_.Get(),
+                                     hudFormat_.Get(), textBox, brush_.Get(),
                                      D2D1_DRAW_TEXT_OPTIONS_CLIP);
+            if (managedCollectionUndoStatusAvailable_) {
+                brush_->SetColor(D2D1::ColorF(0x92C8FF));
+                renderTarget_->DrawTextW(
+                    L"撤销", 2, hudFormat_.Get(),
+                    managedCollectionUndoStatusBounds_, brush_.Get(),
+                    D2D1_DRAW_TEXT_OPTIONS_CLIP);
+            }
+        } else {
+            managedCollectionUndoStatusBounds_ = D2D1::RectF();
         }
     }
 
@@ -14304,6 +14344,11 @@ private:
             return;
         }
         if (state_.workspacePaused) return;
+        if (managedCollectionUndoStatusAvailable_ &&
+            PointInside(dip, managedCollectionUndoStatusBounds_)) {
+            Undo();
+            return;
+        }
         if (corePlacementMode_) {
             for (int index = 0;
                  index < kWorkspaceControlCount;
@@ -15817,6 +15862,77 @@ private:
         return true;
     }
 
+    bool ManagedCollectionConfirmationRequired() const {
+        if (!lastManagedCollectionSuccess_.has_value()) {
+            return true;
+        }
+        if (std::chrono::steady_clock::now() -
+                *lastManagedCollectionSuccess_ >=
+            kManagedCollectionConfirmationWindow) {
+            return true;
+        }
+        return !PathEquals(
+            managedCollectionSessionLibraryPath_,
+            NormalizePath(ManagedLibraryPath().wstring()));
+    }
+
+    bool ConfirmManagedCollection(
+        const std::wstring& sourcePath,
+        const Core& target) {
+        if (!ManagedCollectionConfirmationRequired()) {
+            return true;
+        }
+        const std::wstring message =
+            L"将“" + FileDisplayName(sourcePath) + L"”收纳到“" +
+            target.name + L"”？它会从桌面移走，之后可随时恢复。";
+        const TASKDIALOG_BUTTON buttons[] = {
+            {IDYES, L"收纳"},
+            {IDCANCEL, L"取消"},
+        };
+        TASKDIALOGCONFIG dialog{sizeof(dialog)};
+        dialog.hwndParent = window_;
+        dialog.dwFlags = TDF_ALLOW_DIALOG_CANCELLATION |
+                         TDF_SIZE_TO_CONTENT;
+        dialog.pszWindowTitle = L"收纳到核心";
+        dialog.pszContent = message.c_str();
+        dialog.pszFooter =
+            L"确认后，连续收纳文件时10分钟内不再询问。";
+        dialog.pszMainIcon = TD_WARNING_ICON;
+        dialog.cButtons = static_cast<UINT>(
+            sizeof(buttons) / sizeof(buttons[0]));
+        dialog.pButtons = buttons;
+        dialog.nDefaultButton = IDCANCEL;
+        using TaskDialogIndirectProc = HRESULT (WINAPI*)(
+            const TASKDIALOGCONFIG*, int*, int*, BOOL*);
+        const HMODULE commonControls =
+            GetModuleHandleW(L"comctl32.dll");
+        const auto taskDialog = commonControls == nullptr
+            ? nullptr
+            : reinterpret_cast<TaskDialogIndirectProc>(
+                GetProcAddress(commonControls, "TaskDialogIndirect"));
+        int pressed = IDCANCEL;
+        if (taskDialog != nullptr &&
+            SUCCEEDED(taskDialog(
+                &dialog, &pressed, nullptr, nullptr))) {
+            return pressed == IDYES;
+        }
+        return MessageBoxW(
+                   window_, message.c_str(), L"收纳到核心",
+                   MB_OKCANCEL | MB_ICONWARNING | MB_DEFBUTTON2) == IDOK;
+    }
+
+    void MarkManagedCollectionSuccess() {
+        lastManagedCollectionSuccess_ =
+            std::chrono::steady_clock::now();
+        managedCollectionSessionLibraryPath_ =
+            NormalizePath(ManagedLibraryPath().wstring());
+    }
+
+    void ResetManagedCollectionConfirmationSession() {
+        lastManagedCollectionSuccess_.reset();
+        managedCollectionSessionLibraryPath_.clear();
+    }
+
     bool StoreDesktopFileInCore(
         const std::wstring& sourcePath,
         std::uint64_t targetCoreId,
@@ -15831,6 +15947,7 @@ private:
             SetStatus(L"收纳失败：目标核心不存在");
             return false;
         }
+        const std::wstring targetName = target->name;
         std::wstring eligibilityError;
         if (!IsEligibleDesktopManagedFile(sourcePath, &eligibilityError)) {
             SetStatus(L"未收纳：" + eligibilityError + L"；已按安全规则保留原文件");
@@ -15862,14 +15979,13 @@ private:
                 return false;
             }
         }
-        const std::wstring collectionWarning =
-            L"收纳后，文件将从桌面移入此核心，可随时还原到桌面。";
-        if (MessageBoxW(
-                window_, collectionWarning.c_str(), L"收纳到核心",
-                MB_OKCANCEL | MB_ICONWARNING | MB_DEFBUTTON2) != IDOK) {
+        if (!ConfirmManagedCollection(sourcePath, *target)) {
             SetStatus(L"已取消收纳；真实文件仍保留在 Windows 桌面");
             return false;
         }
+        // A failed or rolled-back move must require confirmation again.  The
+        // session is re-opened only after the complete transaction commits.
+        ResetManagedCollectionConfirmationSession();
 
         const WorkspaceState before = state_;
         const std::uint64_t itemId = state_.nextId;
@@ -16043,13 +16159,12 @@ private:
         reverse.createdAt = UnixTimeNow();
         managedUndoAction_ = ManagedUndoAction{std::move(reverse)};
         SetSelection({HitKind::Item, targetCoreId, itemId});
+        MarkManagedCollectionSuccess();
         iconCache_.clear();
         iconShadowCache_.clear();
         layoutCache_.clear();
         layoutDirty_ = true;
-        SetStatus(parentId == 0
-            ? L"已收纳到核心；真实文件已移入托管库"
-            : L"已收纳并设为目标文件的子文件；真实文件已移入托管库");
+        SetManagedCollectionStatus(targetName);
         Invalidate();
         return true;
     }
@@ -16250,6 +16365,19 @@ private:
         DragFinish(drop);
         if (paths.empty()) {
             return;
+        }
+        if (paths.size() > 1) {
+            const bool containsCollectableDesktopFile = std::any_of(
+                paths.begin(), paths.end(),
+                [this](const std::wstring& path) {
+                    return IsEligibleDesktopManagedFile(path);
+                });
+            if (containsCollectableDesktopFile) {
+                ClearExternalDropPreview();
+                SetStatus(
+                    L"批量收纳尚未启用；请逐个拖入，避免真实文件出现半完成移动");
+                return;
+            }
         }
         // A single ordinary file dropped from the current user's Desktop is
         // intentionally collected into the durable library. Every other
@@ -18174,6 +18302,8 @@ private:
         } else if (timer == kStatusTimer) {
             KillTimer(window_, kStatusTimer);
             status_.clear();
+            managedCollectionUndoStatusAvailable_ = false;
+            managedCollectionUndoStatusBounds_ = D2D1::RectF();
             Invalidate();
         } else if (timer == kAnimationTimer) {
             const float total =
@@ -18250,6 +18380,17 @@ private:
 
     void SetStatus(std::wstring message) {
         status_ = std::move(message);
+        managedCollectionUndoStatusAvailable_ = false;
+        managedCollectionUndoStatusBounds_ = D2D1::RectF();
+        if (window_ != nullptr) {
+            SetTimer(window_, kStatusTimer, 3600, nullptr);
+        }
+        Invalidate();
+    }
+
+    void SetManagedCollectionStatus(const std::wstring& coreName) {
+        status_ = L"已收纳到“" + coreName + L"”";
+        managedCollectionUndoStatusAvailable_ = true;
         if (window_ != nullptr) {
             SetTimer(window_, kStatusTimer, 3600, nullptr);
         }
@@ -19387,6 +19528,11 @@ private:
     // overriding the protected relationship document.
     std::map<std::uint64_t, std::wstring> protectedShortLabelOverrides_;
     std::wstring status_;
+    bool managedCollectionUndoStatusAvailable_ = false;
+    D2D1_RECT_F managedCollectionUndoStatusBounds_ = D2D1::RectF();
+    std::optional<std::chrono::steady_clock::time_point>
+        lastManagedCollectionSuccess_;
+    std::wstring managedCollectionSessionLibraryPath_;
     std::int64_t lastHistoryBackupTime_ = 0;
     HDC layeredDeviceContext_ = nullptr;
     HBITMAP layeredBitmap_ = nullptr;
@@ -19628,6 +19774,56 @@ bool RunSelfTest() {
         !connectionColorApp.dirty_ ||
         SerializeState(connectionColorApp.state_) !=
             SerializeState(expectedConnectionColorState)) {
+        return false;
+    }
+
+    GravityApp managedCollectionSessionApp;
+    managedCollectionSessionApp.managedCollectionSessionLibraryPath_ =
+        NormalizePath(
+            managedCollectionSessionApp.ManagedLibraryPath().wstring());
+    managedCollectionSessionApp.lastManagedCollectionSuccess_ =
+        std::chrono::steady_clock::now();
+    if (managedCollectionSessionApp.
+            ManagedCollectionConfirmationRequired()) {
+        return false;
+    }
+    managedCollectionSessionApp.lastManagedCollectionSuccess_ =
+        std::chrono::steady_clock::now() -
+        kManagedCollectionConfirmationWindow;
+    if (!managedCollectionSessionApp.
+            ManagedCollectionConfirmationRequired()) {
+        return false;
+    }
+    managedCollectionSessionApp.lastManagedCollectionSuccess_ =
+        std::chrono::steady_clock::now();
+    managedCollectionSessionApp.state_.managedLibraryPath =
+        L"C:\\ManagedLibraryChanged";
+    if (!managedCollectionSessionApp.
+            ManagedCollectionConfirmationRequired()) {
+        return false;
+    }
+    managedCollectionSessionApp.ResetManagedCollectionConfirmationSession();
+    if (!managedCollectionSessionApp.
+            ManagedCollectionConfirmationRequired()) {
+        return false;
+    }
+    managedCollectionSessionApp.SetManagedCollectionStatus(L"测试核心");
+    if (!managedCollectionSessionApp.
+            managedCollectionUndoStatusAvailable_ ||
+        managedCollectionSessionApp.status_.find(L"已收纳") ==
+            std::wstring::npos) {
+        return false;
+    }
+    const D2D1_RECT_F undoBounds =
+        managedCollectionSessionApp.ManagedCollectionUndoStatusRectangle(
+            D2D1::SizeF(1280.0f, 720.0f));
+    if (undoBounds.right <= undoBounds.left ||
+        undoBounds.bottom <= undoBounds.top) {
+        return false;
+    }
+    managedCollectionSessionApp.SetStatus(L"普通状态");
+    if (managedCollectionSessionApp.
+            managedCollectionUndoStatusAvailable_) {
         return false;
     }
 
