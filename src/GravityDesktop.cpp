@@ -19151,9 +19151,20 @@ private:
             const int y = top + static_cast<int>(index) *
                 (lineHeight + gap);
             const int left = centerX - width / 2;
-            RoundRect(dc, left, y, left + width,
-                      y + lineHeight,
-                      lineHeight, lineHeight);
+            // A small beveled polygon keeps the guide strokes soft without
+            // importing GDI32!RoundRect, which caused a loader-compatibility
+            // failure on this desktop.
+            const int bevel = std::max(
+                1, std::min(lineHeight / 2, width / 4));
+            const POINT stroke[] = {
+                {left + bevel, y},
+                {left + width - bevel, y},
+                {left + width, y + lineHeight / 2},
+                {left + width - bevel, y + lineHeight},
+                {left + bevel, y + lineHeight},
+                {left, y + lineHeight / 2},
+            };
+            Polygon(dc, stroke, static_cast<int>(std::size(stroke)));
         }
         const int tipBaseY = top + static_cast<int>(widths.size()) *
             (lineHeight + gap);
