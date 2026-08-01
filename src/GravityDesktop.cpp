@@ -9717,16 +9717,12 @@ private:
 
     D2D1_RECT_F DividerHandleRectangle(
         const D2D1_SIZE_F& client) const {
-        constexpr float width = 34.0f;
-        constexpr float height = 22.0f;
-        const float centerY = std::clamp(
-            client.height * 0.46f,
-            height * 0.5f + 8.0f,
-            std::max(height * 0.5f + 8.0f,
-                     client.height - height * 0.5f - 8.0f));
+        (void)client;
+        constexpr float width = 30.0f;
+        constexpr float height = 38.0f;
         return D2D1::RectF(
-            2.0f, centerY - height * 0.5f,
-            2.0f + width, centerY + height * 0.5f);
+            2.0f, 2.0f,
+            2.0f + width, 2.0f + height);
     }
 
     bool IsDividerHit(D2D1_POINT_2F point) const {
@@ -9742,28 +9738,49 @@ private:
     void DrawWorkspaceDivider(const D2D1_SIZE_F& client) {
         if (!DividerEnabled()) return;
         const bool active = dividerHovered_ || draggingDivider_;
-        brush_->SetColor(D2D1::ColorF(0x59636B,
-                                      active ? 0.38f : 0.20f));
-        renderTarget_->DrawLine(D2D1::Point2F(0.75f, 0.0f),
-                                D2D1::Point2F(0.75f, client.height),
-                                brush_.Get(), active ? 1.5f : 1.0f);
+        if (active) {
+            brush_->SetColor(D2D1::ColorF(0x59636B,
+                                          draggingDivider_ ? 0.52f : 0.36f));
+            renderTarget_->DrawLine(D2D1::Point2F(0.75f, 0.0f),
+                                    D2D1::Point2F(0.75f, client.height),
+                                    brush_.Get(), draggingDivider_ ? 1.5f : 1.0f);
+        }
 
         const D2D1_RECT_F handle = DividerHandleRectangle(client);
+        const float bodyBottom = handle.bottom - 10.0f;
+        const float centerX = (handle.left + handle.right) * 0.5f;
+        const D2D1_RECT_F body = D2D1::RectF(
+            handle.left, handle.top, handle.right, bodyBottom + 3.0f);
         brush_->SetColor(D2D1::ColorF(0x53616B,
                                       active ? 0.72f : 0.28f));
         renderTarget_->FillRoundedRectangle(
-            D2D1::RoundedRect(handle, 7.0f, 7.0f), brush_.Get());
+            D2D1::RoundedRect(body, 5.0f, 5.0f),
+            brush_.Get());
         if (active) {
             brush_->SetColor(D2D1::ColorF(0xE8EEF1, 0.78f));
             renderTarget_->DrawRoundedRectangle(
-                D2D1::RoundedRect(handle, 7.0f, 7.0f),
+                D2D1::RoundedRect(body, 5.0f, 5.0f),
                 brush_.Get(), 1.0f);
         }
+        brush_->SetColor(D2D1::ColorF(0x53616B,
+                                      active ? 0.72f : 0.28f));
+        const D2D1_POINT_2F triangleLeft =
+            D2D1::Point2F(centerX - 8.0f, bodyBottom);
+        const D2D1_POINT_2F triangleTip =
+            D2D1::Point2F(centerX, handle.bottom);
+        const D2D1_POINT_2F triangleRight =
+            D2D1::Point2F(centerX + 8.0f, bodyBottom);
+        renderTarget_->DrawLine(triangleLeft, triangleTip,
+                                brush_.Get(), active ? 2.0f : 1.0f);
+        renderTarget_->DrawLine(triangleTip, triangleRight,
+                                brush_.Get(), active ? 2.0f : 1.0f);
+        renderTarget_->DrawLine(triangleRight, triangleLeft,
+                                brush_.Get(), active ? 1.5f : 0.8f);
         brush_->SetColor(D2D1::ColorF(0xF0F4F6,
                                       active ? 0.90f : 0.52f));
         constexpr wchar_t glyph[] = L"↔";
         renderTarget_->DrawTextW(
-            glyph, 1, bodyFormat_.Get(), handle, brush_.Get(),
+            glyph, 1, bodyFormat_.Get(), body, brush_.Get(),
             D2D1_DRAW_TEXT_OPTIONS_CLIP);
 
         if (active) {
