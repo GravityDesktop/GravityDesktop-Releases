@@ -125,6 +125,13 @@ enum class ManagedTransactionOperation : int {
     Store = 0,
     Restore = 1,
     Undo = 2,
+    Rename = 3,
+};
+
+enum class RenameTargetKind : int {
+    Core = 0,
+    ItemDisplay = 1,
+    ItemRealFile = 2,
 };
 
 enum class ManagedTransactionStage : int {
@@ -255,6 +262,8 @@ enum MenuCommand : UINT {
     MenuResetView,
     MenuToggleCore,
     MenuRenameCore,
+    MenuRenameItemDisplay,
+    MenuRenameItemRealFile,
     MenuCoreAppearanceSettings,
     MenuAppearanceColor,
     MenuAppearanceCoreScale,
@@ -1149,7 +1158,7 @@ bool DeserializeManagedFileTransaction(
         NumberMember(*object, "item_id", 0.0));
     transaction.operation = static_cast<ManagedTransactionOperation>(
         std::clamp(static_cast<int>(NumberMember(
-            *object, "operation", 0.0)), 0, 2));
+            *object, "operation", 0.0)), 0, 3));
     transaction.stage = static_cast<ManagedTransactionStage>(
         std::clamp(static_cast<int>(NumberMember(
             *object, "stage", 0.0)), 0, 4));
@@ -7636,6 +7645,7 @@ private:
     }
 
     void ClearSelection() {
+        nameRenameCandidate_ = {};
         SetSelection({});
     }
 
@@ -12140,6 +12150,81 @@ private:
         return x * x + y * y;
     }
 
+    bool IsRenameLabelHit(
+        const HitResult& hit, D2D1_POINT_2F world) {
+        const D2D1_POINT_2F screen = WorldToScreen(world);
+        if (hit.kind == HitKind::Core) {
+            const Core* core = FindCore(hit.coreId);
+            if (core == nullptr || core->archived) {
+                return false;
+            }
+            return PointInside(
+                screen,
+                CoreNameRectangle(
+                    *core, WorldToScreen(VisualCorePosition(*core)),
+                    CoreScreenRadius(*core)));
+        }
+        if (hit.kind != HitKind::Item) {
+            return false;
+        }
+        const Core* core = FindCore(hit.coreId);
+        const FileItem* item = FindItem(hit.coreId, hit.itemId);
+        if (core == nullptr || item == nullptr || core->archived) {
+            return false;
+        }
+        const LayoutMap& layouts = StableLayouts();
+        const auto found = layouts.find(hit.coreId);
+        if (found == layouts.end()) {
+            return false;
+        }
+        const auto entry = std::find_if(
+            found->second.begin(), found->second.end(),
+            [&hit](const ItemLayout& value) {
+                return value.item != nullptr &&
+                       value.item->id == hit.itemId;
+            });
+        if (entry == found->second.end() || !entry->showLabel) {
+            return false;
+        }
+        D2D1_RECT_F label = FileLabelInteractionRectangle(
+            *item, VisualLabelRectangle(*core, *entry));
+        label.top -= 2.0f;
+        label.bottom += 2.0f;
+        return PointInside(screen, label);
+    }
+
+    bool TryBeginRenameFromSlowNameClick(
+        const HitResult& hit, D2D1_POINT_2F world) {
+        if ((hit.kind != HitKind::Core && hit.kind != HitKind::Item) ||
+            !IsRenameLabelHit(hit, world)) {
+            nameRenameCandidate_ = {};
+            return false;
+        }
+        const auto now = std::chrono::steady_clock::now();
+        const auto elapsed = std::chrono::duration_cast<
+            std::chrono::milliseconds>(
+            now - nameRenameCandidateAt_).count();
+        const bool repeat = selected_ == hit &&
+            nameRenameCandidate_ == hit &&
+            elapsed >= 500 && elapsed <= 4000;
+        nameRenameCandidate_ = hit;
+        nameRenameCandidateAt_ = now;
+        if (!repeat) {
+            return false;
+        }
+        nameRenameCandidate_ = {};
+        if (hit.kind == HitKind::Core) {
+            BeginRename(hit.coreId);
+        } else {
+            const FileItem* item = FindItem(hit.coreId, hit.itemId);
+            BeginItemRename(
+                hit.coreId, hit.itemId,
+                item != nullptr &&
+                    item->storageMode == FileStorageMode::Managed);
+        }
+        return true;
+    }
+
     HitResult HitTest(D2D1_POINT_2F world) {
         const LayoutMap& layouts = StableLayouts();
         const D2D1_POINT_2F screen = WorldToScreen(world);
@@ -14391,6 +14476,9 @@ private:
         }
 
         const HitResult hit = HitTest(world);
+        if (TryBeginRenameFromSlowNameClick(hit, world)) {
+            return;
+        }
         if (hit.kind == HitKind::Item) {
             if (FileItem* item = FindItem(hit.coreId, hit.itemId);
                 item != nullptr) {
@@ -14439,6 +14527,12 @@ private:
             return;
         }
         SetSelection(hit);
+        if ((hit.kind == HitKind::Core || hit.kind == HitKind::Item) &&
+            interactionWindow_ != nullptr) {
+            // The island is deliberately non-activating, so a selected node
+            // must explicitly receive keyboard focus for F2 to work.
+            SetFocus(interactionWindow_);
+        }
         pointerStartDip_ = dip;
         pointerStartWorld_ = world;
         dragWorld_ = world;
@@ -15351,6 +15445,19 @@ private:
         } else {
             FileItem* item = FindItem(hit.coreId, hit.itemId);
             AppendMenuW(menu, MF_STRING, MenuOpenItem, L"打开");
+            if (item != nullptr &&
+                item->storageMode == FileStorageMode::Managed) {
+                AppendMenuW(
+                    menu, MF_STRING, MenuRenameItemRealFile,
+                    L"重命名文件\tF2");
+            } else {
+                AppendMenuW(
+                    menu, MF_STRING, MenuRenameItemDisplay,
+                    L"修改显示名称\tF2");
+                AppendMenuW(
+                    menu, MF_STRING, MenuRenameItemRealFile,
+                    L"重命名真实文件…");
+            }
             AppendMenuW(menu, MF_STRING, MenuOpenContainingFolder, L"打开所在文件夹");
             AppendMenuW(menu, MF_STRING, MenuRevealInExplorer, L"在资源管理器中选中");
             AppendMenuW(menu, MF_STRING, MenuShowFullPath, L"查看完整路径");
@@ -15408,6 +15515,12 @@ private:
             break;
         case MenuRenameCore:
             BeginRename(selected_.coreId);
+            break;
+        case MenuRenameItemDisplay:
+            BeginItemRename(selected_.coreId, selected_.itemId, false);
+            break;
+        case MenuRenameItemRealFile:
+            BeginItemRename(selected_.coreId, selected_.itemId, true);
             break;
         case MenuCoreAppearanceSettings:
             OpenCoreAppearancePanel(selected_.coreId);
@@ -15719,9 +15832,20 @@ private:
             Undo();
             return;
         }
-        if (key == VK_F2 && selected_.kind == HitKind::Core) {
-            BeginRename(selected_.coreId);
-            return;
+        if (key == VK_F2) {
+            if (selected_.kind == HitKind::Core) {
+                BeginRename(selected_.coreId);
+                return;
+            }
+            if (selected_.kind == HitKind::Item) {
+                const FileItem* item =
+                    FindItem(selected_.coreId, selected_.itemId);
+                BeginItemRename(
+                    selected_.coreId, selected_.itemId,
+                    item != nullptr &&
+                        item->storageMode == FileStorageMode::Managed);
+                return;
+            }
         }
         if (key == VK_DELETE) {
             if (selected_.kind == HitKind::Item) {
@@ -18161,17 +18285,52 @@ private:
             return;
         }
         editingCoreId_ = coreId;
+        editingItemId_ = 0;
+        editingRenameTarget_ = RenameTargetKind::Core;
+        editingPreservedExtension_.clear();
+        CreateRenameEditWindow(core->name);
+    }
+
+    void BeginItemRename(
+        std::uint64_t coreId, std::uint64_t itemId, bool renameRealFile) {
+        CancelCoreShortLabelEdit();
+        EndRename(true);
+        Core* core = FindCore(coreId);
+        FileItem* item = FindItem(coreId, itemId);
+        if (core == nullptr || item == nullptr || core->archived) {
+            return;
+        }
+        editingCoreId_ = coreId;
+        editingItemId_ = itemId;
+        editingRenameTarget_ = renameRealFile
+            ? RenameTargetKind::ItemRealFile
+            : RenameTargetKind::ItemDisplay;
+        editingPreservedExtension_ = renameRealFile
+            ? std::filesystem::path(item->path).extension().wstring()
+            : std::wstring();
+        const std::wstring initial = renameRealFile
+            ? std::filesystem::path(item->path).stem().wstring()
+            : item->displayName.empty()
+                ? MakeDisplayName(item->path, item->isDirectory)
+                : item->displayName;
+        CreateRenameEditWindow(initial);
+    }
+
+    void CreateRenameEditWindow(const std::wstring& initialValue) {
         HWND editParent =
             interactionWindow_ != nullptr
                 ? interactionWindow_
                 : window_;
         editWindow_ = CreateWindowExW(
-            WS_EX_CLIENTEDGE, L"EDIT", core->name.c_str(),
+            WS_EX_CLIENTEDGE, L"EDIT", initialValue.c_str(),
             WS_CHILD | WS_VISIBLE | ES_AUTOHSCROLL | ES_CENTER,
             0, 0, 180, 28, editParent,
             nullptr, GetModuleHandleW(nullptr), nullptr);
         if (editWindow_ == nullptr) {
             editingCoreId_ = 0;
+            editingItemId_ = 0;
+            editingRenameTarget_ = RenameTargetKind::Core;
+            editingPreservedExtension_.clear();
             return;
         }
         SendMessageW(editWindow_, WM_SETFONT,
@@ -18195,13 +18354,32 @@ private:
         if (core == nullptr) {
             return;
         }
-        const D2D1_POINT_2F dip =
-            WorldToScreen(VisualCorePosition(*core));
+        D2D1_RECT_F label;
+        if (editingRenameTarget_ == RenameTargetKind::Core) {
+            const D2D1_POINT_2F center =
+                WorldToScreen(VisualCorePosition(*core));
+            label = CoreNameRectangle(*core, center, CoreScreenRadius(*core));
+        } else {
+            const LayoutMap& layouts = StableLayouts();
+            const auto found = layouts.find(core->id);
+            if (found == layouts.end()) return;
+            const auto entry = std::find_if(
+                found->second.begin(), found->second.end(),
+                [this](const ItemLayout& value) {
+                    return value.item != nullptr &&
+                           value.item->id == editingItemId_;
+                });
+            if (entry == found->second.end()) return;
+            label = FileLabelInteractionRectangle(
+                *entry->item, VisualLabelRectangle(*core, *entry));
+        }
         const float scale = dpi_ / 96.0f;
         const int width = static_cast<int>(190.0f * scale);
         const int height = static_cast<int>(29.0f * scale);
-        const int left = static_cast<int>((dip.x - 95.0f) * scale);
-        const int top = static_cast<int>((dip.y + 43.0f) * scale);
+        const float center = (label.left + label.right) * 0.5f;
+        const int left = static_cast<int>((center - 95.0f) * scale) +
+            interactionContentOffsetPixels_;
+        const int top = static_cast<int>((label.top - 2.0f) * scale);
         SetWindowPos(editWindow_, HWND_TOP, left, top, width, height, SWP_NOACTIVATE);
     }
 
@@ -18212,7 +18390,12 @@ private:
         HWND edit = editWindow_;
         editWindow_ = nullptr;
         const std::uint64_t coreId = editingCoreId_;
+        const std::uint64_t itemId = editingItemId_;
+        const RenameTargetKind target = editingRenameTarget_;
         editingCoreId_ = 0;
+        editingItemId_ = 0;
+        editingRenameTarget_ = RenameTargetKind::Core;
+        editingPreservedExtension_.clear();
         std::wstring value;
         if (commit) {
             const int length = GetWindowTextLengthW(edit);
@@ -18226,16 +18409,29 @@ private:
         DestroyWindow(edit);
         interactionShapes_.clear();
 
-        if (commit && !value.empty()) {
+        if (commit && target == RenameTargetKind::Core && !value.empty()) {
             if (Core* core = FindCore(coreId); core != nullptr && core->name != value) {
-                PushUndo(state_);
+                const WorkspaceState before = state_;
+                const bool dirtyBefore = dirty_;
                 core->name = Shorten(value, 40);
                 core->iconKind = InferCoreIconKind(*core);
                 if (!core->themeColorCustomized) {
                     core->themeColor = DefaultCoreColor(core->iconKind);
                 }
-                ScheduleSave();
+                dirty_ = true;
+                if (SaveState()) {
+                    PushUndo(before);
+                    SetStatus(L"已重命名核心");
+                } else {
+                    state_ = before;
+                    dirty_ = dirtyBefore;
+                    SetStatus(L"保存失败：核心名称未修改");
+                }
             }
+        } else if (commit && target == RenameTargetKind::ItemDisplay) {
+            (void)CommitItemDisplayRename(coreId, itemId, value);
+        } else if (commit && target == RenameTargetKind::ItemRealFile) {
+            (void)RenameItemRealFile(coreId, itemId, value);
         }
         Invalidate();
     }
@@ -18786,6 +18982,234 @@ private:
         return true;
     }
 
+    static bool IsReservedWindowsFileStem(const std::wstring& stem) {
+        std::wstring upper = stem;
+        std::transform(
+            upper.begin(), upper.end(), upper.begin(),
+            [](wchar_t value) {
+                return static_cast<wchar_t>(std::towupper(value));
+            });
+        if (upper == L"CON" || upper == L"PRN" || upper == L"AUX" ||
+            upper == L"NUL") {
+            return true;
+        }
+        if (upper.size() == 4 &&
+            (upper.rfind(L"COM", 0) == 0 || upper.rfind(L"LPT", 0) == 0)) {
+            return upper[3] >= L'1' && upper[3] <= L'9';
+        }
+        return false;
+    }
+
+    static bool ValidateFileRenameStem(
+        const std::wstring& stem, std::wstring* reason = nullptr) {
+        if (stem.empty() || stem == L"." || stem == L"..") {
+            if (reason != nullptr) *reason = L"文件名不能为空";
+            return false;
+        }
+        if (stem.back() == L'.' || stem.back() == L' ') {
+            if (reason != nullptr) *reason = L"文件名不能以句点或空格结尾";
+            return false;
+        }
+        if (stem.find_first_of(L"\\\\/:*?\"<>|") != std::wstring::npos) {
+            if (reason != nullptr) *reason = L"文件名包含 Windows 不允许的字符";
+            return false;
+        }
+        if (IsReservedWindowsFileStem(stem)) {
+            if (reason != nullptr) *reason = L"该名称是 Windows 保留名称";
+            return false;
+        }
+        return true;
+    }
+
+    bool CommitItemDisplayRename(
+        std::uint64_t coreId, std::uint64_t itemId,
+        const std::wstring& value) {
+        FileItem* item = FindItem(coreId, itemId);
+        if (item == nullptr) return false;
+        if (value.empty()) {
+            SetStatus(L"显示名称不能为空");
+            return false;
+        }
+        const std::wstring displayName = Shorten(value, 80);
+        if (item->displayName == displayName) return true;
+        const WorkspaceState before = state_;
+        item->displayName = displayName;
+        dirty_ = true;
+        if (!SaveState()) {
+            state_ = before;
+            dirty_ = false;
+            SetStatus(L"保存失败：显示名称未修改");
+            return false;
+        }
+        PushUndo(before);
+        SetStatus(L"已更新显示名称");
+        return true;
+    }
+
+    bool RenameItemRealFile(
+        std::uint64_t coreId, std::uint64_t itemId,
+        const std::wstring& stem) {
+        Core* core = FindCore(coreId);
+        FileItem* item = FindItem(coreId, itemId);
+        if (core == nullptr || item == nullptr) return false;
+        if (stateRecoveryBlocked_) {
+            SetStatus(L"状态处于保护模式；未重命名真实文件");
+            return false;
+        }
+        if (item->missing || item->path.empty() || !FilePathExists(item->path)) {
+            SetStatus(L"重命名失败：真实文件不存在");
+            return false;
+        }
+        if (item->isDirectory) {
+            SetStatus(L"当前版本请在资源管理器中重命名文件夹");
+            return false;
+        }
+        std::wstring validationError;
+        if (!ValidateFileRenameStem(stem, &validationError)) {
+            SetStatus(L"重命名失败：" + validationError);
+            return false;
+        }
+        const std::filesystem::path source(item->path);
+        const std::wstring extension = source.extension().wstring();
+        const std::wstring fileName = stem + extension;
+        if (fileName.size() > 255) {
+            SetStatus(L"重命名失败：文件名过长");
+            return false;
+        }
+        const std::filesystem::path destination = source.parent_path() / fileName;
+        if (PathEquals(source.wstring(), destination.wstring())) {
+            SetStatus(L"名称未改变");
+            return true;
+        }
+        if (FilePathExists(destination.wstring())) {
+            SetStatus(L"重命名失败：同目录已存在同名文件");
+            return false;
+        }
+        if (item->storageMode == FileStorageMode::Reference) {
+            const std::wstring warning =
+                L"将重命名真实文件：\n" + FileDisplayName(item->path) +
+                L"\n\n依赖原路径的程序可能受影响。是否继续？";
+            if (MessageBoxW(
+                    window_, warning.c_str(), L"重命名真实文件",
+                    MB_YESNO | MB_ICONWARNING | MB_DEFBUTTON2) != IDYES) {
+                return false;
+            }
+        }
+
+        const WorkspaceState before = state_;
+        ManagedFileTransaction transaction;
+        transaction.id = itemId;
+        transaction.coreId = coreId;
+        transaction.itemId = itemId;
+        transaction.operation = ManagedTransactionOperation::Rename;
+        transaction.stage = ManagedTransactionStage::Prepared;
+        transaction.sourcePath = source.wstring();
+        transaction.destinationPath = destination.wstring();
+        transaction.itemPresentAfter = true;
+        transaction.createdAt = UnixTimeNow();
+        if (!PersistManagedTransaction(transaction)) {
+            SetStatus(L"重命名失败：无法写入文件事务日志");
+            return false;
+        }
+        std::wstring moveError;
+        if (!MoveFileWithoutReplacement(
+                transaction.sourcePath, transaction.destinationPath,
+                &moveError)) {
+            ClearManagedTransaction();
+            SetStatus(L"重命名失败：" + moveError);
+            return false;
+        }
+        transaction.stage = ManagedTransactionStage::FileMoved;
+        if (!PersistManagedTransaction(transaction)) {
+            std::wstring rollbackError;
+            const bool rolledBack = MoveFileWithoutReplacement(
+                transaction.destinationPath, transaction.sourcePath,
+                &rollbackError);
+            if (rolledBack) {
+                transaction.stage = ManagedTransactionStage::RolledBack;
+                (void)PersistManagedTransaction(transaction);
+                ClearManagedTransaction();
+            }
+            SetStatus(L"重命名失败：事务记录未完成，已尝试回滚真实文件");
+            return false;
+        }
+
+        WorkspaceState candidate = state_;
+        auto candidateCore = std::find_if(
+            candidate.cores.begin(), candidate.cores.end(),
+            [coreId](const Core& value) { return value.id == coreId; });
+        FileItem* candidateItem = nullptr;
+        if (candidateCore != candidate.cores.end()) {
+            auto candidateFile = std::find_if(
+                candidateCore->files.begin(), candidateCore->files.end(),
+                [itemId](const FileItem& value) { return value.id == itemId; });
+            if (candidateFile != candidateCore->files.end()) {
+                candidateItem = &*candidateFile;
+            }
+        }
+        if (candidateItem != nullptr) {
+            candidateItem->path = transaction.destinationPath;
+            candidateItem->originalName = fileName;
+            candidateItem->displayName =
+                MakeDisplayName(transaction.destinationPath, candidateItem->isDirectory);
+            candidateItem->missing = false;
+            if (candidateItem->storageMode == FileStorageMode::Managed) {
+                candidateItem->managedPath = transaction.destinationPath;
+                if (!candidateItem->originalPath.empty()) {
+                    candidateItem->originalPath =
+                        (std::filesystem::path(candidateItem->originalPath)
+                             .parent_path() / fileName).wstring();
+                }
+            }
+        }
+        const RelationValidationResult validation = ValidateRelationState(candidate);
+        if (candidateItem == nullptr || !validation.IsValid() ||
+            !WriteUtf8Atomic(stateFile_, SerializeState(candidate))) {
+            std::wstring rollbackError;
+            const bool rolledBack = MoveFileWithoutReplacement(
+                transaction.destinationPath, transaction.sourcePath,
+                &rollbackError);
+            if (rolledBack) {
+                transaction.stage = ManagedTransactionStage::RolledBack;
+                (void)PersistManagedTransaction(transaction);
+                ClearManagedTransaction();
+            }
+            SetStatus(candidateItem == nullptr
+                ? L"重命名失败：文件节点状态已变化，已回滚真实文件"
+                : !validation.IsValid()
+                    ? L"重命名失败：关系校验未通过，已回滚真实文件"
+                    : L"重命名失败：状态未保存，已回滚真实文件");
+            return false;
+        }
+
+        state_ = std::move(candidate);
+        dirty_ = false;
+        CreateHistoryBackup(false);
+        transaction.stage = ManagedTransactionStage::StateSaved;
+        (void)PersistManagedTransaction(transaction);
+        transaction.stage = ManagedTransactionStage::Committed;
+        (void)PersistManagedTransaction(transaction);
+        ClearManagedTransaction();
+        PushUndo(before);
+        ManagedFileTransaction reverse;
+        reverse.id = transaction.id;
+        reverse.coreId = coreId;
+        reverse.itemId = itemId;
+        reverse.operation = ManagedTransactionOperation::Rename;
+        reverse.sourcePath = transaction.destinationPath;
+        reverse.destinationPath = transaction.sourcePath;
+        reverse.itemPresentAfter = true;
+        reverse.createdAt = UnixTimeNow();
+        managedUndoAction_ = ManagedUndoAction{std::move(reverse)};
+        iconCache_.clear();
+        iconShadowCache_.clear();
+        layoutCache_.clear();
+        layoutDirty_ = true;
+        SetStatus(L"已重命名真实文件");
+        Invalidate();
+        return true;
+    }
+
     bool IsEligibleDesktopManagedFile(
         const std::wstring& path,
         std::wstring* reason = nullptr) const {
@@ -18824,6 +19248,10 @@ private:
         FileItem* item = FindItemAnywhere(transaction.itemId, &owner);
         if (!transaction.itemPresentAfter) {
             return item == nullptr;
+        }
+        if (transaction.operation == ManagedTransactionOperation::Rename) {
+            return item != nullptr && owner != nullptr &&
+                   PathEquals(item->path, transaction.destinationPath);
         }
         return item != nullptr && owner != nullptr &&
                item->storageMode == FileStorageMode::Managed &&
@@ -19623,6 +20051,12 @@ private:
     HWND editWindow_ = nullptr;
     WNDPROC oldEditProc_ = nullptr;
     std::uint64_t editingCoreId_ = 0;
+    std::uint64_t editingItemId_ = 0;
+    RenameTargetKind editingRenameTarget_ = RenameTargetKind::Core;
+    std::wstring editingPreservedExtension_;
+    HitResult nameRenameCandidate_{};
+    std::chrono::steady_clock::time_point nameRenameCandidateAt_ =
+        std::chrono::steady_clock::now();
     HWND coreShortLabelEditWindow_ = nullptr;
     WNDPROC oldCoreShortLabelEditProc_ = nullptr;
     std::uint64_t coreShortLabelEditingCoreId_ = 0;
@@ -22174,6 +22608,58 @@ bool RunSelfTest() {
         GravityApp::FilePathExists(managedRecoveryDestination.wstring()) ||
         GravityApp::FilePathExists(
             managedRecoveryApp.ManagedTransactionPath().wstring())) {
+        return false;
+    }
+
+    // Real-file rename must keep the visual reference, managed restore path
+    // and the undo transaction in lockstep.  This test uses a managed item so
+    // it exercises the filesystem transaction without a confirmation dialog.
+    const std::filesystem::path renameSource =
+        relationTestDirectory / L"rename-source.txt";
+    const std::filesystem::path renameDestination =
+        relationTestDirectory / L"rename-destination.txt";
+    if (!WriteUtf8Atomic(renameSource, "rename transaction")) {
+        return false;
+    }
+    GravityApp renameApp;
+    renameApp.stateFile_ = relationTestDirectory / L"rename-state.json";
+    Core renameCore;
+    renameCore.id = 880;
+    renameCore.name = L"rename core";
+    FileItem renameItem;
+    renameItem.id = 881;
+    renameItem.path = renameSource.wstring();
+    renameItem.originalPath =
+        (relationTestDirectory / L"original-name.txt").wstring();
+    renameItem.managedPath = renameSource.wstring();
+    renameItem.originalName = L"rename-source.txt";
+    renameItem.displayName = L"rename-source";
+    renameItem.storageMode = FileStorageMode::Managed;
+    renameCore.files.push_back(renameItem);
+    renameApp.state_.cores.push_back(std::move(renameCore));
+    if (!renameApp.RenameItemRealFile(880, 881, L"rename-destination") ||
+        GravityApp::FilePathExists(renameSource.wstring()) ||
+        !GravityApp::FilePathExists(renameDestination.wstring()) ||
+        renameApp.FindItem(880, 881) == nullptr ||
+        !PathEquals(renameApp.FindItem(880, 881)->path,
+                    renameDestination.wstring()) ||
+        !PathEquals(renameApp.FindItem(880, 881)->managedPath,
+                    renameDestination.wstring()) ||
+        FileDisplayName(renameApp.FindItem(880, 881)->originalPath) !=
+            L"rename-destination.txt" ||
+        renameApp.managedUndoAction_.has_value() == false) {
+        return false;
+    }
+    renameApp.Undo();
+    if (!GravityApp::FilePathExists(renameSource.wstring()) ||
+        GravityApp::FilePathExists(renameDestination.wstring()) ||
+        renameApp.FindItem(880, 881) == nullptr ||
+        !PathEquals(renameApp.FindItem(880, 881)->path,
+                    renameSource.wstring()) ||
+        !renameApp.undoStack_.empty() ||
+        !GravityApp::ValidateFileRenameStem(L"rename", nullptr) ||
+        GravityApp::ValidateFileRenameStem(L"CON", nullptr) ||
+        GravityApp::ValidateFileRenameStem(L"bad:name", nullptr)) {
         return false;
     }
 
