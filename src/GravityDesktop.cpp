@@ -15863,12 +15863,7 @@ private:
             }
         }
         const std::wstring collectionWarning =
-            L"将“" + FileDisplayName(sourcePath) + L"”收纳到“" +
-            target->name + L"”。\n\n"
-            L"真实文件会从 Windows 桌面移入“文档\\Gravity Desktop Files”，"
-            L"左侧原始桌面图标将消失。\n"
-            L"引力桌面只保存一个入口；之后可通过“从核心移除并还原到桌面”恢复。\n\n"
-            L"依赖原始桌面路径的外部程序可能需要重新定位该文件。";
+            L"收纳后，文件将从桌面移入此核心，可随时还原到桌面。";
         if (MessageBoxW(
                 window_, collectionWarning.c_str(), L"收纳到核心",
                 MB_OKCANCEL | MB_ICONWARNING | MB_DEFBUTTON2) != IDOK) {
