@@ -2619,6 +2619,186 @@ RelationValidationResult ValidateRelationState(
     return result;
 }
 
+struct RelationRepairSummary {
+    std::size_t clearedParents = 0;
+    std::size_t clearedFamilyReferences = 0;
+    std::size_t removedFamilies = 0;
+
+    bool Changed() const {
+        return clearedParents != 0 ||
+               clearedFamilyReferences != 0 ||
+               removedFamilies != 0;
+    }
+};
+
+bool RepairRecoverableRelationState(
+    const WorkspaceState& source,
+    WorkspaceState& repaired,
+    RelationRepairSummary& summary) {
+    repaired = source;
+    summary = {};
+    const RelationValidationResult original =
+        ValidateRelationState(repaired);
+    if (original.IsValid()) {
+        return true;
+    }
+    static constexpr std::array<const wchar_t*, 4>
+        unrecoverableCodes{
+            L"duplicate_core", L"duplicate_item",
+            L"duplicate_family", L"node_limit"};
+    if (std::any_of(
+            original.issues.begin(), original.issues.end(),
+            [](const RelationValidationIssue& issue) {
+                return std::any_of(
+                    unrecoverableCodes.begin(),
+                    unrecoverableCodes.end(),
+                    [&issue](const wchar_t* code) {
+                        return issue.code == code;
+                    });
+            })) {
+        return false;
+    }
+
+    struct MutableItemOwner {
+        Core* core = nullptr;
+        FileItem* item = nullptr;
+    };
+    std::unordered_map<std::uint64_t, Core*> cores;
+    std::unordered_map<std::uint64_t, MutableItemOwner> items;
+    for (Core& core : repaired.cores) {
+        cores.emplace(core.id, &core);
+        for (FileItem& item : core.files) {
+            items.emplace(
+                item.id, MutableItemOwner{&core, &item});
+        }
+    }
+    std::unordered_map<std::uint64_t, const FileFamily*>
+        families;
+    for (const FileFamily& family : repaired.families) {
+        families.emplace(family.id, &family);
+    }
+
+    std::unordered_set<std::uint64_t> invalidFamilies;
+    for (const FileFamily& family : repaired.families) {
+        const auto familyCore = cores.find(family.coreId);
+        const auto root = items.find(family.rootFileId);
+        const auto current = items.find(family.currentFileId);
+        const bool invalid =
+            familyCore == cores.end() ||
+            root == items.end() || current == items.end() ||
+            root->second.core->id != family.coreId ||
+            current->second.core->id != family.coreId ||
+            root->second.item->parentFileId != 0 ||
+            root->second.item->familyId != family.id ||
+            current->second.item->familyId != family.id;
+        if (invalid) {
+            invalidFamilies.insert(family.id);
+        }
+    }
+
+    for (Core& core : repaired.cores) {
+        for (FileItem& item : core.files) {
+            if (item.familyId == 0) {
+                continue;
+            }
+            const auto family = families.find(item.familyId);
+            if (family == families.end() ||
+                invalidFamilies.contains(item.familyId) ||
+                family->second->coreId != core.id) {
+                item.familyId = 0;
+                ++summary.clearedFamilyReferences;
+            }
+        }
+    }
+    repaired.families.erase(
+        std::remove_if(
+            repaired.families.begin(), repaired.families.end(),
+            [&invalidFamilies](const FileFamily& family) {
+                return invalidFamilies.contains(family.id);
+            }),
+        repaired.families.end());
+    summary.removedFamilies = invalidFamilies.size();
+
+    const auto makeIndependent =
+        [&summary](Core& core, FileItem& item) {
+            if (item.parentFileId != 0) {
+                ++summary.clearedParents;
+            }
+            item.parentFileId = 0;
+            item.relativeManualLock = false;
+            item.relativeManualOffset = D2D1::Point2F();
+            if (item.slot >= 0) {
+                item.detachedFromUpper = false;
+                return;
+            }
+            if (!item.detachedFromUpper ||
+                (std::abs(item.detachedWorldPosition.x) < 0.001f &&
+                 std::abs(item.detachedWorldPosition.y) < 0.001f)) {
+                const float angle =
+                    item.relativeAngle * kPi / 180.0f;
+                const float radius =
+                    std::max(72.0f, item.relativeRadius);
+                item.detachedWorldPosition = D2D1::Point2F(
+                    core.position.x + std::cos(angle) * radius,
+                    core.position.y + std::sin(angle) * radius);
+            }
+            item.detachedFromUpper = true;
+        };
+
+    for (Core& core : repaired.cores) {
+        for (FileItem& item : core.files) {
+            if (item.parentFileId == 0) {
+                continue;
+            }
+            const auto parent = items.find(item.parentFileId);
+            if (item.parentFileId == item.id ||
+                parent == items.end() ||
+                parent->second.core->id != core.id ||
+                item.familyId == 0 ||
+                parent->second.item->familyId == 0 ||
+                item.familyId != parent->second.item->familyId) {
+                makeIndependent(core, item);
+            }
+        }
+    }
+
+    std::unordered_set<std::uint64_t> processed;
+    for (const auto& [startId, owner] : items) {
+        (void)owner;
+        if (processed.contains(startId)) {
+            continue;
+        }
+        std::unordered_map<std::uint64_t, std::size_t>
+            positions;
+        std::vector<std::uint64_t> path;
+        std::uint64_t cursor = startId;
+        while (cursor != 0 && !processed.contains(cursor)) {
+            if (const auto repeated = positions.find(cursor);
+                repeated != positions.end()) {
+                for (std::size_t index = repeated->second;
+                     index < path.size(); ++index) {
+                    MutableItemOwner& cycleOwner =
+                        items.at(path[index]);
+                    makeIndependent(
+                        *cycleOwner.core, *cycleOwner.item);
+                }
+                break;
+            }
+            const auto node = items.find(cursor);
+            if (node == items.end()) {
+                break;
+            }
+            positions.emplace(cursor, path.size());
+            path.push_back(cursor);
+            cursor = node->second.item->parentFileId;
+        }
+        processed.insert(path.begin(), path.end());
+    }
+
+    return summary.Changed() &&
+           ValidateRelationState(repaired).IsValid();
+}
+
 bool HasRelationValidationIssue(
     const RelationValidationResult& result,
     const wchar_t* code) {
@@ -11998,6 +12178,12 @@ private:
             return;
         }
 
+        if (source == target && item->detachedFromUpper &&
+            AttachedFileCount(*target) >= kCoreFileCapacity) {
+            SetStatus(L"无法连接到核心：核心容量已满");
+            return;
+        }
+
         if (source != target) {
             std::vector<std::uint64_t> movedIds;
             std::wstring moveError;
@@ -12022,7 +12208,6 @@ private:
         // Restoring a core link is explicit: the file becomes a normal root
         // node and receives a real core slot.  No real file is moved.
         item->parentFileId = 0;
-        item->detachedFromUpper = false;
         item->detachedWorldPosition = D2D1::Point2F();
         item->relativeManualLock = false;
         item->relativeManualOffset = D2D1::Point2F();
@@ -12030,7 +12215,21 @@ private:
         item->slot = -1;
         item->ring = -1;
         item->ringSlot = -1;
+        // Slot capacity is calculated as current attached files plus this
+        // candidate. Keep it temporarily detached so the same reference is
+        // not counted twice while its new slot is selected.
+        item->detachedFromUpper = true;
         AssignNewItemLayout(*target, *item);
+        if (item->slot < 0) {
+            state_ = std::move(before);
+            dirty_ = dirtyBefore;
+            layoutCache_.clear();
+            layoutDirty_ = true;
+            SetStatus(L"无法连接到核心：没有可用槽位");
+            Invalidate();
+            return;
+        }
+        item->detachedFromUpper = false;
         ArrangeAttachedSubtreeOutward(*target, itemId);
         target->expanded = true;
         layoutDirty_ = true;
@@ -17454,6 +17653,38 @@ private:
         }
     }
 
+    bool TryRepairLoadedRelationState(
+        const std::filesystem::path& sourcePath,
+        const std::string& originalText,
+        const WorkspaceState& loaded,
+        const RelationValidationResult& validation,
+        std::filesystem::path* preservedPath) {
+        (void)PreserveInvalidRelationStateCopy(
+            sourcePath, originalText, validation,
+            preservedPath);
+        WorkspaceState repaired;
+        RelationRepairSummary summary;
+        if (!RepairRecoverableRelationState(
+                loaded, repaired, summary) ||
+            !ValidateRelationState(repaired).IsValid() ||
+            stateFile_.empty() ||
+            !WriteUtf8Atomic(
+                stateFile_, SerializeState(repaired))) {
+            return false;
+        }
+        state_ = std::move(repaired);
+        stateRecoveryBlocked_ = false;
+        dirty_ = false;
+        SetStatus(
+            L"已安全修复异常文件关系：断开 " +
+            std::to_wstring(summary.clearedParents) +
+            L" 条失效上层连接，清理 " +
+            std::to_wstring(summary.removedFamilies) +
+            L" 个失效文件族；文件引用和真实文件均已保留");
+        NotifyPendingSessionEndRecovery();
+        return true;
+    }
+
     void LoadState() {
         stateFile_ = StateFilePath();
         const std::optional<std::string> stateText = ReadUtf8File(stateFile_);
@@ -17468,9 +17699,11 @@ private:
                     return;
                 }
                 std::filesystem::path preserved;
-                (void)PreserveInvalidRelationStateCopy(
-                    stateFile_, *stateText, validation,
-                    &preserved);
+                if (TryRepairLoadedRelationState(
+                        stateFile_, *stateText, state_,
+                        validation, &preserved)) {
+                    return;
+                }
                 stateRecoveryBlocked_ = true;
                 dirty_ = false;
                 std::wstring message =
@@ -17505,9 +17738,12 @@ private:
                     return;
                 }
                 std::filesystem::path preserved;
-                (void)PreserveInvalidRelationStateCopy(
-                    stateFile_.wstring() + L".bak",
-                    *backup, validation, &preserved);
+                if (TryRepairLoadedRelationState(
+                        stateFile_.wstring() + L".bak",
+                        *backup, state_, validation,
+                        &preserved)) {
+                    return;
+                }
                 stateRecoveryBlocked_ = true;
                 dirty_ = false;
                 std::wstring message =
@@ -18632,8 +18868,33 @@ bool RunSelfTest() {
     const std::filesystem::path protectedStatePath =
         relationTestDirectory /
         L"protected-state.json";
+    WorkspaceState recoverableState = missingParentState;
+    FileItem missingFamilyItem;
+    missingFamilyItem.id = 104;
+    missingFamilyItem.path =
+        L"C:\\GravityDesktopSelfTest\\missing-family.txt";
+    missingFamilyItem.familyId = 999;
+    missingFamilyItem.slot = 4;
+    recoverableState.cores.front().files.push_back(
+        std::move(missingFamilyItem));
+    FileItem danglingFamilyItem;
+    danglingFamilyItem.id = 105;
+    danglingFamilyItem.path =
+        L"C:\\GravityDesktopSelfTest\\dangling-family.txt";
+    danglingFamilyItem.parentFileId = 998;
+    danglingFamilyItem.familyId = 202;
+    danglingFamilyItem.slot = 5;
+    recoverableState.cores.front().files.push_back(
+        std::move(danglingFamilyItem));
+    FileFamily danglingFamily;
+    danglingFamily.id = 202;
+    danglingFamily.coreId = kUnclassifiedCoreId;
+    danglingFamily.rootFileId = 998;
+    danglingFamily.currentFileId = 998;
+    recoverableState.families.push_back(
+        std::move(danglingFamily));
     const std::string protectedStateText =
-        SerializeState(missingParentState);
+        SerializeState(recoverableState);
     if (!WriteUtf8Atomic(
             protectedStatePath,
             protectedStateText)) {
@@ -18688,16 +18949,89 @@ bool RunSelfTest() {
             break;
         }
     }
-    if (!protectedLoadApp.stateRecoveryBlocked_ ||
+    FileItem* repairedMissingParent =
+        protectedLoadApp.FindItem(
+            kUnclassifiedCoreId, 102);
+    FileItem* repairedMissingFamily =
+        protectedLoadApp.FindItem(
+            kUnclassifiedCoreId, 104);
+    FileItem* repairedDanglingFamily =
+        protectedLoadApp.FindItem(
+            kUnclassifiedCoreId, 105);
+    const std::optional<std::string> repairedStateText =
+        ReadUtf8File(protectedStatePath);
+    WorkspaceState repairedPersistedState;
+    if (protectedLoadApp.stateRecoveryBlocked_ ||
         protectedLoadApp.state_.cores.size() !=
-            missingParentState.cores.size() ||
+            recoverableState.cores.size() ||
         protectedLoadApp.state_.cores.front().files.size() !=
-            missingParentState.cores.front().files.size() ||
-        protectedLoadApp.SaveState() ||
+            recoverableState.cores.front().files.size() ||
+        repairedMissingParent == nullptr ||
+        repairedMissingParent->parentFileId != 0 ||
+        !repairedMissingParent->detachedFromUpper ||
+        repairedMissingFamily == nullptr ||
+        repairedMissingFamily->familyId != 0 ||
+        repairedDanglingFamily == nullptr ||
+        repairedDanglingFamily->parentFileId != 0 ||
+        repairedDanglingFamily->familyId != 0 ||
         !preservedInvalidCopy ||
-        ReadUtf8File(protectedStatePath) !=
-            std::optional<std::string>(
-                protectedStateText)) {
+        !repairedStateText ||
+        *repairedStateText == protectedStateText ||
+        !DeserializeState(
+            *repairedStateText,
+            repairedPersistedState) ||
+        !ValidateRelationState(
+            repairedPersistedState).IsValid()) {
+        return false;
+    }
+
+    GravityApp reattachApp;
+    reattachApp.stateFile_ =
+        relationTestDirectory / L"reattach.json";
+    Core reattachCore;
+    reattachCore.id = kUnclassifiedCoreId;
+    reattachCore.name = L"reattach";
+    reattachCore.position =
+        D2D1::Point2F(300.0f, 260.0f);
+    reattachCore.expanded = true;
+    reattachCore.layoutTemplate =
+        LayoutTemplate::CompactDouble;
+    FileItem detachedItem;
+    detachedItem.id = 401;
+    detachedItem.path =
+        L"C:\\GravityDesktopSelfTest\\reattach.txt";
+    detachedItem.originalName = L"reattach.txt";
+    detachedItem.displayName = L"reattach";
+    detachedItem.detachedFromUpper = true;
+    detachedItem.detachedWorldPosition =
+        D2D1::Point2F(520.0f, 300.0f);
+    detachedItem.slot = -1;
+    detachedItem.ring = -1;
+    detachedItem.ringSlot = -1;
+    reattachCore.files.push_back(
+        std::move(detachedItem));
+    reattachApp.state_.cores.push_back(
+        std::move(reattachCore));
+    const WorkspaceState reattachBefore =
+        reattachApp.state_;
+    reattachApp.AttachItemToCore(
+        kUnclassifiedCoreId, 401,
+        kUnclassifiedCoreId, reattachBefore);
+    FileItem* reattached = reattachApp.FindItem(
+        kUnclassifiedCoreId, 401);
+    const std::optional<std::string> reattachedText =
+        ReadUtf8File(reattachApp.stateFile_);
+    WorkspaceState reattachedState;
+    if (reattached == nullptr ||
+        reattached->detachedFromUpper ||
+        reattached->parentFileId != 0 ||
+        reattached->slot < 0 ||
+        AttachedFileCount(
+            reattachApp.state_.cores.front()) != 1 ||
+        reattachApp.undoStack_.size() != 1 ||
+        !reattachedText ||
+        !DeserializeState(*reattachedText, reattachedState) ||
+        !ValidateRelationState(reattachedState).IsValid()) {
         return false;
     }
 
