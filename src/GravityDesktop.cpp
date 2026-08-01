@@ -96,6 +96,8 @@ constexpr UINT kCommitRenameMessage = WM_APP + 1;
 constexpr UINT kTrayCallbackMessage = WM_APP + 2;
 constexpr UINT kRestoreExistingInstanceMessage = WM_APP + 3;
 constexpr UINT kRefreshInteractionLayerMessage = WM_APP + 4;
+constexpr UINT kCommitCoreShortLabelMessage = WM_APP + 5;
+constexpr UINT kPreviewCoreShortLabelMessage = WM_APP + 6;
 constexpr UINT kTrayIconId = 1;
 constexpr float kPi = 3.14159265358979323846f;
 constexpr std::array<int, 3> kRingCapacities{6, 13, 0};
@@ -900,6 +902,9 @@ struct CoreBaselineFileLayout {
 struct Core {
     std::uint64_t id = 0;
     std::wstring name;
+    // Optional user-owned visual identifier.  It is deliberately independent
+    // from the core name, icon kind and all layout coordinates.
+    std::wstring shortLabel;
     D2D1_POINT_2F position = D2D1::Point2F();
     bool expanded = true;
     int displayLimit = kNormalVisibleLimit;
@@ -956,6 +961,57 @@ struct Core {
     float growthDirectionDegrees = 0.0f;
     std::vector<FileItem> files;
 };
+
+enum class CoreShortLabelValidation {
+    Valid,
+    WhitespaceOrControl,
+    TooLong,
+    InvalidUnicode,
+};
+
+// Windows wchar_t values are UTF-16 code units.  Count Unicode scalar values
+// rather than UTF-16 units so a supplementary-plane character is never split
+// or incorrectly rejected as two visible characters.
+CoreShortLabelValidation ValidateCoreShortLabel(
+    const std::wstring& value) {
+    std::size_t scalarCount = 0;
+    for (std::size_t index = 0; index < value.size(); ++index) {
+        const wchar_t unit = value[index];
+        if (unit < 0x20 || unit == 0x7F || std::iswspace(unit) != 0) {
+            return CoreShortLabelValidation::WhitespaceOrControl;
+        }
+        if (unit >= 0xD800 && unit <= 0xDBFF) {
+            if (index + 1 >= value.size() ||
+                value[index + 1] < 0xDC00 ||
+                value[index + 1] > 0xDFFF) {
+                return CoreShortLabelValidation::InvalidUnicode;
+            }
+            ++index;
+        } else if (unit >= 0xDC00 && unit <= 0xDFFF) {
+            return CoreShortLabelValidation::InvalidUnicode;
+        }
+        if (++scalarCount > 2) {
+            return CoreShortLabelValidation::TooLong;
+        }
+    }
+    return CoreShortLabelValidation::Valid;
+}
+
+const wchar_t* CoreShortLabelValidationMessage(
+    CoreShortLabelValidation validation) {
+    switch (validation) {
+    case CoreShortLabelValidation::Valid:
+        return L"";
+    case CoreShortLabelValidation::WhitespaceOrControl:
+        return L"短标识不能包含空格、换行或控制字符";
+    case CoreShortLabelValidation::TooLong:
+        return L"短标识最多两个字符";
+    case CoreShortLabelValidation::InvalidUnicode:
+        return L"短标识包含无效字符";
+    default:
+        return L"短标识无效";
+    }
+}
 
 std::size_t AttachedFileCount(const Core& core) {
     return static_cast<std::size_t>(std::count_if(
@@ -1615,6 +1671,7 @@ std::string SerializeState(const WorkspaceState& state) {
     for (std::size_t coreIndex = 0; coreIndex < state.cores.size(); ++coreIndex) {
         const Core& core = state.cores[coreIndex];
         output << "    {\"id\": " << core.id << ", \"name\": " << EscapeJson(core.name)
+               << ", \"short_label\": " << EscapeJson(core.shortLabel)
                << ", \"x\": " << core.position.x << ", \"y\": " << core.position.y
                << ", \"expanded\": " << (core.expanded ? "true" : "false")
                << ", \"display_limit\": " << core.displayLimit
@@ -1899,6 +1956,14 @@ bool DeserializeState(const std::string& json, WorkspaceState& state) {
         ids.insert(core.id);
         maximumId = std::max(maximumId, core.id);
         core.name = StringMember(*object, "name", L"核心");
+        core.shortLabel = StringMember(*object, "short_label", L"");
+        if (ValidateCoreShortLabel(core.shortLabel) !=
+            CoreShortLabelValidation::Valid) {
+            // A malformed optional label must never prevent the workspace
+            // from loading.  Clear only that visual field and retain every
+            // existing core, relationship and coordinate.
+            core.shortLabel.clear();
+        }
         core.position.x = static_cast<float>(NumberMember(*object, "x", 360.0));
         core.position.y = static_cast<float>(NumberMember(*object, "y", 300.0));
         core.expanded = BoolMember(*object, "expanded", true);
@@ -2781,6 +2846,7 @@ public:
             }
         }
         EndRename(false);
+        CancelCoreShortLabelEdit();
         DestroyInteractionWindow();
         if (window_ != nullptr) {
             KillTimer(window_, kCoreSelectionHaloTimer);
@@ -3090,6 +3156,16 @@ public:
         case kCommitRenameMessage:
             EndRename(wParam != 0);
             return 0;
+        case kCommitCoreShortLabelMessage:
+            if (wParam != 0) {
+                CommitCoreShortLabelEdit();
+            } else {
+                CancelCoreShortLabelEdit();
+            }
+            return 0;
+        case kPreviewCoreShortLabelMessage:
+            PreviewCoreShortLabelEdit();
+            return 0;
         case WM_GETMINMAXINFO: {
             auto* info = reinterpret_cast<MINMAXINFO*>(lParam);
             const UINT dpi = window_ == nullptr ? 96 : GetDpiForWindow(window_);
@@ -3241,6 +3317,30 @@ private:
             return CallWindowProcW(app->oldEditProc_, window, message, wParam, lParam);
         }
         return DefWindowProcW(window, message, wParam, lParam);
+    }
+
+    static LRESULT CALLBACK CoreShortLabelEditWindowProc(
+        HWND window, UINT message, WPARAM wParam, LPARAM lParam) {
+        auto* app = reinterpret_cast<GravityApp*>(
+            GetWindowLongPtrW(window, GWLP_USERDATA));
+        if (app == nullptr) {
+            return DefWindowProcW(window, message, wParam, lParam);
+        }
+        if (message == WM_KEYDOWN && wParam == VK_RETURN) {
+            PostMessageW(app->window_, kCommitCoreShortLabelMessage, TRUE, 0);
+            return 0;
+        }
+        if (message == WM_KEYDOWN && wParam == VK_ESCAPE) {
+            PostMessageW(app->window_, kCommitCoreShortLabelMessage, FALSE, 0);
+            return 0;
+        }
+        const LRESULT result = CallWindowProcW(
+            app->oldCoreShortLabelEditProc_, window, message, wParam, lParam);
+        if (message == WM_CHAR || message == WM_PASTE || message == WM_CUT ||
+            message == WM_CLEAR || message == WM_UNDO) {
+            PostMessageW(app->window_, kPreviewCoreShortLabelMessage, 0, 0);
+        }
+        return result;
     }
 
     D2D1_SIZE_F MonitorWorkAreaDip() const {
@@ -3902,6 +4002,11 @@ private:
             editWindow_ = nullptr;
             oldEditProc_ = nullptr;
             editingCoreId_ = 0;
+            coreShortLabelEditWindow_ = nullptr;
+            oldCoreShortLabelEditProc_ = nullptr;
+            coreShortLabelEditingCoreId_ = 0;
+            coreShortLabelPreview_.clear();
+            coreShortLabelEditError_.clear();
         }
         if (window_ != nullptr &&
             IsWindow(window_) == FALSE) {
@@ -7496,21 +7601,23 @@ private:
             }
         }
 
-        if (editWindow_ != nullptr) {
-            RECT editBounds{};
-            if (GetWindowRect(editWindow_, &editBounds)) {
+        const auto addEditInteractionShape =
+            [&](HWND edit) {
+                if (edit == nullptr) return;
+                RECT editBounds{};
+                if (!GetWindowRect(edit, &editBounds)) return;
                 POINT points[2]{
                     {editBounds.left, editBounds.top},
                     {editBounds.right, editBounds.bottom}};
                 MapWindowPoints(
-                    HWND_DESKTOP, interactionWindow_,
-                    points, 2);
+                    HWND_DESKTOP, interactionWindow_, points, 2);
                 shapes.push_back({
                     RECT{points[0].x, points[0].y,
                          points[1].x, points[1].y},
                     false});
-            }
-        }
+            };
+        addEditInteractionShape(editWindow_);
+        addEditInteractionShape(coreShortLabelEditWindow_);
 
         if (shapes == interactionShapes_) {
             return;
@@ -8043,6 +8150,7 @@ private:
     }
 
     void CloseCoreAppearancePanel() {
+        CancelCoreShortLabelEdit();
         coreAppearancePanelActive_ = false;
         draggingCoreAppearancePanel_ = false;
         draggingCoreAppearanceSlider_ = false;
@@ -8501,7 +8609,7 @@ private:
     D2D1_RECT_F CoreAppearancePanelRectangle(
         const D2D1_SIZE_F& client) const {
         constexpr float width = 360.0f;
-        constexpr float height = 458.0f;
+        constexpr float height = 524.0f;
         const float left = std::clamp(coreAppearancePanelAnchorDip_.x - 18.0f,
             14.0f, std::max(14.0f, client.width - width - 14.0f));
         const float top = std::clamp(coreAppearancePanelAnchorDip_.y + 12.0f,
@@ -8536,16 +8644,16 @@ private:
     D2D1_RECT_F CoreAppearanceTrackRectangle(
         const D2D1_SIZE_F& client, CoreAppearanceControl control) const {
         const D2D1_RECT_F card = CoreAppearancePanelRectangle(client);
-        float y = card.top + 194.0f;
+        float y = card.top + 260.0f;
         switch (control) {
         case CoreAppearanceControl::CoreScale:
-            y = card.top + 194.0f;
+            y = card.top + 260.0f;
             break;
         case CoreAppearanceControl::GlowIntensity:
-            y = card.top + 233.0f;
+            y = card.top + 299.0f;
             break;
         case CoreAppearanceControl::LineWidth:
-            y = card.top + 390.0f;
+            y = card.top + 456.0f;
             break;
         default:
             break;
@@ -8561,6 +8669,27 @@ private:
                            card.right - 14.0f, card.top + 178.0f);
     }
 
+    D2D1_RECT_F CoreAppearanceShortLabelInputRectangle(
+        const D2D1_SIZE_F& client) const {
+        const D2D1_RECT_F card = CoreAppearancePanelRectangle(client);
+        return D2D1::RectF(card.left + 104.0f, card.top + 185.0f,
+                           card.right - 126.0f, card.top + 211.0f);
+    }
+
+    D2D1_RECT_F CoreAppearanceShortLabelApplyRectangle(
+        const D2D1_SIZE_F& client) const {
+        const D2D1_RECT_F card = CoreAppearancePanelRectangle(client);
+        return D2D1::RectF(card.right - 118.0f, card.top + 185.0f,
+                           card.right - 68.0f, card.top + 211.0f);
+    }
+
+    D2D1_RECT_F CoreAppearanceShortLabelCancelRectangle(
+        const D2D1_SIZE_F& client) const {
+        const D2D1_RECT_F card = CoreAppearancePanelRectangle(client);
+        return D2D1::RectF(card.right - 63.0f, card.top + 185.0f,
+                           card.right - 14.0f, card.top + 211.0f);
+    }
+
     D2D1_RECT_F CoreAppearanceLineColorRectangle(
         const D2D1_SIZE_F& client, int index) const {
         const D2D1_RECT_F card = CoreAppearancePanelRectangle(client);
@@ -8571,7 +8700,7 @@ private:
         const float left =
             card.left + 14.0f + static_cast<float>(column) * (width + gap);
         const float top =
-            card.top + 315.0f + static_cast<float>(row) * 29.0f;
+            card.top + 381.0f + static_cast<float>(row) * 29.0f;
         return D2D1::RectF(left, top, left + width, top + 24.0f);
     }
 
@@ -8823,7 +8952,87 @@ private:
                          customColor.right - 8.0f, customColor.bottom),
             brush_.Get(), D2D1_DRAW_TEXT_OPTIONS_CLIP);
 
-        const float separatorY = card.top + 267.0f;
+        const bool shortLabelEditing = CoreShortLabelEditOpen();
+        const D2D1_RECT_F shortLabelInput =
+            CoreAppearanceShortLabelInputRectangle(client);
+        const D2D1_RECT_F shortLabelApply =
+            CoreAppearanceShortLabelApplyRectangle(client);
+        const D2D1_RECT_F shortLabelCancel =
+            CoreAppearanceShortLabelCancelRectangle(client);
+        brush_->SetColor(D2D1::ColorF(secondary, 0.96f));
+        const wchar_t* shortLabelTitle = L"核心短标识";
+        renderTarget_->DrawTextW(
+            shortLabelTitle,
+            static_cast<UINT32>(wcslen(shortLabelTitle)),
+            hudFormat_.Get(),
+            D2D1::RectF(card.left + 14.0f, shortLabelInput.top,
+                         shortLabelInput.left - 8.0f, shortLabelInput.bottom),
+            brush_.Get(), D2D1_DRAW_TEXT_OPTIONS_CLIP);
+        brush_->SetColor(D2D1::ColorF(
+            dark ? 0x2E2E2E : 0xFFFFFF, 0.98f));
+        renderTarget_->FillRoundedRectangle(
+            D2D1::RoundedRect(shortLabelInput, 4.0f, 4.0f), brush_.Get());
+        brush_->SetColor(D2D1::ColorF(
+            shortLabelEditing ? accent : border,
+            shortLabelEditing ? 0.98f : 0.88f));
+        renderTarget_->DrawRoundedRectangle(
+            D2D1::RoundedRect(shortLabelInput, 4.0f, 4.0f), brush_.Get(),
+            shortLabelEditing ? 1.4f : 1.0f);
+        if (!shortLabelEditing) {
+            const std::wstring value = core->shortLabel.empty()
+                ? L"未设置" : core->shortLabel;
+            brush_->SetColor(D2D1::ColorF(
+                core->shortLabel.empty() ? secondary : primary,
+                core->shortLabel.empty() ? 0.76f : 0.98f));
+            renderTarget_->DrawTextW(
+                value.c_str(), static_cast<UINT32>(value.size()),
+                hudFormat_.Get(),
+                D2D1::RectF(shortLabelInput.left + 7.0f,
+                             shortLabelInput.top,
+                             shortLabelInput.right - 5.0f,
+                             shortLabelInput.bottom),
+                brush_.Get(), D2D1_DRAW_TEXT_OPTIONS_CLIP);
+        }
+        const std::array<std::pair<D2D1_RECT_F, const wchar_t*>, 2>
+            shortLabelActions{{{shortLabelApply, L"应用"},
+                               {shortLabelCancel, L"取消"}}};
+        for (const auto& action : shortLabelActions) {
+            brush_->SetColor(D2D1::ColorF(
+                shortLabelEditing
+                    ? (dark ? 0x354458 : 0xE1EDF8)
+                    : (dark ? 0x2B2B2B : 0xECEFF1),
+                0.96f));
+            renderTarget_->FillRoundedRectangle(
+                D2D1::RoundedRect(action.first, 4.0f, 4.0f), brush_.Get());
+            brush_->SetColor(D2D1::ColorF(
+                shortLabelEditing ? accent : border,
+                shortLabelEditing ? 0.94f : 0.58f));
+            renderTarget_->DrawRoundedRectangle(
+                D2D1::RoundedRect(action.first, 4.0f, 4.0f), brush_.Get(), 1.0f);
+            brush_->SetColor(D2D1::ColorF(
+                shortLabelEditing ? primary : secondary,
+                shortLabelEditing ? 0.98f : 0.68f));
+            renderTarget_->DrawTextW(
+                action.second, static_cast<UINT32>(wcslen(action.second)),
+                hudFormat_.Get(), action.first, brush_.Get(),
+                D2D1_DRAW_TEXT_OPTIONS_CLIP);
+        }
+        const bool hasShortLabelError = !coreShortLabelEditError_.empty();
+        brush_->SetColor(D2D1::ColorF(
+            hasShortLabelError ? static_cast<UINT32>(0xB65C34) : secondary,
+            hasShortLabelError ? 0.98f : 0.82f));
+        const std::wstring shortLabelHint = !hasShortLabelError
+            ? L"最多两个字符；留空后恢复原图标。"
+            : coreShortLabelEditError_;
+        renderTarget_->DrawTextW(
+            shortLabelHint.c_str(),
+            static_cast<UINT32>(shortLabelHint.size()),
+            hudFormat_.Get(),
+            D2D1::RectF(card.left + 104.0f, card.top + 215.0f,
+                         card.right - 14.0f, card.top + 239.0f),
+            brush_.Get(), D2D1_DRAW_TEXT_OPTIONS_CLIP);
+
+        const float separatorY = card.top + 333.0f;
         brush_->SetColor(D2D1::ColorF(border, 0.58f));
         renderTarget_->DrawLine(
             D2D1::Point2F(card.left + 14.0f, separatorY),
@@ -8836,8 +9045,8 @@ private:
             lineSectionTitle,
             static_cast<UINT32>(wcslen(lineSectionTitle)),
             hudFormat_.Get(),
-            D2D1::RectF(card.left + 14.0f, card.top + 276.0f,
-                         card.right - 14.0f, card.top + 300.0f),
+            D2D1::RectF(card.left + 14.0f, card.top + 342.0f,
+                         card.right - 14.0f, card.top + 366.0f),
             brush_.Get(), D2D1_DRAW_TEXT_OPTIONS_CLIP);
         brush_->SetColor(D2D1::ColorF(secondary, 0.96f));
         const wchar_t* lineColorLabel = L"连线颜色";
@@ -8845,8 +9054,8 @@ private:
             lineColorLabel,
             static_cast<UINT32>(wcslen(lineColorLabel)),
             hudFormat_.Get(),
-            D2D1::RectF(card.left + 14.0f, card.top + 295.0f,
-                         card.right - 14.0f, card.top + 315.0f),
+            D2D1::RectF(card.left + 14.0f, card.top + 361.0f,
+                         card.right - 14.0f, card.top + 381.0f),
             brush_.Get(), D2D1_DRAW_TEXT_OPTIONS_CLIP);
         static constexpr std::array<ConnectionLineColorMode, 4>
             lineColorModes{
@@ -8981,7 +9190,7 @@ private:
         coreAppearancePanelActive_ = true;
         appearancePreviewColor_.reset();
         constexpr float cardWidth = 360.0f;
-        constexpr float cardHeight = 458.0f;
+        constexpr float cardHeight = 524.0f;
         constexpr float gap = 14.0f;
         const D2D1_SIZE_F client = ClientDipSize();
         const D2D1_POINT_2F center =
@@ -9126,6 +9335,27 @@ private:
             CloseCoreAppearancePanel();
             SyncSelectionDismissTimer();
             Invalidate();
+            return true;
+        }
+        if (PointInside(
+                point,
+                CoreAppearanceShortLabelInputRectangle(ClientDipSize()))) {
+            BeginCoreShortLabelEdit(coreAppearancePanelCoreId_);
+            return true;
+        }
+        if (CoreShortLabelEditOpen()) {
+            if (PointInside(
+                    point,
+                    CoreAppearanceShortLabelApplyRectangle(ClientDipSize()))) {
+                CommitCoreShortLabelEdit();
+            } else if (PointInside(
+                           point,
+                           CoreAppearanceShortLabelCancelRectangle(
+                               ClientDipSize()))) {
+                CancelCoreShortLabelEdit();
+            } else {
+                SetFocus(coreShortLabelEditWindow_);
+            }
             return true;
         }
         if (PointInside(point, CoreAppearancePanelTitleBarRectangle(ClientDipSize()))) {
@@ -10387,6 +10617,139 @@ private:
             tooltipBodyFormat_.Get(), recentRect, brush_.Get(), D2D1_DRAW_TEXT_OPTIONS_CLIP);
     }
 
+    std::wstring CoreShortLabelForDisplay(const Core& core) const {
+        if (core.id == coreShortLabelEditingCoreId_ &&
+            coreShortLabelEditWindow_ != nullptr &&
+            ValidateCoreShortLabel(coreShortLabelPreview_) ==
+                CoreShortLabelValidation::Valid) {
+            return coreShortLabelPreview_;
+        }
+        return core.shortLabel;
+    }
+
+    ComPtr<IDWriteTextFormat> CreateFittedCoreShortLabelFormat(
+        const std::wstring& text, float maximumWidth, float maximumHeight,
+        float preferredSize, float minimumSize,
+        DWRITE_FONT_WEIGHT weight) const {
+        if (writeFactory_ == nullptr || text.empty()) {
+            return nullptr;
+        }
+        const wchar_t* font = systemUiFontFamily_.empty()
+            ? L"Segoe UI" : systemUiFontFamily_.c_str();
+        ComPtr<IDWriteTextFormat> fallback;
+        for (float size = preferredSize; size + 0.01f >= minimumSize;
+             size -= 0.5f) {
+            ComPtr<IDWriteTextFormat> format;
+            if (FAILED(writeFactory_->CreateTextFormat(
+                    font, nullptr, weight, DWRITE_FONT_STYLE_NORMAL,
+                    DWRITE_FONT_STRETCH_NORMAL, size, L"zh-CN",
+                    format.ReleaseAndGetAddressOf()))) {
+                continue;
+            }
+            format->SetTextAlignment(DWRITE_TEXT_ALIGNMENT_CENTER);
+            format->SetParagraphAlignment(
+                DWRITE_PARAGRAPH_ALIGNMENT_CENTER);
+            format->SetWordWrapping(DWRITE_WORD_WRAPPING_NO_WRAP);
+            fallback = format;
+            ComPtr<IDWriteTextLayout> layout;
+            if (FAILED(writeFactory_->CreateTextLayout(
+                    text.c_str(), static_cast<UINT32>(text.size()),
+                    format.Get(), maximumWidth * 2.0f,
+                    maximumHeight * 2.0f,
+                    layout.ReleaseAndGetAddressOf()))) {
+                continue;
+            }
+            DWRITE_TEXT_METRICS metrics{};
+            if (SUCCEEDED(layout->GetMetrics(&metrics)) &&
+                metrics.widthIncludingTrailingWhitespace <= maximumWidth &&
+                metrics.height <= maximumHeight) {
+                return format;
+            }
+        }
+        return fallback;
+    }
+
+    static UINT32 CoreShortLabelForeground(UINT32 themeColor) {
+        const float red = static_cast<float>((themeColor >> 16) & 0xFFu);
+        const float green = static_cast<float>((themeColor >> 8) & 0xFFu);
+        const float blue = static_cast<float>(themeColor & 0xFFu);
+        const float luminance =
+            (red * 0.2126f + green * 0.7152f + blue * 0.0722f) / 255.0f;
+        return luminance < 0.54f ? 0xF7FAFF : 0x17212D;
+    }
+
+    static UINT32 CoreShortLabelOutline(UINT32 themeColor) {
+        return CoreShortLabelForeground(themeColor) == 0xF7FAFF
+            ? 0x14202D : 0xF7FAFF;
+    }
+
+    void DrawCoreShortLabel(const Core& core, const std::wstring& shortLabel,
+                            D2D1_POINT_2F center, float coreRadius,
+                            UINT32 themeColor) {
+        const float labelWidth = coreRadius * 1.36f;
+        const float labelHeight = coreRadius * 0.74f;
+        const D2D1_POINT_2F labelCenter = D2D1::Point2F(
+            center.x, center.y - coreRadius * 0.28f);
+        const D2D1_RECT_F labelBounds = D2D1::RectF(
+            labelCenter.x - labelWidth * 0.5f,
+            labelCenter.y - labelHeight * 0.5f,
+            labelCenter.x + labelWidth * 0.5f,
+            labelCenter.y + labelHeight * 0.5f);
+        const ComPtr<IDWriteTextFormat> labelFormat =
+            CreateFittedCoreShortLabelFormat(
+                shortLabel, labelWidth, labelHeight,
+                std::clamp(coreRadius * 0.70f, 16.0f, 32.0f),
+                std::clamp(coreRadius * 0.36f, 10.0f, 17.0f),
+                DWRITE_FONT_WEIGHT_SEMI_BOLD);
+        if (labelFormat != nullptr) {
+            constexpr float outlineDip = 0.9f;
+            brush_->SetColor(D2D1::ColorF(
+                CoreShortLabelOutline(themeColor), 0.76f));
+            for (const D2D1_POINT_2F offset : {
+                     D2D1::Point2F(-outlineDip, 0.0f),
+                     D2D1::Point2F(outlineDip, 0.0f),
+                     D2D1::Point2F(0.0f, -outlineDip),
+                     D2D1::Point2F(0.0f, outlineDip)}) {
+                renderTarget_->DrawTextW(
+                    shortLabel.c_str(),
+                    static_cast<UINT32>(shortLabel.size()), labelFormat.Get(),
+                    D2D1::RectF(labelBounds.left + offset.x,
+                                 labelBounds.top + offset.y,
+                                 labelBounds.right + offset.x,
+                                 labelBounds.bottom + offset.y),
+                    brush_.Get(), D2D1_DRAW_TEXT_OPTIONS_CLIP);
+            }
+            brush_->SetColor(D2D1::ColorF(
+                CoreShortLabelForeground(themeColor), 0.98f));
+            renderTarget_->DrawTextW(
+                shortLabel.c_str(), static_cast<UINT32>(shortLabel.size()),
+                labelFormat.Get(), labelBounds, brush_.Get(),
+                D2D1_DRAW_TEXT_OPTIONS_CLIP);
+        }
+
+        const std::wstring count = CoreCapacityText(core);
+        const float capacityWidth = coreRadius * 1.40f;
+        const float capacityHeight = coreRadius * 0.42f;
+        const D2D1_RECT_F capacityBounds = D2D1::RectF(
+            center.x - capacityWidth * 0.5f,
+            center.y + coreRadius * 0.14f,
+            center.x + capacityWidth * 0.5f,
+            center.y + coreRadius * 0.14f + capacityHeight);
+        const ComPtr<IDWriteTextFormat> capacityFormat =
+            CreateFittedCoreShortLabelFormat(
+                count, capacityWidth, capacityHeight,
+                std::clamp(coreRadius * 0.34f, 10.0f, 15.0f),
+                9.0f, DWRITE_FONT_WEIGHT_NORMAL);
+        if (capacityFormat != nullptr) {
+            brush_->SetColor(D2D1::ColorF(
+                CoreShortLabelForeground(themeColor), 0.88f));
+            renderTarget_->DrawTextW(
+                count.c_str(), static_cast<UINT32>(count.size()),
+                capacityFormat.Get(), capacityBounds, brush_.Get(),
+                D2D1_DRAW_TEXT_OPTIONS_CLIP);
+        }
+    }
+
     void DrawCore(const Core& core) {
         // Dragging takes visual priority over selection.  Hover and selection
         // never change this core's size, position, or any file coordinate.
@@ -10452,14 +10815,16 @@ private:
                 CoreGlowIntensity(core));
         }
 
-        brush_->SetColor(D2D1::ColorF(0xF4F8FF, 0.96f));
-        const float left = center.x - 12.0f;
-        const float top = center.y - 11.0f;
-        const float glyphScale =
-            std::clamp(coreRadius / 32.0f, 0.85f, 1.55f);
-        renderTarget_->SetTransform(
-            D2D1::Matrix3x2F::Scale(glyphScale, glyphScale, center));
-        switch (core.iconKind) {
+        const std::wstring shortLabel = CoreShortLabelForDisplay(core);
+        if (shortLabel.empty()) {
+            brush_->SetColor(D2D1::ColorF(0xF4F8FF, 0.96f));
+            const float left = center.x - 12.0f;
+            const float top = center.y - 11.0f;
+            const float glyphScale =
+                std::clamp(coreRadius / 32.0f, 0.85f, 1.55f);
+            renderTarget_->SetTransform(
+                D2D1::Matrix3x2F::Scale(glyphScale, glyphScale, center));
+            switch (core.iconKind) {
         case CoreIconKind::Documents:
             renderTarget_->DrawRoundedRectangle(
                 D2D1::RoundedRect(
@@ -10544,6 +10909,10 @@ private:
             renderTarget_->FillEllipse(
                 D2D1::Ellipse(center, 4.0f, 4.0f), brush_.Get());
             break;
+            }
+        } else {
+            DrawCoreShortLabel(
+                core, shortLabel, center, coreRadius, themeColor);
         }
         renderTarget_->SetTransform(D2D1::Matrix3x2F::Identity());
 
@@ -10580,47 +10949,49 @@ private:
                 D2D1_DRAW_TEXT_OPTIONS_CLIP);
         }
 
-        // The badge is a stable capacity indicator, not a hover decoration:
-        // for example 10/15 or 16/18.  It sits beside the core glyph so the
-        // count remains readable without competing with the core name.
-        const std::wstring count = CoreCapacityText(core);
-        const float badgeScale = CoreVisualScale(core);
-        const D2D1_RECT_F badgeBounds =
-            CoreCapacityBadgeRectangle(
-                core, center, coreRadius);
-        const float badgeHeight =
-            badgeBounds.bottom - badgeBounds.top;
-        const D2D1_POINT_2F badge = D2D1::Point2F(
-            (badgeBounds.left + badgeBounds.right) * 0.5f,
-            (badgeBounds.top + badgeBounds.bottom) * 0.5f);
-        const D2D1_RECT_F badgeGlowBounds = D2D1::RectF(
-            badgeBounds.left - 2.0f, badgeBounds.top - 2.0f,
-            badgeBounds.right + 2.0f, badgeBounds.bottom + 2.0f);
-        brush_->SetColor(D2D1::ColorF(themeColor, 0.22f));
-        renderTarget_->FillRoundedRectangle(
-            D2D1::RoundedRect(badgeGlowBounds,
-                               badgeHeight * 0.5f + 2.0f,
-                               badgeHeight * 0.5f + 2.0f),
-            brush_.Get());
-        brush_->SetColor(D2D1::ColorF(0x10213B, 0.96f));
-        renderTarget_->FillRoundedRectangle(
-            D2D1::RoundedRect(
-                badgeBounds, badgeHeight * 0.5f, badgeHeight * 0.5f),
-            brush_.Get());
-        brush_->SetColor(D2D1::ColorF(
-            LightenCoreColor(themeColor, 0.48f), 0.96f));
-        renderTarget_->DrawRoundedRectangle(
-            D2D1::RoundedRect(
-                badgeBounds, badgeHeight * 0.5f, badgeHeight * 0.5f),
-            brush_.Get(), 1.0f);
-        brush_->SetColor(D2D1::ColorF(0xF7FAFF, 0.99f));
-        renderTarget_->SetTransform(D2D1::Matrix3x2F::Scale(
-            badgeScale, badgeScale, badge));
-        renderTarget_->DrawTextW(
-            count.c_str(), static_cast<UINT32>(count.size()), bodyFormat_.Get(),
-            badgeBounds,
-            brush_.Get(), D2D1_DRAW_TEXT_OPTIONS_CLIP);
-        renderTarget_->SetTransform(D2D1::Matrix3x2F::Identity());
+        if (shortLabel.empty()) {
+            // The badge is a stable capacity indicator, not a hover
+            // decoration.  A short label uses the lower part of the circle
+            // for the same count instead.
+            const std::wstring count = CoreCapacityText(core);
+            const float badgeScale = CoreVisualScale(core);
+            const D2D1_RECT_F badgeBounds =
+                CoreCapacityBadgeRectangle(
+                    core, center, coreRadius);
+            const float badgeHeight =
+                badgeBounds.bottom - badgeBounds.top;
+            const D2D1_POINT_2F badge = D2D1::Point2F(
+                (badgeBounds.left + badgeBounds.right) * 0.5f,
+                (badgeBounds.top + badgeBounds.bottom) * 0.5f);
+            const D2D1_RECT_F badgeGlowBounds = D2D1::RectF(
+                badgeBounds.left - 2.0f, badgeBounds.top - 2.0f,
+                badgeBounds.right + 2.0f, badgeBounds.bottom + 2.0f);
+            brush_->SetColor(D2D1::ColorF(themeColor, 0.22f));
+            renderTarget_->FillRoundedRectangle(
+                D2D1::RoundedRect(badgeGlowBounds,
+                                   badgeHeight * 0.5f + 2.0f,
+                                   badgeHeight * 0.5f + 2.0f),
+                brush_.Get());
+            brush_->SetColor(D2D1::ColorF(0x10213B, 0.96f));
+            renderTarget_->FillRoundedRectangle(
+                D2D1::RoundedRect(
+                    badgeBounds, badgeHeight * 0.5f, badgeHeight * 0.5f),
+                brush_.Get());
+            brush_->SetColor(D2D1::ColorF(
+                LightenCoreColor(themeColor, 0.48f), 0.96f));
+            renderTarget_->DrawRoundedRectangle(
+                D2D1::RoundedRect(
+                    badgeBounds, badgeHeight * 0.5f, badgeHeight * 0.5f),
+                brush_.Get(), 1.0f);
+            brush_->SetColor(D2D1::ColorF(0xF7FAFF, 0.99f));
+            renderTarget_->SetTransform(D2D1::Matrix3x2F::Scale(
+                badgeScale, badgeScale, badge));
+            renderTarget_->DrawTextW(
+                count.c_str(), static_cast<UINT32>(count.size()), bodyFormat_.Get(),
+                badgeBounds,
+                brush_.Get(), D2D1_DRAW_TEXT_OPTIONS_CLIP);
+            renderTarget_->SetTransform(D2D1::Matrix3x2F::Identity());
+        }
 
         const bool hasMissing = std::any_of(core.files.begin(), core.files.end(),
                                             [](const FileItem& item) { return item.missing; });
@@ -13841,6 +14212,7 @@ private:
             coreAppearancePanelAnchorDip_ = D2D1::Point2F(
                 dip.x - coreAppearancePanelDragOffsetDip_.x + 18.0f,
                 dip.y - coreAppearancePanelDragOffsetDip_.y - 12.0f);
+            PositionCoreShortLabelEditWindow();
             Invalidate();
             return;
         }
@@ -16457,6 +16829,7 @@ private:
     }
 
     void BeginRename(std::uint64_t coreId) {
+        CancelCoreShortLabelEdit();
         EndRename(true);
         Core* core = FindCore(coreId);
         if (core == nullptr || coreId == kUnclassifiedCoreId) {
@@ -16714,6 +17087,172 @@ private:
         Invalidate();
     }
 
+    bool CoreShortLabelEditOpen() const {
+        return coreShortLabelEditWindow_ != nullptr &&
+               FindCore(coreShortLabelEditingCoreId_) != nullptr;
+    }
+
+    std::wstring CoreShortLabelEditText() const {
+        if (coreShortLabelEditWindow_ == nullptr) {
+            return L"";
+        }
+        const int length = GetWindowTextLengthW(coreShortLabelEditWindow_);
+        std::wstring value(static_cast<std::size_t>(length) + 1, L'\0');
+        GetWindowTextW(coreShortLabelEditWindow_, value.data(), length + 1);
+        value.resize(static_cast<std::size_t>(length));
+        return value;
+    }
+
+    void PositionCoreShortLabelEditWindow() {
+        if (coreShortLabelEditWindow_ == nullptr ||
+            !CoreAppearancePanelOpen()) {
+            return;
+        }
+        const D2D1_RECT_F input = CoreAppearanceShortLabelInputRectangle(
+            ClientDipSize());
+        const float scale = dpi_ / 96.0f;
+        SetWindowPos(
+            coreShortLabelEditWindow_, HWND_TOP,
+            static_cast<int>(std::round(input.left * scale)),
+            static_cast<int>(std::round(input.top * scale)),
+            std::max(1, static_cast<int>(std::round(
+                (input.right - input.left) * scale))),
+            std::max(1, static_cast<int>(std::round(
+                (input.bottom - input.top) * scale))),
+            SWP_NOACTIVATE);
+    }
+
+    void BeginCoreShortLabelEdit(std::uint64_t coreId) {
+        if (CoreShortLabelEditOpen()) {
+            SetFocus(coreShortLabelEditWindow_);
+            return;
+        }
+        EndRename(true);
+        Core* core = FindCore(coreId);
+        if (core == nullptr || !CoreAppearancePanelOpen() ||
+            coreAppearancePanelCoreId_ != coreId) {
+            return;
+        }
+        HWND editParent = interactionWindow_ != nullptr
+            ? interactionWindow_ : window_;
+        coreShortLabelEditWindow_ = CreateWindowExW(
+            WS_EX_CLIENTEDGE, L"EDIT", core->shortLabel.c_str(),
+            WS_CHILD | WS_VISIBLE | ES_AUTOHSCROLL | ES_CENTER,
+            0, 0, 120, 26, editParent, nullptr,
+            GetModuleHandleW(nullptr), nullptr);
+        if (coreShortLabelEditWindow_ == nullptr) {
+            return;
+        }
+        coreShortLabelEditingCoreId_ = coreId;
+        coreShortLabelEditSnapshot_ = state_;
+        coreShortLabelPreview_ = core->shortLabel;
+        coreShortLabelEditError_.clear();
+        SendMessageW(coreShortLabelEditWindow_, WM_SETFONT,
+            reinterpret_cast<WPARAM>(GetStockObject(DEFAULT_GUI_FONT)), TRUE);
+        SendMessageW(coreShortLabelEditWindow_, EM_SETLIMITTEXT, 8, 0);
+        SetWindowLongPtrW(coreShortLabelEditWindow_, GWLP_USERDATA,
+            reinterpret_cast<LONG_PTR>(this));
+        oldCoreShortLabelEditProc_ = reinterpret_cast<WNDPROC>(
+            SetWindowLongPtrW(
+                coreShortLabelEditWindow_, GWLP_WNDPROC,
+                reinterpret_cast<LONG_PTR>(
+                    &GravityApp::CoreShortLabelEditWindowProc)));
+        PositionCoreShortLabelEditWindow();
+        interactionShapes_.clear();
+        Invalidate();
+        SetFocus(coreShortLabelEditWindow_);
+        SendMessageW(coreShortLabelEditWindow_, EM_SETSEL, 0, -1);
+    }
+
+    void PreviewCoreShortLabelEdit() {
+        if (!CoreShortLabelEditOpen()) {
+            return;
+        }
+        coreShortLabelPreview_ = CoreShortLabelEditText();
+        const CoreShortLabelValidation validation =
+            ValidateCoreShortLabel(coreShortLabelPreview_);
+        coreShortLabelEditError_ = validation == CoreShortLabelValidation::Valid
+            ? L"" : CoreShortLabelValidationMessage(validation);
+        // The preview deliberately never writes Core::shortLabel or any
+        // layout data. It is consumed only by the core's display layer.
+        Invalidate();
+    }
+
+    void DestroyCoreShortLabelEditWindow() {
+        if (coreShortLabelEditWindow_ == nullptr) {
+            return;
+        }
+        HWND edit = coreShortLabelEditWindow_;
+        coreShortLabelEditWindow_ = nullptr;
+        if (oldCoreShortLabelEditProc_ != nullptr) {
+            SetWindowLongPtrW(edit, GWLP_WNDPROC,
+                reinterpret_cast<LONG_PTR>(oldCoreShortLabelEditProc_));
+        }
+        oldCoreShortLabelEditProc_ = nullptr;
+        DestroyWindow(edit);
+        interactionShapes_.clear();
+    }
+
+    void CancelCoreShortLabelEdit() {
+        if (coreShortLabelEditWindow_ == nullptr) {
+            return;
+        }
+        DestroyCoreShortLabelEditWindow();
+        coreShortLabelEditingCoreId_ = 0;
+        coreShortLabelPreview_.clear();
+        coreShortLabelEditError_.clear();
+        Invalidate();
+    }
+
+    bool CommitCoreShortLabelEdit() {
+        if (!CoreShortLabelEditOpen()) {
+            return false;
+        }
+        const std::wstring value = CoreShortLabelEditText();
+        const CoreShortLabelValidation validation =
+            ValidateCoreShortLabel(value);
+        if (validation != CoreShortLabelValidation::Valid) {
+            coreShortLabelEditError_ =
+                CoreShortLabelValidationMessage(validation);
+            SetStatus(coreShortLabelEditError_);
+            Invalidate();
+            return false;
+        }
+        Core* core = FindCore(coreShortLabelEditingCoreId_);
+        if (core == nullptr) {
+            CancelCoreShortLabelEdit();
+            return false;
+        }
+        if (core->shortLabel == value) {
+            CancelCoreShortLabelEdit();
+            return true;
+        }
+
+        const WorkspaceState before = coreShortLabelEditSnapshot_;
+        const bool dirtyBefore = dirty_;
+        core->shortLabel = value;
+        dirty_ = true;
+        // Confirmation is the single commit point: save once, then create one
+        // undo entry.  No rendering coordinate or layout cache is touched.
+        if (!SaveState()) {
+            state_ = before;
+            dirty_ = dirtyBefore;
+            coreShortLabelEditError_ = L"保存失败；短标识未修改";
+            SetStatus(coreShortLabelEditError_);
+            Invalidate();
+            return false;
+        }
+        PushUndo(std::move(coreShortLabelEditSnapshot_));
+        const bool cleared = value.empty();
+        DestroyCoreShortLabelEditWindow();
+        coreShortLabelEditingCoreId_ = 0;
+        coreShortLabelPreview_.clear();
+        coreShortLabelEditError_.clear();
+        SetStatus(cleared ? L"核心短标识已清空" : L"核心短标识已保存");
+        Invalidate();
+        return true;
+    }
+
     std::filesystem::path SessionEndRecoveryPath() const {
         if (stateFile_.empty()) {
             return {};
@@ -16896,6 +17435,7 @@ private:
         ApplyCoreRatiosToWorkspace();
         RefreshResponsiveMetrics(true);
         PositionEditWindow();
+        PositionCoreShortLabelEditWindow();
         Invalidate();
     }
 
@@ -16911,6 +17451,7 @@ private:
         ApplyCoreRatiosToWorkspace();
         RefreshResponsiveMetrics(true);
         PositionEditWindow();
+        PositionCoreShortLabelEditWindow();
         Invalidate();
     }
 
@@ -17071,6 +17612,12 @@ private:
     HWND editWindow_ = nullptr;
     WNDPROC oldEditProc_ = nullptr;
     std::uint64_t editingCoreId_ = 0;
+    HWND coreShortLabelEditWindow_ = nullptr;
+    WNDPROC oldCoreShortLabelEditProc_ = nullptr;
+    std::uint64_t coreShortLabelEditingCoreId_ = 0;
+    std::wstring coreShortLabelPreview_;
+    std::wstring coreShortLabelEditError_;
+    WorkspaceState coreShortLabelEditSnapshot_;
     std::wstring status_;
     std::int64_t lastHistoryBackupTime_ = 0;
     HDC layeredDeviceContext_ = nullptr;
@@ -19015,6 +19562,7 @@ bool RunSelfTest() {
     Core core;
     core.id = kUnclassifiedCoreId;
     core.name = L"未分类";
+    core.shortLabel = L"归档";
     core.position = D2D1::Point2F(360.0f, 300.0f);
     core.displayLimit = kNormalVisibleLimit;
     core.layoutVersion = kLayoutVersion;
@@ -19094,7 +19642,29 @@ bool RunSelfTest() {
         return false;
     }
     if (restored.cores.size() != 1 || restored.cores.front().files.size() != 1 ||
-        restored.families.size() != 1 || restored.families.front().rootFileId != item.id) {
+        restored.families.size() != 1 || restored.families.front().rootFileId != item.id ||
+        restored.cores.front().shortLabel != core.shortLabel) {
+        return false;
+    }
+
+    if (ValidateCoreShortLabel(L"") != CoreShortLabelValidation::Valid ||
+        ValidateCoreShortLabel(L"工作") != CoreShortLabelValidation::Valid ||
+        ValidateCoreShortLabel(L"三个字") != CoreShortLabelValidation::TooLong ||
+        ValidateCoreShortLabel(L"A ") !=
+            CoreShortLabelValidation::WhitespaceOrControl ||
+        ValidateCoreShortLabel(std::wstring(
+            1, static_cast<wchar_t>(0xD83D))) !=
+            CoreShortLabelValidation::InvalidUnicode) {
+        return false;
+    }
+    WorkspaceState malformedShortLabelState = source;
+    malformedShortLabelState.cores.front().shortLabel = L"invalid";
+    WorkspaceState restoredMalformedShortLabelState;
+    if (!DeserializeState(
+            SerializeState(malformedShortLabelState),
+            restoredMalformedShortLabelState) ||
+        restoredMalformedShortLabelState.cores.empty() ||
+        !restoredMalformedShortLabelState.cores.front().shortLabel.empty()) {
         return false;
     }
     const FileItem& restoredItem = restored.cores.front().files.front();
@@ -19232,6 +19802,7 @@ bool RunSelfTest() {
     WorkspaceState legacyState;
     if (!DeserializeState(legacy, legacyState) || legacyState.cores.empty() ||
         legacyState.cores.front().layoutVersion != 1 ||
+        !legacyState.cores.front().shortLabel.empty() ||
         std::abs(
             legacyState.connectionLineWidth -
             kConnectionLineWidthStandard) > 0.001f ||
