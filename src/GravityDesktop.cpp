@@ -3584,6 +3584,18 @@ private:
     bool ScreenPointInsideInteractionIsland(
         POINT screenPoint) const {
         const HWND windowAtPoint = WindowFromPoint(screenPoint);
+        // The short-label editor is a temporary activating popup so Windows
+        // can deliver keyboard and IME input. It is intentionally separate
+        // from the non-activating interaction-island window. Treat it as an
+        // app-owned interaction target explicitly; otherwise the global
+        // "click outside" poll closes the appearance panel on the same mouse
+        // press that is meant to focus the editor.
+        if (coreShortLabelEditWindow_ != nullptr &&
+            IsWindowVisible(coreShortLabelEditWindow_) != FALSE &&
+            (windowAtPoint == coreShortLabelEditWindow_ ||
+             IsChild(coreShortLabelEditWindow_, windowAtPoint) != FALSE)) {
+            return true;
+        }
         const bool interactionReceivesPoint =
             windowAtPoint == interactionWindow_ ||
             (interactionWindow_ != nullptr &&
