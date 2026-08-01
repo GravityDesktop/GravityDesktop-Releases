@@ -3356,6 +3356,9 @@ public:
         case WM_DROPFILES:
             OnDropFiles(reinterpret_cast<HDROP>(wParam));
             return 0;
+        case WM_KEYDOWN:
+            OnKeyDown(wParam);
+            return 0;
         case WM_SETCURSOR:
             if (LOWORD(lParam) == HTCLIENT) {
                 SetInteractionCursor(source);
@@ -4495,6 +4498,9 @@ private:
             editWindow_ = nullptr;
             oldEditProc_ = nullptr;
             editingCoreId_ = 0;
+            editingItemId_ = 0;
+            editingRenameTarget_ = RenameTargetKind::Core;
+            editingPreservedExtension_.clear();
             coreShortLabelEditWindow_ = nullptr;
             oldCoreShortLabelEditProc_ = nullptr;
             coreShortLabelEditingCoreId_ = 0;
@@ -7645,7 +7651,6 @@ private:
     }
 
     void ClearSelection() {
-        nameRenameCandidate_ = {};
         SetSelection({});
     }
 
@@ -12196,23 +12201,13 @@ private:
     bool TryBeginRenameFromSlowNameClick(
         const HitResult& hit, D2D1_POINT_2F world) {
         if ((hit.kind != HitKind::Core && hit.kind != HitKind::Item) ||
-            !IsRenameLabelHit(hit, world)) {
-            nameRenameCandidate_ = {};
+            !IsRenameLabelHit(hit, world) || selected_ != hit) {
             return false;
         }
-        const auto now = std::chrono::steady_clock::now();
-        const auto elapsed = std::chrono::duration_cast<
-            std::chrono::milliseconds>(
-            now - nameRenameCandidateAt_).count();
-        const bool repeat = selected_ == hit &&
-            nameRenameCandidate_ == hit &&
-            elapsed >= 500 && elapsed <= 4000;
-        nameRenameCandidate_ = hit;
-        nameRenameCandidateAt_ = now;
-        if (!repeat) {
-            return false;
-        }
-        nameRenameCandidate_ = {};
+        // Match the established Windows desktop convention: once an object is
+        // selected, the next click on its caption begins in-place editing.
+        // Fast double-clicks are delivered separately as WM_LBUTTONDBLCLK and
+        // continue to open files or toggle a core instead of entering edit.
         if (hit.kind == HitKind::Core) {
             BeginRename(hit.coreId);
         } else {
@@ -18317,14 +18312,15 @@ private:
     }
 
     void CreateRenameEditWindow(const std::wstring& initialValue) {
-        HWND editParent =
+        HWND editOwner =
             interactionWindow_ != nullptr
                 ? interactionWindow_
                 : window_;
         editWindow_ = CreateWindowExW(
-            WS_EX_CLIENTEDGE, L"EDIT", initialValue.c_str(),
-            WS_CHILD | WS_VISIBLE | ES_AUTOHSCROLL | ES_CENTER,
-            0, 0, 180, 28, editParent,
+            WS_EX_TOOLWINDOW | WS_EX_CLIENTEDGE,
+            L"EDIT", initialValue.c_str(),
+            WS_POPUP | WS_VISIBLE | ES_AUTOHSCROLL | ES_CENTER,
+            0, 0, 180, 28, editOwner,
             nullptr, GetModuleHandleW(nullptr), nullptr);
         if (editWindow_ == nullptr) {
             editingCoreId_ = 0;
@@ -18342,6 +18338,10 @@ private:
         PositionEditWindow();
         interactionShapes_.clear();
         Invalidate();
+        // The desktop companion deliberately stays non-activating.  Editing
+        // is the exception: this short-lived owned popup receives normal
+        // keyboard and IME input, then disappears on commit or cancellation.
+        SetForegroundWindow(editWindow_);
         SetFocus(editWindow_);
         SendMessageW(editWindow_, EM_SETSEL, 0, -1);
     }
@@ -18377,9 +18377,14 @@ private:
         const int width = static_cast<int>(190.0f * scale);
         const int height = static_cast<int>(29.0f * scale);
         const float center = (label.left + label.right) * 0.5f;
-        const int left = static_cast<int>((center - 95.0f) * scale) +
-            interactionContentOffsetPixels_;
-        const int top = static_cast<int>((label.top - 2.0f) * scale);
+        POINT origin{0, 0};
+        if (window_ != nullptr) {
+            ClientToScreen(window_, &origin);
+        }
+        const int left = origin.x +
+            static_cast<int>((center - 95.0f) * scale);
+        const int top = origin.y +
+            static_cast<int>((label.top - 2.0f) * scale);
         SetWindowPos(editWindow_, HWND_TOP, left, top, width, height, SWP_NOACTIVATE);
     }
 
@@ -20054,9 +20059,6 @@ private:
     std::uint64_t editingItemId_ = 0;
     RenameTargetKind editingRenameTarget_ = RenameTargetKind::Core;
     std::wstring editingPreservedExtension_;
-    HitResult nameRenameCandidate_{};
-    std::chrono::steady_clock::time_point nameRenameCandidateAt_ =
-        std::chrono::steady_clock::now();
     HWND coreShortLabelEditWindow_ = nullptr;
     WNDPROC oldCoreShortLabelEditProc_ = nullptr;
     std::uint64_t coreShortLabelEditingCoreId_ = 0;
