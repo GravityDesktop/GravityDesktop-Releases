@@ -9718,11 +9718,11 @@ private:
     D2D1_RECT_F DividerHandleRectangle(
         const D2D1_SIZE_F& client) const {
         (void)client;
-        constexpr float width = 88.0f;
-        constexpr float height = 40.0f;
+        constexpr float width = 38.0f;
+        constexpr float height = 32.0f;
         return D2D1::RectF(
-            2.0f, 2.0f,
-            2.0f + width, 2.0f + height);
+            0.0f, 2.0f,
+            width, 2.0f + height);
     }
 
     bool IsDividerHit(D2D1_POINT_2F point) const {
@@ -9747,46 +9747,24 @@ private:
         }
 
         const D2D1_RECT_F handle = DividerHandleRectangle(client);
-        const float bodyBottom = handle.bottom - 12.0f;
-        const D2D1_RECT_F body = D2D1::RectF(
-            handle.left, handle.top, handle.right, bodyBottom + 3.0f);
         brush_->SetColor(D2D1::ColorF(0x53616B,
-                                      active ? 0.72f : 0.28f));
-        renderTarget_->FillRoundedRectangle(
-            D2D1::RoundedRect(body, 5.0f, 5.0f),
-            brush_.Get());
-        if (active) {
-            brush_->SetColor(D2D1::ColorF(0xE8EEF1, 0.78f));
-            renderTarget_->DrawRoundedRectangle(
-                D2D1::RoundedRect(body, 5.0f, 5.0f),
-                brush_.Get(), 1.0f);
-        }
-        brush_->SetColor(D2D1::ColorF(0x53616B,
-                                      active ? 0.72f : 0.28f));
-        constexpr int triangleRows = 7;
+                                      active ? 0.74f : 0.34f));
+        constexpr int triangleRows = 9;
         constexpr float triangleTipX = 0.75f;
-        constexpr float triangleBaseRight = 30.0f;
+        constexpr float triangleBaseRight = 36.0f;
         for (int row = 0; row < triangleRows; ++row) {
             const float progress = static_cast<float>(row) /
                 static_cast<float>(triangleRows - 1);
-            const float y = bodyBottom +
-                (handle.bottom - bodyBottom) * progress;
-            const float left = handle.left +
-                (triangleTipX - handle.left) * progress;
+            const float y = handle.top +
+                (handle.bottom - handle.top) * progress;
+            const float left = triangleTipX;
             const float right = triangleBaseRight +
                 (triangleTipX - triangleBaseRight) * progress;
             renderTarget_->DrawLine(
                 D2D1::Point2F(left, y),
                 D2D1::Point2F(right, y),
-                brush_.Get(), active ? 1.6f : 0.85f);
+                brush_.Get(), active ? 1.8f : 0.95f);
         }
-        brush_->SetColor(D2D1::ColorF(0xF0F4F6,
-                                      active ? 0.92f : 0.58f));
-        constexpr wchar_t label[] = L"调整范围";
-        renderTarget_->DrawTextW(
-            label, static_cast<UINT32>(wcslen(label)),
-            bodyFormat_.Get(), body, brush_.Get(),
-            D2D1_DRAW_TEXT_OPTIONS_CLIP);
 
         if (active) {
             const int percent = static_cast<int>(std::round(
@@ -9794,14 +9772,14 @@ private:
                 100.0f));
             const std::wstring hint = draggingDivider_
                 ? L"核心桌面：" + std::to_wstring(percent) + L"%"
-                : L"拖动调整核心桌面范围";
-            const float hintWidth = draggingDivider_ ? 124.0f : 178.0f;
+                : L"调整范围";
+            const float hintWidth = draggingDivider_ ? 124.0f : 78.0f;
             const D2D1_RECT_F hintRect = D2D1::RectF(
                 handle.right + 8.0f,
-                handle.top - 2.0f,
+                handle.top + 2.0f,
                 std::min(client.width - 4.0f,
                          handle.right + 8.0f + hintWidth),
-                handle.bottom + 2.0f);
+                handle.top + 26.0f);
             brush_->SetColor(D2D1::ColorF(0x172846, 0.74f));
             renderTarget_->FillRoundedRectangle(
                 D2D1::RoundedRect(hintRect, 6.0f, 6.0f), brush_.Get());
