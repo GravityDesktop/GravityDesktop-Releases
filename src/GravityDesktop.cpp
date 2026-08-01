@@ -18101,11 +18101,11 @@ private:
         const int top = std::max(1, DipToPixels(5.0f));
         const int lineHeight = std::max(2, DipToPixels(3.0f));
         const int gap = std::max(2, DipToPixels(3.0f));
-        // The final bar becomes the base of a solid, obtuse tip.  This keeps
-        // the marker centered on the divider while making its endpoint read
-        // as an actual inverted triangle instead of a tiny horizontal line.
-        const std::array<float, 6> widths{
-            98.0f, 82.0f, 66.0f, 50.0f, 34.0f, 18.0f};
+        // Keep only the upper guide strokes separate.  The endpoint itself is
+        // one filled triangle, with its straight top edge serving as the final
+        // horizontal stroke.  No rounded bar is overlaid on that triangle.
+        const std::array<float, 5> widths{
+            98.0f, 82.0f, 66.0f, 50.0f, 34.0f};
         const COLORREF lineColor = RGB(73, 82, 88);
         HBRUSH lineBrush = CreateSolidBrush(lineColor);
         HPEN noOutline = CreatePen(PS_NULL, 1, lineColor);
@@ -18120,9 +18120,9 @@ private:
                       y + lineHeight,
                       lineHeight, lineHeight);
         }
-        const int tipBaseY = top + static_cast<int>(widths.size() - 1) *
-            (lineHeight + gap) + lineHeight - 1;
-        const int tipHalfWidth = std::max(2, DipToPixels(9.0f));
+        const int tipBaseY = top + static_cast<int>(widths.size()) *
+            (lineHeight + gap);
+        const int tipHalfWidth = std::max(2, DipToPixels(12.0f));
         const int tipY = std::min(
             static_cast<int>(client.bottom) - 1,
             tipBaseY + std::max(1, DipToPixels(8.0f)));
@@ -18131,14 +18131,8 @@ private:
             {centerX + tipHalfWidth, tipBaseY},
             {centerX, tipY},
         };
-        const int tipLineWidth = std::max(2, DipToPixels(widths.back()));
-        const int tipLineY = tipBaseY - lineHeight + 1;
         HBRUSH tipBrush = CreateSolidBrush(RGB(20, 20, 20));
         HGDIOBJ oldTipBrush = SelectObject(dc, tipBrush);
-        RoundRect(dc, centerX - tipLineWidth / 2, tipLineY,
-                  centerX - tipLineWidth / 2 + tipLineWidth,
-                  tipLineY + lineHeight,
-                  lineHeight, lineHeight);
         Polygon(dc, tip, static_cast<int>(std::size(tip)));
         SelectObject(dc, oldTipBrush);
         DeleteObject(tipBrush);
