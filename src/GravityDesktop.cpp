@@ -3147,24 +3147,57 @@ public:
             return HTCLIENT;
         case WM_MOUSEACTIVATE:
             return MA_NOACTIVATE;
-        case WM_LBUTTONDOWN:
-            OnLeftButtonDown(GET_X_LPARAM(lParam), GET_Y_LPARAM(lParam));
+        case WM_LBUTTONDOWN: {
+            const int x = GET_X_LPARAM(lParam);
+            const int y = GET_Y_LPARAM(lParam);
+            if (IsDividerInteractionPoint(source, x, y)) {
+                BeginDividerDrag(InteractionClientXToVisual(source, x), y);
+                return 0;
+            }
+            OnLeftButtonDown(InteractionClientXToVisual(source, x), y);
             return 0;
+        }
         case WM_LBUTTONUP:
-            OnLeftButtonUp(GET_X_LPARAM(lParam), GET_Y_LPARAM(lParam));
+            OnLeftButtonUp(
+                InteractionClientXToVisual(source, GET_X_LPARAM(lParam)),
+                GET_Y_LPARAM(lParam));
             return 0;
-        case WM_LBUTTONDBLCLK:
-            OnDoubleClick(GET_X_LPARAM(lParam), GET_Y_LPARAM(lParam));
+        case WM_LBUTTONDBLCLK: {
+            const int x = GET_X_LPARAM(lParam);
+            const int y = GET_Y_LPARAM(lParam);
+            if (IsDividerInteractionPoint(source, x, y)) {
+                ResetDividerToDefault();
+                return 0;
+            }
+            OnDoubleClick(InteractionClientXToVisual(source, x), y);
             return 0;
+        }
         case WM_MBUTTONDOWN:
-            BeginPan(GET_X_LPARAM(lParam), GET_Y_LPARAM(lParam));
+            BeginPan(
+                InteractionClientXToVisual(source, GET_X_LPARAM(lParam)),
+                GET_Y_LPARAM(lParam));
             return 0;
         case WM_MBUTTONUP:
             EndPointerOperation();
             return 0;
-        case WM_MOUSEMOVE:
-            OnMouseMove(GET_X_LPARAM(lParam), GET_Y_LPARAM(lParam));
+        case WM_MOUSEMOVE: {
+            const int x = GET_X_LPARAM(lParam);
+            const int y = GET_Y_LPARAM(lParam);
+            const bool dividerHover =
+                IsDividerInteractionPoint(source, x, y);
+            if (!draggingDivider_ && dividerHovered_ != dividerHover) {
+                dividerHovered_ = dividerHover;
+                if (!dividerHovered_) HideDividerTooltip();
+                UpdateDividerHandleVisual();
+                Invalidate();
+            }
+            if (dividerHover) {
+                SetCursor(LoadCursorW(nullptr, IDC_SIZEWE));
+                return 0;
+            }
+            OnMouseMove(InteractionClientXToVisual(source, x), y);
             return 0;
+        }
         case WM_MOUSELEAVE:
             OnPointerLeave();
             return 0;
@@ -3181,7 +3214,9 @@ public:
                          GET_WHEEL_DELTA_WPARAM(wParam));
             return 0;
         case WM_RBUTTONUP:
-            OnContextMenu(GET_X_LPARAM(lParam), GET_Y_LPARAM(lParam));
+            OnContextMenu(
+                InteractionClientXToVisual(source, GET_X_LPARAM(lParam)),
+                GET_Y_LPARAM(lParam));
             return 0;
         case WM_DROPFILES:
             OnDropFiles(reinterpret_cast<HDROP>(wParam));
@@ -3194,6 +3229,7 @@ public:
             break;
         case WM_NCDESTROY:
             if (interactionWindow_ == source) {
+                DestroyDividerTooltip();
                 interactionWindow_ = nullptr;
             }
             SetWindowLongPtrW(source, GWLP_USERDATA, 0);
@@ -3962,6 +3998,7 @@ private:
     }
 
     void DestroyInteractionWindow() {
+        DestroyDividerTooltip();
         if (interactionWindow_ == nullptr) {
             return;
         }
@@ -3974,6 +4011,7 @@ private:
         DiscardInteractionSurface();
         DestroyWindow(interaction);
         interactionShapes_.clear();
+        interactionDividerRegionIncluded_ = false;
     }
 
     void AttachInteractionWindowToCompanionLayer() {
@@ -4078,17 +4116,54 @@ private:
         if (GetWindowRect(window_, &bounds) == FALSE) {
             return;
         }
-        POINT origin{bounds.left, bounds.top};
+        const int overhang = DividerInteractionOverhangPixels();
+        interactionContentOffsetPixels_ = overhang;
+        RECT interactionBounds = bounds;
+        interactionBounds.left -= overhang;
+        POINT origin{interactionBounds.left, interactionBounds.top};
         SetWindowPos(
             interactionWindow_,
             DesktopCompanionInsertAfter(),
             origin.x, origin.y,
-            std::max(1L, bounds.right - bounds.left),
-            std::max(1L, bounds.bottom - bounds.top),
+            std::max(1L, interactionBounds.right - interactionBounds.left),
+            std::max(1L, interactionBounds.bottom - interactionBounds.top),
             SWP_NOACTIVATE | SWP_NOOWNERZORDER |
                 SWP_NOREDRAW);
-        PresentInteractionSurface(bounds);
+        PresentInteractionSurface(interactionBounds);
         interactionShapes_.clear();
+        interactionDividerRegionIncluded_ = false;
+        UpdateDividerTooltipRectangle();
+    }
+
+    int DividerInteractionOverhangPixels() const {
+        return DividerEnabled()
+            ? std::max(1, DividerHandleWidthPixels() / 2)
+            : 0;
+    }
+
+    int InteractionClientXToVisual(HWND source, int x) const {
+        return source == interactionWindow_
+            ? x - interactionContentOffsetPixels_
+            : x;
+    }
+
+    bool IsDividerInteractionPoint(HWND source, int x, int y) const {
+        if (source != interactionWindow_ || !DividerEnabled()) {
+            return false;
+        }
+        const int overhang = interactionContentOffsetPixels_;
+        const int width = DividerHandleWidthPixels();
+        const int tipY = std::min(
+            DividerHandleHeightPixels() - 1,
+            std::max(1, DipToPixels(46.0f)));
+        if (y < 0 || y > tipY) {
+            return false;
+        }
+        const float remaining = 1.0f -
+            static_cast<float>(y) / static_cast<float>(tipY);
+        const float halfWidth =
+            static_cast<float>(width) * 0.5f * remaining;
+        return std::abs(static_cast<float>(x - overhang)) <= halfWidth;
     }
 
     void ApplyCompanionWorkspaceFrame() {
@@ -4194,17 +4269,18 @@ private:
             currentDesktopHost != desktopHost_) {
             return false;
         }
+        const bool dividerAttached =
+            GetWindow(dividerHandleWindow_, GW_OWNER) ==
+            interactionWindow_;
         if (desktopChildHosted_) {
             return GetParent(window_) == desktopHost_ &&
                    (GetWindowLongPtrW(
                         interactionWindow_,
                         GWL_STYLE) & WS_CHILD) == 0 &&
-                   GetWindow(
-                       interactionWindow_,
-                       GW_OWNER) == desktopHost_ &&
-                   GetWindow(
-                       dividerHandleWindow_,
-                       GW_OWNER) == desktopHost_;
+                    GetWindow(
+                        interactionWindow_,
+                        GW_OWNER) == desktopHost_ &&
+                   dividerAttached;
         }
         return (GetWindowLongPtrW(
                     window_, GWL_STYLE) & WS_CHILD) == 0 &&
@@ -4214,8 +4290,7 @@ private:
                GetWindow(window_, GW_OWNER) == desktopHost_ &&
                GetWindow(interactionWindow_, GW_OWNER) ==
                    desktopHost_ &&
-               GetWindow(dividerHandleWindow_, GW_OWNER) ==
-                   desktopHost_;
+               dividerAttached;
     }
 
     RECT PrimaryWorkAreaPixels() const {
@@ -4281,6 +4356,7 @@ private:
             interactionDropTargetRegistered_ = false;
             DiscardInteractionSurface();
             interactionShapes_.clear();
+            interactionDividerRegionIncluded_ = false;
             editWindow_ = nullptr;
             oldEditProc_ = nullptr;
             editingCoreId_ = 0;
@@ -4381,6 +4457,7 @@ private:
         }
 
         interactionShapes_.clear();
+        interactionDividerRegionIncluded_ = false;
         RECT client{};
         GetClientRect(window_, &client);
         const int clientWidth =
@@ -7774,6 +7851,8 @@ private:
                 (rectangle.right + padding) * scale)),
             static_cast<LONG>(std::ceil(
                 (rectangle.bottom + padding) * scale))};
+        pixels.left += interactionContentOffsetPixels_;
+        pixels.right += interactionContentOffsetPixels_;
         pixels.left =
             std::clamp(pixels.left, client.left, client.right);
         pixels.right =
@@ -7943,7 +8022,10 @@ private:
         addEditInteractionShape(editWindow_);
         addEditInteractionShape(coreShortLabelEditWindow_);
 
-        if (shapes == interactionShapes_) {
+        const bool includeDividerRegion =
+            DividerEnabled() && interactionContentOffsetPixels_ > 0;
+        if (shapes == interactionShapes_ &&
+            includeDividerRegion == interactionDividerRegionIncluded_) {
             return;
         }
         HRGN combined = CreateRectRgn(0, 0, 0, 0);
@@ -7972,6 +8054,25 @@ private:
                 break;
             }
         }
+        if (valid && includeDividerRegion) {
+            const int handleWidth = DividerHandleWidthPixels();
+            const int tipY = std::min(
+                DividerHandleHeightPixels() - 1,
+                std::max(1, DipToPixels(46.0f)));
+            const POINT points[3]{
+                POINT{0, 0},
+                POINT{handleWidth, 0},
+                POINT{interactionContentOffsetPixels_, tipY}};
+            HRGN dividerRegion = CreatePolygonRgn(points, 3, WINDING);
+            if (dividerRegion == nullptr ||
+                CombineRgn(
+                    combined, combined, dividerRegion, RGN_OR) == ERROR) {
+                valid = false;
+            }
+            if (dividerRegion != nullptr) {
+                DeleteObject(dividerRegion);
+            }
+        }
         if (!valid ||
             SetWindowRgn(
                 interactionWindow_, combined, FALSE) == 0) {
@@ -7980,6 +8081,7 @@ private:
         }
         // SetWindowRgn owns combined after success.
         interactionShapes_ = std::move(shapes);
+        interactionDividerRegionIncluded_ = includeDividerRegion;
     }
 
     void Paint() {
@@ -9845,7 +9947,8 @@ private:
     }
 
     void AttachDividerHandleWindowToCompanionLayer() {
-        if (dividerHandleWindow_ == nullptr || desktopHost_ == nullptr) {
+        if (dividerHandleWindow_ == nullptr ||
+            interactionWindow_ == nullptr) {
             return;
         }
         const LONG_PTR style =
@@ -9859,10 +9962,13 @@ private:
             SetParent(dividerHandleWindow_, nullptr);
             frameChanged = true;
         }
-        if (GetWindow(dividerHandleWindow_, GW_OWNER) != desktopHost_) {
+        // The interaction-island popup is already proven to remain above the
+        // Windows desktop icons while staying below ordinary applications.
+        // Owning the tiny handle by that island preserves the same z-order.
+        if (GetWindow(dividerHandleWindow_, GW_OWNER) != interactionWindow_) {
             SetWindowLongPtrW(
                 dividerHandleWindow_, GWLP_HWNDPARENT,
-                reinterpret_cast<LONG_PTR>(desktopHost_));
+                reinterpret_cast<LONG_PTR>(interactionWindow_));
             frameChanged = true;
         }
         if (frameChanged) {
@@ -14587,6 +14693,13 @@ private:
         POINT cursor{};
         GetCursorPos(&cursor);
         ScreenToClient(source, &cursor);
+        if (source == interactionWindow_) {
+            if (IsDividerInteractionPoint(source, cursor.x, cursor.y)) {
+                SetCursor(LoadCursorW(nullptr, IDC_SIZEWE));
+                return;
+            }
+            cursor.x = InteractionClientXToVisual(source, cursor.x);
+        }
         const D2D1_POINT_2F dip =
             PixelToDip(cursor.x, cursor.y);
         const bool onDistancePanel =
@@ -17857,11 +17970,41 @@ private:
     }
 
     int DividerHandleWidthPixels() const {
-        return std::max(1, DipToPixels(38.0f));
+        return std::max(1, DipToPixels(100.0f));
     }
 
     int DividerHandleHeightPixels() const {
-        return std::max(1, DipToPixels(44.0f));
+        return std::max(1, DipToPixels(60.0f));
+    }
+
+    void UpdateDividerHandleHitRegion() {
+        if (dividerHandleWindow_ == nullptr ||
+            IsWindow(dividerHandleWindow_) == FALSE) {
+            return;
+        }
+        const int width = DividerHandleWidthPixels();
+        const int height = DividerHandleHeightPixels();
+        const int centerX = width / 2;
+        const int top = std::max(1, DipToPixels(5.0f));
+        const int tipY = std::min(
+            height - 1, top + std::max(1, DipToPixels(36.0f)));
+        const int topHalfWidth = std::max(1, DipToPixels(49.0f));
+        const int padding = std::max(1, DipToPixels(5.0f));
+        const POINT points[3]{
+            POINT{std::max(0, centerX - topHalfWidth - padding),
+                  std::max(0, top - padding)},
+            POINT{std::min(width, centerX + topHalfWidth + padding),
+                  std::max(0, top - padding)},
+            POINT{centerX, std::min(height, tipY + padding)}};
+        if (HRGN region = CreatePolygonRgn(points, 3, WINDING);
+            region != nullptr) {
+            // SetWindowRgn takes ownership on success. The region makes the
+            // entire inverted-triangle surface draggable while allowing the
+            // rest of the tiny island to remain mouse-through.
+            if (SetWindowRgn(dividerHandleWindow_, region, FALSE) == 0) {
+                DeleteObject(region);
+            }
+        }
     }
 
     void UpdateDividerHandleVisual() {
@@ -17895,12 +18038,15 @@ private:
         }
         const int width = DividerHandleWidthPixels();
         const int height = DividerHandleHeightPixels();
+        POINT origin{workspace.left - width / 2, workspace.top};
         SetWindowPos(
-            dividerHandleWindow_, DesktopCompanionInsertAfter(),
-            workspace.left - width / 2, workspace.top,
+            dividerHandleWindow_,
+            DesktopCompanionInsertAfter(),
+            origin.x, origin.y,
             width, height,
             SWP_NOACTIVATE | SWP_NOOWNERZORDER |
                 SWP_SHOWWINDOW);
+        UpdateDividerHandleHitRegion();
         UpdateDividerHandleVisual();
         UpdateDividerTooltipRectangle();
     }
@@ -17952,11 +18098,11 @@ private:
         DeleteObject(background);
 
         const int centerX = (client.left + client.right) / 2;
-        const int top = std::max(1, DipToPixels(3.0f));
+        const int top = std::max(1, DipToPixels(5.0f));
         const int lineHeight = std::max(2, DipToPixels(3.0f));
-        const int gap = std::max(2, DipToPixels(2.0f));
+        const int gap = std::max(2, DipToPixels(3.0f));
         const std::array<float, 7> widths{
-            24.0f, 22.0f, 19.0f, 16.0f, 12.0f, 8.0f, 3.0f};
+            98.0f, 82.0f, 66.0f, 50.0f, 34.0f, 18.0f, 3.0f};
         const COLORREF lineColor = RGB(73, 82, 88);
         HBRUSH lineBrush = CreateSolidBrush(lineColor);
         HPEN noOutline = CreatePen(PS_NULL, 1, lineColor);
@@ -17980,16 +18126,18 @@ private:
 
     void UpdateDividerTooltipRectangle() {
         if (dividerTooltipWindow_ == nullptr ||
-            dividerHandleWindow_ == nullptr) {
+            interactionWindow_ == nullptr) {
             return;
         }
-        RECT handle{};
-        GetClientRect(dividerHandleWindow_, &handle);
         TOOLINFOW tool{};
         tool.cbSize = TTTOOLINFOW_V1_SIZE;
-        tool.hwnd = dividerHandleWindow_;
+        tool.hwnd = interactionWindow_;
         tool.uId = 1;
-        tool.rect = handle;
+        tool.rect = RECT{
+            0, 0,
+            DividerHandleWidthPixels(),
+            std::min(DividerHandleHeightPixels(),
+                     std::max(1, DipToPixels(46.0f)))};
         SendMessageW(
             dividerTooltipWindow_, TTM_NEWTOOLRECTW,
             0, reinterpret_cast<LPARAM>(&tool));
@@ -17997,7 +18145,7 @@ private:
 
     void CreateDividerTooltip() {
         if (dividerTooltipWindow_ != nullptr ||
-            dividerHandleWindow_ == nullptr) {
+            interactionWindow_ == nullptr) {
             return;
         }
         INITCOMMONCONTROLSEX controls{
@@ -18009,7 +18157,7 @@ private:
             WS_POPUP | TTS_NOPREFIX | TTS_ALWAYSTIP,
             CW_USEDEFAULT, CW_USEDEFAULT,
             CW_USEDEFAULT, CW_USEDEFAULT,
-            dividerHandleWindow_, nullptr,
+            interactionWindow_, nullptr,
             GetModuleHandleW(nullptr), nullptr);
         if (dividerTooltipWindow_ == nullptr) {
             return;
@@ -18017,11 +18165,15 @@ private:
         TOOLINFOW tool{};
         tool.cbSize = TTTOOLINFOW_V1_SIZE;
         tool.uFlags = TTF_SUBCLASS;
-        tool.hwnd = dividerHandleWindow_;
+        tool.hwnd = interactionWindow_;
         tool.uId = 1;
         tool.lpszText = const_cast<LPWSTR>(
             L"拖动调整核心桌面范围");
-        GetClientRect(dividerHandleWindow_, &tool.rect);
+        tool.rect = RECT{
+            0, 0,
+            DividerHandleWidthPixels(),
+            std::min(DividerHandleHeightPixels(),
+                     std::max(1, DipToPixels(46.0f)))};
         SendMessageW(
             dividerTooltipWindow_, TTM_ADDTOOLW,
             0, reinterpret_cast<LPARAM>(&tool));
@@ -18290,6 +18442,8 @@ private:
     HGDIOBJ interactionPreviousBitmap_ = nullptr;
     void* interactionBits_ = nullptr;
     SIZE interactionPixelSize_{0, 0};
+    int interactionContentOffsetPixels_ = 0;
+    bool interactionDividerRegionIncluded_ = false;
     bool selectionDismissTimerActive_ = false;
     bool selectionDismissButtonsDown_ = false;
     bool popupMenuOpen_ = false;
