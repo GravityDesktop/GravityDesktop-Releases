@@ -9718,11 +9718,11 @@ private:
     D2D1_RECT_F DividerHandleRectangle(
         const D2D1_SIZE_F& client) const {
         (void)client;
-        constexpr float width = 38.0f;
-        constexpr float height = 32.0f;
+        constexpr float width = 88.0f;
+        constexpr float height = 42.0f;
         return D2D1::RectF(
-            0.0f, 2.0f,
-            width, 2.0f + height);
+            2.0f, 2.0f,
+            2.0f + width, 2.0f + height);
     }
 
     bool IsDividerHit(D2D1_POINT_2F point) const {
@@ -9747,33 +9747,60 @@ private:
         }
 
         const D2D1_RECT_F handle = DividerHandleRectangle(client);
-        brush_->SetColor(D2D1::ColorF(0x53616B,
-                                      active ? 0.74f : 0.34f));
+        const float bodyBottom = handle.top + 25.0f;
+        const D2D1_RECT_F body = D2D1::RectF(
+            handle.left, handle.top, handle.right, bodyBottom);
+        const float triangleCenterX = handle.left + 22.0f;
+        constexpr float triangleHalfWidth = 12.0f;
+        brush_->SetColor(D2D1::ColorF(0xF3F5F6,
+                                      active ? 0.82f : 0.40f));
+        renderTarget_->FillRoundedRectangle(
+            D2D1::RoundedRect(body, 4.0f, 4.0f), brush_.Get());
+        brush_->SetColor(D2D1::ColorF(0x92999F,
+                                      active ? 0.66f : 0.30f));
+        renderTarget_->DrawRoundedRectangle(
+            D2D1::RoundedRect(body, 4.0f, 4.0f),
+            brush_.Get(), active ? 1.0f : 0.75f);
+
+        brush_->SetColor(D2D1::ColorF(0xF3F5F6,
+                                      active ? 0.82f : 0.40f));
         constexpr int triangleRows = 9;
-        constexpr float triangleTipX = 0.75f;
-        constexpr float triangleBaseRight = 36.0f;
         for (int row = 0; row < triangleRows; ++row) {
             const float progress = static_cast<float>(row) /
                 static_cast<float>(triangleRows - 1);
-            const float y = handle.top +
-                (handle.bottom - handle.top) * progress;
-            const float left = triangleTipX;
-            const float right = triangleBaseRight +
-                (triangleTipX - triangleBaseRight) * progress;
+            const float y = bodyBottom +
+                (handle.bottom - bodyBottom) * progress;
+            const float halfWidth = triangleHalfWidth * (1.0f - progress);
             renderTarget_->DrawLine(
-                D2D1::Point2F(left, y),
-                D2D1::Point2F(right, y),
+                D2D1::Point2F(triangleCenterX - halfWidth, y),
+                D2D1::Point2F(triangleCenterX + halfWidth, y),
                 brush_.Get(), active ? 1.8f : 0.95f);
         }
+        brush_->SetColor(D2D1::ColorF(0x92999F,
+                                      active ? 0.66f : 0.30f));
+        renderTarget_->DrawLine(
+            D2D1::Point2F(triangleCenterX - triangleHalfWidth, bodyBottom),
+            D2D1::Point2F(triangleCenterX, handle.bottom),
+            brush_.Get(), active ? 1.0f : 0.75f);
+        renderTarget_->DrawLine(
+            D2D1::Point2F(triangleCenterX, handle.bottom),
+            D2D1::Point2F(triangleCenterX + triangleHalfWidth, bodyBottom),
+            brush_.Get(), active ? 1.0f : 0.75f);
+        brush_->SetColor(D2D1::ColorF(0x3F474E,
+                                      active ? 0.92f : 0.64f));
+        constexpr wchar_t label[] = L"调整范围";
+        renderTarget_->DrawTextW(
+            label, static_cast<UINT32>(wcslen(label)),
+            bodyFormat_.Get(), body, brush_.Get(),
+            D2D1_DRAW_TEXT_OPTIONS_CLIP);
 
-        if (active) {
+        if (draggingDivider_) {
             const int percent = static_cast<int>(std::round(
                 std::clamp(state_.workspaceWidthRatio, 0.30f, 0.70f) *
                 100.0f));
-            const std::wstring hint = draggingDivider_
-                ? L"核心桌面：" + std::to_wstring(percent) + L"%"
-                : L"调整范围";
-            const float hintWidth = draggingDivider_ ? 124.0f : 78.0f;
+            const std::wstring hint =
+                L"核心桌面：" + std::to_wstring(percent) + L"%";
+            constexpr float hintWidth = 124.0f;
             const D2D1_RECT_F hintRect = D2D1::RectF(
                 handle.right + 8.0f,
                 handle.top + 2.0f,
