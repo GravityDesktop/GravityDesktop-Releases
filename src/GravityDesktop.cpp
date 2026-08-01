@@ -2806,6 +2806,7 @@ public:
             CreateBenchmarkWorkspace();
         } else {
             LoadState();
+            LoadCoreShortLabelOverrides();
         }
         NormalizeStateModel();
         // Pause is a runtime tray state. An explicit process launch must not
@@ -16983,8 +16984,17 @@ private:
         ResetFocusImmediately();
         iconCache_.clear();
         iconShadowCache_.clear();
-        ScheduleSave();
-        SetStatus(L"已撤销上一步操作");
+        if (stateRecoveryBlocked_) {
+            SynchronizeProtectedShortLabelOverridesFromState();
+            if (!PersistCoreShortLabelOverrides()) {
+                SetStatus(L"撤销已在内存完成；保护副本写入失败");
+            } else {
+                SetStatus(L"已撤销上一步操作");
+            }
+        } else {
+            ScheduleSave();
+            SetStatus(L"已撤销上一步操作");
+        }
         Invalidate();
     }
 
@@ -17111,15 +17121,21 @@ private:
         const D2D1_RECT_F input = CoreAppearanceShortLabelInputRectangle(
             ClientDipSize());
         const float scale = dpi_ / 96.0f;
+        HWND coordinateWindow = interactionWindow_ != nullptr
+            ? interactionWindow_ : window_;
+        POINT origin{0, 0};
+        if (coordinateWindow != nullptr) {
+            ClientToScreen(coordinateWindow, &origin);
+        }
         SetWindowPos(
             coreShortLabelEditWindow_, HWND_TOP,
-            static_cast<int>(std::round(input.left * scale)),
-            static_cast<int>(std::round(input.top * scale)),
+            origin.x + static_cast<int>(std::round(input.left * scale)),
+            origin.y + static_cast<int>(std::round(input.top * scale)),
             std::max(1, static_cast<int>(std::round(
                 (input.right - input.left) * scale))),
             std::max(1, static_cast<int>(std::round(
                 (input.bottom - input.top) * scale))),
-            SWP_NOACTIVATE);
+            SWP_NOOWNERZORDER | SWP_SHOWWINDOW);
     }
 
     void BeginCoreShortLabelEdit(std::uint64_t coreId) {
@@ -17133,12 +17149,13 @@ private:
             coreAppearancePanelCoreId_ != coreId) {
             return;
         }
-        HWND editParent = interactionWindow_ != nullptr
+        HWND editOwner = interactionWindow_ != nullptr
             ? interactionWindow_ : window_;
         coreShortLabelEditWindow_ = CreateWindowExW(
-            WS_EX_CLIENTEDGE, L"EDIT", core->shortLabel.c_str(),
-            WS_CHILD | WS_VISIBLE | ES_AUTOHSCROLL | ES_CENTER,
-            0, 0, 120, 26, editParent, nullptr,
+            WS_EX_TOOLWINDOW | WS_EX_CLIENTEDGE,
+            L"EDIT", core->shortLabel.c_str(),
+            WS_POPUP | WS_VISIBLE | ES_AUTOHSCROLL | ES_CENTER,
+            0, 0, 120, 26, editOwner, nullptr,
             GetModuleHandleW(nullptr), nullptr);
         if (coreShortLabelEditWindow_ == nullptr) {
             return;
@@ -17160,6 +17177,10 @@ private:
         PositionCoreShortLabelEditWindow();
         interactionShapes_.clear();
         Invalidate();
+        // The desktop companion itself deliberately never activates.  Text
+        // input is the one exception: a temporary owned editor must receive
+        // keyboard and IME composition messages until it is applied/cancelled.
+        SetForegroundWindow(coreShortLabelEditWindow_);
         SetFocus(coreShortLabelEditWindow_);
         SendMessageW(coreShortLabelEditWindow_, EM_SETSEL, 0, -1);
     }
@@ -17229,13 +17250,26 @@ private:
         }
 
         const WorkspaceState before = coreShortLabelEditSnapshot_;
+        const auto overridesBefore = protectedShortLabelOverrides_;
         const bool dirtyBefore = dirty_;
         core->shortLabel = value;
-        dirty_ = true;
+        const bool protectedStateWrite = stateRecoveryBlocked_;
+        bool saved = false;
+        if (protectedStateWrite) {
+            // Relation recovery protection must remain intact. Persist this
+            // independent visual preference to its own atomically-written
+            // sidecar instead of overwriting the protected state document.
+            protectedShortLabelOverrides_[core->id] = value;
+            saved = PersistCoreShortLabelOverrides();
+        } else {
+            dirty_ = true;
+            saved = SaveState();
+        }
         // Confirmation is the single commit point: save once, then create one
-        // undo entry.  No rendering coordinate or layout cache is touched.
-        if (!SaveState()) {
+        // undo entry. No rendering coordinate or layout cache is touched.
+        if (!saved) {
             state_ = before;
+            protectedShortLabelOverrides_ = overridesBefore;
             dirty_ = dirtyBefore;
             coreShortLabelEditError_ = L"保存失败；短标识未修改";
             SetStatus(coreShortLabelEditError_);
@@ -17248,7 +17282,12 @@ private:
         coreShortLabelEditingCoreId_ = 0;
         coreShortLabelPreview_.clear();
         coreShortLabelEditError_.clear();
-        SetStatus(cleared ? L"核心短标识已清空" : L"核心短标识已保存");
+        SetStatus(
+            cleared
+                ? L"核心短标识已清空"
+                : (protectedStateWrite
+                       ? L"核心短标识已保存到保护副本"
+                       : L"核心短标识已保存"));
         Invalidate();
         return true;
     }
@@ -17272,6 +17311,85 @@ private:
                 L"检测到上次关机保存失败的恢复副本：" +
                 path.filename().wstring() +
                 L"。可通过“导入布局”恢复。");
+        }
+    }
+
+    std::filesystem::path CoreShortLabelOverridePath() const {
+        if (stateFile_.empty()) {
+            return {};
+        }
+        return std::filesystem::path(
+            stateFile_.wstring() + L".core-short-labels.json");
+    }
+
+    std::string SerializeCoreShortLabelOverrides() const {
+        std::ostringstream output;
+        output.imbue(std::locale::classic());
+        output << "{\"version\":1,\"labels\":[";
+        bool first = true;
+        for (const auto& [coreId, label] : protectedShortLabelOverrides_) {
+            if (!first) output << ',';
+            first = false;
+            output << "{\"core_id\":" << coreId
+                   << ",\"short_label\":" << EscapeJson(label) << '}';
+        }
+        output << "]}";
+        return output.str();
+    }
+
+    void LoadCoreShortLabelOverrides() {
+        protectedShortLabelOverrides_.clear();
+        const std::filesystem::path path = CoreShortLabelOverridePath();
+        if (path.empty()) {
+            return;
+        }
+        const std::optional<std::string> text = ReadUtf8File(path);
+        if (!text.has_value()) {
+            return;
+        }
+        JsonValue rootValue;
+        JsonParser parser(*text);
+        if (!parser.Parse(rootValue)) {
+            return;
+        }
+        const JsonValue::Object* root = rootValue.AsObject();
+        const JsonValue* labelsValue =
+            root == nullptr ? nullptr : FindMember(*root, "labels");
+        const JsonValue::Array* labels =
+            labelsValue == nullptr ? nullptr : labelsValue->AsArray();
+        if (labels == nullptr) {
+            return;
+        }
+        for (const JsonValue& entry : *labels) {
+            const JsonValue::Object* object = entry.AsObject();
+            if (object == nullptr) continue;
+            const std::uint64_t coreId = static_cast<std::uint64_t>(
+                NumberMember(*object, "core_id", 0.0));
+            const std::wstring label =
+                StringMember(*object, "short_label", L"");
+            if (coreId == 0 ||
+                ValidateCoreShortLabel(label) !=
+                    CoreShortLabelValidation::Valid) {
+                continue;
+            }
+            if (Core* core = FindCore(coreId); core != nullptr) {
+                core->shortLabel = label;
+                protectedShortLabelOverrides_[coreId] = label;
+            }
+        }
+    }
+
+    bool PersistCoreShortLabelOverrides() {
+        const std::filesystem::path path = CoreShortLabelOverridePath();
+        return !path.empty() &&
+               WriteUtf8Atomic(
+                   path, SerializeCoreShortLabelOverrides());
+    }
+
+    void SynchronizeProtectedShortLabelOverridesFromState() {
+        protectedShortLabelOverrides_.clear();
+        for (const Core& core : state_.cores) {
+            protectedShortLabelOverrides_[core.id] = core.shortLabel;
         }
     }
 
@@ -17618,6 +17736,10 @@ private:
     std::wstring coreShortLabelPreview_;
     std::wstring coreShortLabelEditError_;
     WorkspaceState coreShortLabelEditSnapshot_;
+    // Only used while relation recovery protection blocks the main state
+    // file. It keeps this independent visual preference writable without
+    // overriding the protected relationship document.
+    std::map<std::uint64_t, std::wstring> protectedShortLabelOverrides_;
     std::wstring status_;
     std::int64_t lastHistoryBackupTime_ = 0;
     HDC layeredDeviceContext_ = nullptr;
@@ -19547,6 +19669,40 @@ bool RunSelfTest() {
         return false;
     }
 
+    const std::filesystem::path protectedLabelStatePath =
+        std::filesystem::temp_directory_path() /
+        (L"GravityDesktop-short-label-" +
+         std::to_wstring(GetCurrentProcessId()) + L".json");
+    GravityApp protectedLabelWriter;
+    protectedLabelWriter.stateFile_ = protectedLabelStatePath;
+    Core protectedLabelCore;
+    protectedLabelCore.id = 61;
+    protectedLabelCore.name = L"保护测试";
+    protectedLabelWriter.state_.cores.push_back(protectedLabelCore);
+    protectedLabelWriter.protectedShortLabelOverrides_[61] = L"项目";
+    if (!protectedLabelWriter.PersistCoreShortLabelOverrides()) {
+        return false;
+    }
+    GravityApp protectedLabelReader;
+    protectedLabelReader.stateFile_ = protectedLabelStatePath;
+    protectedLabelReader.state_.cores.push_back(protectedLabelCore);
+    protectedLabelReader.LoadCoreShortLabelOverrides();
+    if (protectedLabelReader.state_.cores.front().shortLabel != L"项目" ||
+        protectedLabelReader.protectedShortLabelOverrides_[61] != L"项目") {
+        return false;
+    }
+    if (!WriteUtf8Atomic(
+            protectedLabelReader.CoreShortLabelOverridePath(),
+            "{\"version\":1,\"labels\":[{\"core_id\":61,\"short_label\":\"invalid\"}]}")) {
+        return false;
+    }
+    protectedLabelReader.state_.cores.front().shortLabel = L"保留";
+    protectedLabelReader.LoadCoreShortLabelOverrides();
+    if (protectedLabelReader.state_.cores.front().shortLabel != L"保留" ||
+        !protectedLabelReader.protectedShortLabelOverrides_.empty()) {
+        return false;
+    }
+
     WorkspaceState source;
     source.nextId = 12;
     source.viewOffset = D2D1::Point2F(12.5f, -7.25f);
@@ -19802,7 +19958,6 @@ bool RunSelfTest() {
     WorkspaceState legacyState;
     if (!DeserializeState(legacy, legacyState) || legacyState.cores.empty() ||
         legacyState.cores.front().layoutVersion != 1 ||
-        !legacyState.cores.front().shortLabel.empty() ||
         std::abs(
             legacyState.connectionLineWidth -
             kConnectionLineWidthStandard) > 0.001f ||
