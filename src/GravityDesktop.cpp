@@ -112,6 +112,27 @@ enum class FileSizeTier : int {
     Important = 2,
 };
 
+// A reference never changes the real file. A managed item is an explicit,
+// user-approved move from the current user's Desktop into a durable library.
+enum class FileStorageMode : int {
+    Reference = 0,
+    Managed = 1,
+};
+
+enum class ManagedTransactionOperation : int {
+    Store = 0,
+    Restore = 1,
+    Undo = 2,
+};
+
+enum class ManagedTransactionStage : int {
+    Prepared = 0,
+    FileMoved = 1,
+    StateSaved = 2,
+    Committed = 3,
+    RolledBack = 4,
+};
+
 enum class CoreIconKind : int {
     General = 0,
     Documents = 1,
@@ -854,6 +875,12 @@ struct FileItem {
     std::vector<std::int64_t> recentOpens;
     bool isDirectory = false;
     bool missing = false;
+    FileStorageMode storageMode = FileStorageMode::Reference;
+    // originalPath never changes after collection; path is always the current
+    // real location used to open the item.
+    std::wstring originalPath;
+    std::wstring managedPath;
+    std::int64_t managedAt = 0;
     // Relationship layer: never changes the real file or its path.
     std::uint64_t parentFileId = 0;
     float relativeAngle = 90.0f;
@@ -1056,11 +1083,85 @@ struct WorkspaceState {
     float dividerPosition = 0.50f;
     bool dividerVisible = true;
     int dividerStyle = 0;
+    // Empty means the durable default beneath the user's Documents folder.
+    // The managed library is never derived from an install or state path.
+    std::wstring managedLibraryPath;
     D2D1_POINT_2F halfScreenViewOffset = D2D1::Point2F();
     D2D1_POINT_2F fullScreenViewOffset = D2D1::Point2F();
     std::vector<Core> cores;
     std::vector<FileFamily> families;
 };
+
+// A journal is intentionally external to state.json. It survives a process
+// crash between moving the real file and atomically replacing state.json.
+struct ManagedFileTransaction {
+    std::uint64_t id = 0;
+    std::uint64_t coreId = 0;
+    std::uint64_t itemId = 0;
+    ManagedTransactionOperation operation =
+        ManagedTransactionOperation::Store;
+    ManagedTransactionStage stage = ManagedTransactionStage::Prepared;
+    std::wstring sourcePath;
+    std::wstring destinationPath;
+    bool itemPresentAfter = false;
+    std::int64_t createdAt = 0;
+};
+
+struct ManagedUndoAction {
+    ManagedFileTransaction reverseTransaction;
+};
+
+std::string SerializeManagedFileTransaction(
+    const ManagedFileTransaction& transaction) {
+    std::ostringstream output;
+    output.imbue(std::locale::classic());
+    output << "{\"version\":1,\"id\":" << transaction.id
+           << ",\"core_id\":" << transaction.coreId
+           << ",\"item_id\":" << transaction.itemId
+           << ",\"operation\":" << static_cast<int>(transaction.operation)
+           << ",\"stage\":" << static_cast<int>(transaction.stage)
+           << ",\"source_path\":" << EscapeJson(transaction.sourcePath)
+           << ",\"destination_path\":"
+           << EscapeJson(transaction.destinationPath)
+           << ",\"item_present_after\":"
+           << (transaction.itemPresentAfter ? "true" : "false")
+           << ",\"created_at\":" << transaction.createdAt << "}";
+    return output.str();
+}
+
+bool DeserializeManagedFileTransaction(
+    const std::string& text, ManagedFileTransaction& transaction) {
+    JsonValue root;
+    JsonParser parser(text);
+    if (!parser.Parse(root)) return false;
+    const JsonValue::Object* object = root.AsObject();
+    if (object == nullptr ||
+        static_cast<int>(NumberMember(*object, "version", 0.0)) != 1) {
+        return false;
+    }
+    transaction.id = static_cast<std::uint64_t>(
+        NumberMember(*object, "id", 0.0));
+    transaction.coreId = static_cast<std::uint64_t>(
+        NumberMember(*object, "core_id", 0.0));
+    transaction.itemId = static_cast<std::uint64_t>(
+        NumberMember(*object, "item_id", 0.0));
+    transaction.operation = static_cast<ManagedTransactionOperation>(
+        std::clamp(static_cast<int>(NumberMember(
+            *object, "operation", 0.0)), 0, 2));
+    transaction.stage = static_cast<ManagedTransactionStage>(
+        std::clamp(static_cast<int>(NumberMember(
+            *object, "stage", 0.0)), 0, 4));
+    transaction.sourcePath = StringMember(*object, "source_path", L"");
+    transaction.destinationPath = StringMember(
+        *object, "destination_path", L"");
+    transaction.itemPresentAfter = BoolMember(
+        *object, "item_present_after", false);
+    transaction.createdAt = static_cast<std::int64_t>(
+        NumberMember(*object, "created_at", 0.0));
+    return transaction.id != 0 && transaction.itemId != 0 &&
+           !transaction.sourcePath.empty() &&
+           !transaction.destinationPath.empty();
+}
 
 bool IsCoreColorPreset(UINT32 color) {
     return std::any_of(
@@ -1635,9 +1736,9 @@ std::string SerializeState(const WorkspaceState& state) {
     output.imbue(std::locale::classic());
     output << std::setprecision(9);
     output << "{\n"
-           << "  \"schemaVersion\": 15,\n"
-           << "  \"schema_version\": 15,\n"
-           << "  \"version\": 15,\n"
+           << "  \"schemaVersion\": 16,\n"
+           << "  \"schema_version\": 16,\n"
+           << "  \"version\": 16,\n"
            << "  \"next_id\": " << state.nextId << ",\n"
            << "  \"view\": {\"x\": " << state.viewOffset.x << ", \"y\": "
            << state.viewOffset.y << ", \"zoom\": " << state.zoom << "},\n"
@@ -1656,6 +1757,8 @@ std::string SerializeState(const WorkspaceState& state) {
            << ", \"divider_visible\": "
            << (state.dividerVisible ? "true" : "false")
            << ", \"divider_style\": " << state.dividerStyle
+           << ", \"managed_library_path\": "
+           << EscapeJson(state.managedLibraryPath)
            << ", \"workspace_collapsed\": "
            << (state.workspaceCollapsed ? "true" : "false")
            << ", \"workspace_paused\": "
@@ -1793,6 +1896,13 @@ std::string SerializeState(const WorkspaceState& state) {
                    << item.openCount << ", \"last_opened\": " << item.lastOpened
                    << ", \"is_directory\": " << (item.isDirectory ? "true" : "false")
                    << ", \"missing\": " << (item.missing ? "true" : "false")
+                   << ", \"storage_mode\": "
+                   << static_cast<int>(item.storageMode)
+                   << ", \"original_path\": "
+                   << EscapeJson(item.originalPath)
+                   << ", \"managed_path\": "
+                   << EscapeJson(item.managedPath)
+                   << ", \"managed_at\": " << item.managedAt
                    << ", \"parent_file_id\": " << item.parentFileId
                    << ", \"relative_angle\": " << item.relativeAngle
                    << ", \"relative_radius\": " << item.relativeRadius
@@ -1923,6 +2033,8 @@ bool DeserializeState(const std::string& json, WorkspaceState& state) {
             loaded.dividerVisible = BoolMember(*settings, "divider_visible", true);
             loaded.dividerStyle = std::clamp(static_cast<int>(
                 NumberMember(*settings, "divider_style", 0.0)), 0, 1);
+            loaded.managedLibraryPath = StringMember(
+                *settings, "managed_library_path", L"");
             loaded.workspaceCollapsed = BoolMember(*settings,
                 "workspace_collapsed", false);
             loaded.workspacePaused = BoolMember(*settings,
@@ -2264,6 +2376,16 @@ bool DeserializeState(const std::string& json, WorkspaceState& state) {
                         NumberMember(*fileObject, "last_opened", 0.0));
                     item.isDirectory = BoolMember(*fileObject, "is_directory", false);
                     item.missing = BoolMember(*fileObject, "missing", false);
+                    item.storageMode = static_cast<FileStorageMode>(std::clamp(
+                        static_cast<int>(NumberMember(
+                            *fileObject, "storage_mode", 0.0)),
+                        0, 1));
+                    item.originalPath = StringMember(
+                        *fileObject, "original_path", L"");
+                    item.managedPath = StringMember(
+                        *fileObject, "managed_path", L"");
+                    item.managedAt = static_cast<std::int64_t>(
+                        NumberMember(*fileObject, "managed_at", 0.0));
                     item.parentFileId = static_cast<std::uint64_t>(
                         NumberMember(*fileObject, "parent_file_id", 0.0));
                     item.relativeAngle = NormalizeDegrees(static_cast<float>(
@@ -2993,6 +3115,7 @@ public:
             CreateBenchmarkWorkspace();
         } else {
             LoadState();
+            RecoverPendingManagedTransaction();
             LoadCoreShortLabelOverrides();
         }
         NormalizeStateModel();
@@ -15200,7 +15323,12 @@ private:
                             L"断开上层连接（保持独立）");
             }
             AppendMenuW(menu, MF_SEPARATOR, 0, nullptr);
-            AppendMenuW(menu, MF_STRING, MenuRemoveItem, L"移除视觉关联");
+            AppendMenuW(
+                menu, MF_STRING, MenuRemoveItem,
+                item != nullptr &&
+                        item->storageMode == FileStorageMode::Managed
+                    ? L"从核心移除并还原到桌面"
+                    : L"从核心移除引用");
         }
 
         POINT screen{x, y};
@@ -15689,6 +15817,248 @@ private:
         return true;
     }
 
+    bool StoreDesktopFileInCore(
+        const std::wstring& sourcePath,
+        std::uint64_t targetCoreId,
+        std::uint64_t parentId,
+        D2D1_POINT_2F dropWorld) {
+        if (stateRecoveryBlocked_) {
+            SetStatus(L"状态处于保护模式；未移动任何真实文件");
+            return false;
+        }
+        Core* target = FindCore(targetCoreId);
+        if (target == nullptr) {
+            SetStatus(L"收纳失败：目标核心不存在");
+            return false;
+        }
+        std::wstring eligibilityError;
+        if (!IsEligibleDesktopManagedFile(sourcePath, &eligibilityError)) {
+            SetStatus(L"未收纳：" + eligibilityError + L"；已按安全规则保留原文件");
+            return false;
+        }
+        Core* existingOwner = nullptr;
+        if (FileItem* existing = FindItemByPath(sourcePath, &existingOwner);
+            existing != nullptr) {
+            SetStatus(existingOwner != nullptr && existingOwner->id != targetCoreId
+                ? L"该文件已经属于其他核心；未自动跨核心移动"
+                : L"该文件已经存在于当前核心；未创建重复入口");
+            return false;
+        }
+        if (AttachedFileCount(*target) >=
+            static_cast<std::size_t>(kCoreFileCapacity)) {
+            SetStatus(L"当前核心已达到 18 项容量上限；未收纳文件");
+            return false;
+        }
+        if (parentId != 0 && FindItem(targetCoreId, parentId) == nullptr) {
+            SetStatus(L"收纳失败：目标父文件不存在");
+            return false;
+        }
+        if (target->layoutLocked) {
+            if (MessageBoxW(
+                    window_,
+                    L"当前核心布局已锁定。\n\n是否解除锁定并收纳文件？",
+                    L"收纳到核心",
+                    MB_YESNO | MB_ICONQUESTION | MB_DEFBUTTON2) != IDYES) {
+                return false;
+            }
+        }
+        const std::wstring collectionWarning =
+            L"将“" + FileDisplayName(sourcePath) + L"”收纳到“" +
+            target->name + L"”。\n\n"
+            L"真实文件会从 Windows 桌面移入“文档\\Gravity Desktop Files”，"
+            L"左侧原始桌面图标将消失。\n"
+            L"引力桌面只保存一个入口；之后可通过“从核心移除并还原到桌面”恢复。\n\n"
+            L"依赖原始桌面路径的外部程序可能需要重新定位该文件。";
+        if (MessageBoxW(
+                window_, collectionWarning.c_str(), L"收纳到核心",
+                MB_OKCANCEL | MB_ICONWARNING | MB_DEFBUTTON2) != IDOK) {
+            SetStatus(L"已取消收纳；真实文件仍保留在 Windows 桌面");
+            return false;
+        }
+
+        const WorkspaceState before = state_;
+        const std::uint64_t itemId = state_.nextId;
+        const std::filesystem::path library = ManagedLibraryPath();
+        const std::wstring fileName = FileDisplayName(sourcePath);
+        const std::filesystem::path destination =
+            library / (L"managed-" + std::to_wstring(itemId)) / fileName;
+        if (FilePathExists(destination.wstring())) {
+            SetStatus(L"收纳失败：托管库目标已存在同名文件");
+            return false;
+        }
+
+        ManagedFileTransaction transaction;
+        transaction.id = itemId;
+        transaction.coreId = targetCoreId;
+        transaction.itemId = itemId;
+        transaction.operation = ManagedTransactionOperation::Store;
+        transaction.stage = ManagedTransactionStage::Prepared;
+        transaction.sourcePath = sourcePath;
+        transaction.destinationPath = destination.wstring();
+        transaction.itemPresentAfter = true;
+        transaction.createdAt = UnixTimeNow();
+        if (!PersistManagedTransaction(transaction)) {
+            SetStatus(L"收纳失败：无法写入文件移动事务日志");
+            return false;
+        }
+
+        std::wstring moveError;
+        if (!MoveFileWithoutReplacement(
+                transaction.sourcePath, transaction.destinationPath,
+                &moveError)) {
+            ClearManagedTransaction();
+            SetStatus(L"收纳失败：" + moveError);
+            return false;
+        }
+        transaction.stage = ManagedTransactionStage::FileMoved;
+        if (!PersistManagedTransaction(transaction)) {
+            std::wstring rollbackError;
+            const bool rolledBack = MoveFileWithoutReplacement(
+                transaction.destinationPath, transaction.sourcePath,
+                &rollbackError);
+            if (rolledBack) {
+                transaction.stage = ManagedTransactionStage::RolledBack;
+                (void)PersistManagedTransaction(transaction);
+                ClearManagedTransaction();
+            }
+            SetStatus(L"收纳失败：事务记录未完成，已尝试回滚真实文件");
+            return false;
+        }
+
+        WorkspaceState candidate = state_;
+        auto candidateCore = std::find_if(
+            candidate.cores.begin(), candidate.cores.end(),
+            [targetCoreId](const Core& core) {
+                return core.id == targetCoreId;
+            });
+        if (candidateCore == candidate.cores.end()) {
+            std::wstring rollbackError;
+            const bool rolledBack = MoveFileWithoutReplacement(
+                transaction.destinationPath, transaction.sourcePath,
+                &rollbackError);
+            if (rolledBack) {
+                transaction.stage = ManagedTransactionStage::RolledBack;
+                (void)PersistManagedTransaction(transaction);
+                ClearManagedTransaction();
+            }
+            SetStatus(L"收纳失败：目标核心状态已变化，已回滚真实文件");
+            return false;
+        }
+        if (candidateCore->layoutLocked) {
+            candidateCore->layoutLocked = false;
+        }
+        FileItem item;
+        item.id = candidate.nextId++;
+        item.path = transaction.destinationPath;
+        item.originalPath = transaction.sourcePath;
+        item.managedPath = transaction.destinationPath;
+        item.managedAt = UnixTimeNow();
+        item.storageMode = FileStorageMode::Managed;
+        item.originalName = fileName;
+        item.displayName = MakeDisplayName(item.path, false);
+        item.isDirectory = false;
+        item.missing = false;
+        item.sizeTier = InferSizeTier(item);
+        GenerateStableOffsets(item);
+        AssignDroppedItemLayout(*candidateCore, item, dropWorld, 0);
+        candidateCore->files.push_back(std::move(item));
+
+        if (parentId != 0) {
+            FileItem* parent = nullptr;
+            FileItem* child = nullptr;
+            for (FileItem& candidateItem : candidateCore->files) {
+                if (candidateItem.id == parentId) parent = &candidateItem;
+                if (candidateItem.id == itemId) child = &candidateItem;
+            }
+            if (parent == nullptr || child == nullptr) {
+                std::wstring rollbackError;
+                const bool rolledBack = MoveFileWithoutReplacement(
+                    transaction.destinationPath, transaction.sourcePath,
+                    &rollbackError);
+                if (rolledBack) {
+                    transaction.stage = ManagedTransactionStage::RolledBack;
+                    (void)PersistManagedTransaction(transaction);
+                    ClearManagedTransaction();
+                }
+                SetStatus(L"收纳失败：父子关系目标已变化，已回滚真实文件");
+                return false;
+            }
+            if (parent->familyId == 0) {
+                FileFamily family;
+                family.id = candidate.nextId++;
+                family.coreId = targetCoreId;
+                family.rootFileId = parentId;
+                family.currentFileId = parentId;
+                parent->familyId = family.id;
+                candidate.families.push_back(std::move(family));
+            }
+            child->parentFileId = parentId;
+            child->familyId = parent->familyId;
+            child->sizeTier = FileSizeTier::Minor;
+            child->relativeAngle = 90.0f;
+            child->relativeRadius = 62.0f;
+            child->relativeManualOffset = D2D1::Point2F();
+            child->relativeManualLock = false;
+            child->slot = -1;
+            child->ring = -1;
+            child->ringSlot = -1;
+        }
+        candidateCore->expanded = true;
+        if (AttachedFileCount(*candidateCore) > 15) {
+            candidateCore->layoutTemplate =
+                LayoutTemplate::HighCapacityDouble;
+        }
+        RefreshAutomaticCoreIdentity(*candidateCore);
+        const RelationValidationResult validation =
+            ValidateRelationState(candidate);
+        if (!validation.IsValid() || !WriteUtf8Atomic(
+                stateFile_, SerializeState(candidate))) {
+            std::wstring rollbackError;
+            const bool rolledBack = MoveFileWithoutReplacement(
+                transaction.destinationPath, transaction.sourcePath,
+                &rollbackError);
+            if (rolledBack) {
+                transaction.stage = ManagedTransactionStage::RolledBack;
+                (void)PersistManagedTransaction(transaction);
+                ClearManagedTransaction();
+            }
+            SetStatus(validation.IsValid()
+                ? L"收纳失败：状态未能保存，真实文件已回滚"
+                : L"收纳失败：关系校验未通过，真实文件已回滚");
+            return false;
+        }
+
+        state_ = std::move(candidate);
+        dirty_ = false;
+        CreateHistoryBackup(false);
+        transaction.stage = ManagedTransactionStage::StateSaved;
+        (void)PersistManagedTransaction(transaction);
+        transaction.stage = ManagedTransactionStage::Committed;
+        (void)PersistManagedTransaction(transaction);
+        ClearManagedTransaction();
+        PushUndo(before);
+        ManagedFileTransaction reverse;
+        reverse.id = transaction.id;
+        reverse.coreId = targetCoreId;
+        reverse.itemId = itemId;
+        reverse.operation = ManagedTransactionOperation::Undo;
+        reverse.sourcePath = transaction.destinationPath;
+        reverse.destinationPath = transaction.sourcePath;
+        reverse.itemPresentAfter = false;
+        reverse.createdAt = UnixTimeNow();
+        managedUndoAction_ = ManagedUndoAction{std::move(reverse)};
+        SetSelection({HitKind::Item, targetCoreId, itemId});
+        iconCache_.clear();
+        iconShadowCache_.clear();
+        layoutCache_.clear();
+        layoutDirty_ = true;
+        SetStatus(parentId == 0
+            ? L"已收纳到核心；真实文件已移入托管库"
+            : L"已收纳并设为目标文件的子文件；真实文件已移入托管库");
+        Invalidate();
+        return true;
+    }
+
     bool AddExternalFileAsChild(
         const std::wstring& path,
         std::uint64_t targetCoreId,
@@ -15885,6 +16255,18 @@ private:
         DragFinish(drop);
         if (paths.empty()) {
             return;
+        }
+        // A single ordinary file dropped from the current user's Desktop is
+        // intentionally collected into the durable library. Every other
+        // source continues through the original reference-only path.
+        if (paths.size() == 1) {
+            std::wstring managedReason;
+            if (IsEligibleDesktopManagedFile(paths.front(), &managedReason)) {
+                StoreDesktopFileInCore(
+                    paths.front(), targetId, parentItemId, world);
+                ClearExternalDropPreview();
+                return;
+            }
         }
         if (parentItemId != 0) {
             AddExternalFileAsChild(
@@ -16246,6 +16628,26 @@ private:
         }
         const Core* source = FindCore(id);
         if (source == nullptr) return;
+        const bool containsManagedFiles = std::any_of(
+            source->files.begin(), source->files.end(),
+            [](const FileItem& item) {
+                return item.storageMode == FileStorageMode::Managed;
+            });
+        if (containsManagedFiles) {
+            const std::wstring warning =
+                L"此核心包含已收纳的真实文件。\n\n"
+                L"直接移除会让托管库中的真实文件失去核心入口，因此已被阻止。\n"
+                L"选择“确定”将解散核心并把全部文件引用移至“未分类”；\n"
+                L"选择“取消”后可逐个从核心移除并还原到桌面。";
+            if (MessageBoxW(
+                    window_, warning.c_str(), L"托管文件保护",
+                    MB_OKCANCEL | MB_ICONWARNING | MB_DEFBUTTON2) == IDOK) {
+                DissolveCore(id);
+            } else {
+                SetStatus(L"已保留核心；未移除任何托管文件或文件引用");
+            }
+            return;
+        }
         const std::wstring warning =
             L"将从引力桌面中移除核心“" + source->name +
             L"”及其中 " +
@@ -16936,7 +17338,9 @@ private:
     bool RemoveItemTransactional(
         std::uint64_t coreId,
         std::uint64_t itemId,
-        RemoveItemChoice choice) {
+        RemoveItemChoice choice,
+        bool allowManagedItems = false,
+        bool recordUndo = true) {
         Core* core = FindCore(coreId);
         if (core == nullptr) {
             return false;
@@ -16962,6 +17366,21 @@ private:
         if (choice == RemoveItemChoice::Cancel) {
             SetStatus(L"已取消移除；所有文件引用保持不变");
             return false;
+        }
+        if (!allowManagedItems) {
+            for (const std::uint64_t candidateId : subtree) {
+                const auto managed = std::find_if(
+                    core->files.begin(), core->files.end(),
+                    [candidateId](const FileItem& item) {
+                        return item.id == candidateId &&
+                            item.storageMode == FileStorageMode::Managed;
+                    });
+                if (managed != core->files.end()) {
+                    SetStatus(
+                        L"该操作包含托管文件；请先将托管文件还原到桌面");
+                    return false;
+                }
+            }
         }
         if (subtree.size() > 1 &&
             choice == RemoveItemChoice::Prompt) {
@@ -17168,7 +17587,9 @@ private:
         state_ = std::move(candidate);
         dirty_ = false;
         CreateHistoryBackup(false);
-        PushUndo(std::move(before));
+        if (recordUndo) {
+            PushUndo(std::move(before));
+        }
         ClearSelection();
         hover_ = {};
         layoutCache_.clear();
@@ -17183,9 +17604,141 @@ private:
         return true;
     }
 
+    bool RestoreManagedItemToDesktop(
+        std::uint64_t coreId,
+        std::uint64_t itemId) {
+        Core* core = FindCore(coreId);
+        FileItem* item = FindItem(coreId, itemId);
+        if (core == nullptr || item == nullptr ||
+            item->storageMode != FileStorageMode::Managed) {
+            return false;
+        }
+        if (ChildCount(*core, itemId) > 0) {
+            SetStatus(
+                L"该托管文件仍有子文件；请先处理子关系后再还原到桌面");
+            return false;
+        }
+        if (stateRecoveryBlocked_) {
+            SetStatus(L"状态处于保护模式；未移动任何真实文件");
+            return false;
+        }
+        const std::optional<std::filesystem::path> desktop =
+            CurrentUserDesktopPath();
+        if (!desktop.has_value()) {
+            SetStatus(L"还原失败：无法读取当前用户桌面路径");
+            return false;
+        }
+        const std::wstring source = item->path;
+        const std::wstring fileName = FileDisplayName(
+            item->originalPath.empty() ? item->path : item->originalPath);
+        std::filesystem::path destination = *desktop / fileName;
+        if (FilePathExists(destination.wstring())) {
+            std::wstring chosen = destination.wstring();
+            std::vector<wchar_t> buffer(32768, L'\0');
+            wcsncpy_s(buffer.data(), buffer.size(), chosen.c_str(), _TRUNCATE);
+            OPENFILENAMEW dialog{sizeof(dialog)};
+            dialog.hwndOwner = window_;
+            dialog.lpstrFile = buffer.data();
+            dialog.nMaxFile = static_cast<DWORD>(buffer.size());
+            dialog.lpstrTitle =
+                L"桌面存在同名文件：请选择新的还原名称或位置";
+            dialog.Flags = OFN_PATHMUSTEXIST | OFN_NOCHANGEDIR;
+            if (!GetSaveFileNameW(&dialog)) {
+                SetStatus(L"已保留托管文件；未覆盖桌面同名文件");
+                return false;
+            }
+            destination = buffer.data();
+            if (FilePathExists(destination.wstring())) {
+                SetStatus(L"还原失败：所选目标已存在，未覆盖任何文件");
+                return false;
+            }
+        }
+        const WorkspaceState before = state_;
+        ManagedFileTransaction transaction;
+        transaction.id = itemId;
+        transaction.coreId = coreId;
+        transaction.itemId = itemId;
+        transaction.operation = ManagedTransactionOperation::Restore;
+        transaction.stage = ManagedTransactionStage::Prepared;
+        transaction.sourcePath = source;
+        transaction.destinationPath = destination.wstring();
+        transaction.itemPresentAfter = false;
+        transaction.createdAt = UnixTimeNow();
+        if (!PersistManagedTransaction(transaction)) {
+            SetStatus(L"还原失败：无法写入文件移动事务日志");
+            return false;
+        }
+        std::wstring moveError;
+        if (!MoveFileWithoutReplacement(
+                transaction.sourcePath, transaction.destinationPath,
+                &moveError)) {
+            ClearManagedTransaction();
+            SetStatus(L"还原失败：" + moveError);
+            return false;
+        }
+        transaction.stage = ManagedTransactionStage::FileMoved;
+        if (!PersistManagedTransaction(transaction)) {
+            std::wstring rollbackError;
+            const bool rolledBack = MoveFileWithoutReplacement(
+                transaction.destinationPath, transaction.sourcePath,
+                &rollbackError);
+            if (rolledBack) {
+                transaction.stage = ManagedTransactionStage::RolledBack;
+                (void)PersistManagedTransaction(transaction);
+                ClearManagedTransaction();
+            }
+            SetStatus(L"还原失败：事务记录未完成，已尝试回滚真实文件");
+            return false;
+        }
+        if (!RemoveItemTransactional(
+                coreId, itemId, RemoveItemChoice::RemoveSubtree,
+                true, false)) {
+            std::wstring rollbackError;
+            const bool rolledBack = MoveFileWithoutReplacement(
+                transaction.destinationPath, transaction.sourcePath,
+                &rollbackError);
+            if (rolledBack) {
+                transaction.stage = ManagedTransactionStage::RolledBack;
+                (void)PersistManagedTransaction(transaction);
+                ClearManagedTransaction();
+            }
+            SetStatus(L"还原失败：核心状态未移除，真实文件已回滚");
+            return false;
+        }
+        transaction.stage = ManagedTransactionStage::StateSaved;
+        (void)PersistManagedTransaction(transaction);
+        transaction.stage = ManagedTransactionStage::Committed;
+        (void)PersistManagedTransaction(transaction);
+        ClearManagedTransaction();
+        PushUndo(before);
+        ManagedFileTransaction reverse;
+        reverse.id = transaction.id;
+        reverse.coreId = coreId;
+        reverse.itemId = itemId;
+        reverse.operation = ManagedTransactionOperation::Undo;
+        reverse.sourcePath = transaction.destinationPath;
+        reverse.destinationPath = transaction.sourcePath;
+        reverse.itemPresentAfter = true;
+        reverse.createdAt = UnixTimeNow();
+        managedUndoAction_ = ManagedUndoAction{std::move(reverse)};
+        iconCache_.clear();
+        iconShadowCache_.clear();
+        layoutCache_.clear();
+        layoutDirty_ = true;
+        SetStatus(L"已从核心移除并还原到 Windows 桌面");
+        Invalidate();
+        return true;
+    }
+
     void RemoveItem(
         std::uint64_t coreId,
         std::uint64_t itemId) {
+        if (const FileItem* item = FindItem(coreId, itemId);
+            item != nullptr &&
+            item->storageMode == FileStorageMode::Managed) {
+            (void)RestoreManagedItemToDesktop(coreId, itemId);
+            return;
+        }
         (void)RemoveItemTransactional(
             coreId, itemId,
             RemoveItemChoice::Prompt);
@@ -17508,6 +18061,7 @@ private:
     }
 
     void PushUndo(const WorkspaceState& snapshot) {
+        managedUndoAction_.reset();
         undoStack_.push_back(snapshot);
         if (undoStack_.size() > 32) {
             undoStack_.erase(undoStack_.begin());
@@ -17515,16 +18069,76 @@ private:
     }
 
     void PushUndo(WorkspaceState&& snapshot) {
+        managedUndoAction_.reset();
         undoStack_.push_back(std::move(snapshot));
         if (undoStack_.size() > 32) {
             undoStack_.erase(undoStack_.begin());
         }
     }
 
+    bool UndoManagedFileOperation(
+        const ManagedFileTransaction& reverse,
+        const WorkspaceState& restoredState) {
+        if (stateRecoveryBlocked_) {
+            SetStatus(L"状态处于保护模式；未撤销真实文件移动");
+            return false;
+        }
+        if (!PersistManagedTransaction(reverse)) {
+            SetStatus(L"撤销失败：无法写入文件移动事务日志");
+            return false;
+        }
+        std::wstring moveError;
+        if (!MoveFileWithoutReplacement(
+                reverse.sourcePath, reverse.destinationPath, &moveError)) {
+            ClearManagedTransaction();
+            SetStatus(L"撤销失败：" + moveError);
+            return false;
+        }
+        ManagedFileTransaction updated = reverse;
+        updated.stage = ManagedTransactionStage::FileMoved;
+        if (!PersistManagedTransaction(updated) ||
+            !WriteUtf8Atomic(stateFile_, SerializeState(restoredState))) {
+            std::wstring rollbackError;
+            (void)MoveFileWithoutReplacement(
+                reverse.destinationPath, reverse.sourcePath, &rollbackError);
+            SetStatus(L"撤销失败：状态未保存，已尝试回滚真实文件");
+            return false;
+        }
+        updated.stage = ManagedTransactionStage::StateSaved;
+        (void)PersistManagedTransaction(updated);
+        updated.stage = ManagedTransactionStage::Committed;
+        (void)PersistManagedTransaction(updated);
+        ClearManagedTransaction();
+        return true;
+    }
+
     void Undo() {
         EndRename(false);
         if (undoStack_.empty()) {
             SetStatus(L"没有可撤销的操作");
+            return;
+        }
+        if (managedUndoAction_.has_value()) {
+            const WorkspaceState& restoredState = undoStack_.back();
+            if (!UndoManagedFileOperation(
+                    managedUndoAction_->reverseTransaction,
+                    restoredState)) {
+                return;
+            }
+            state_ = restoredState;
+            undoStack_.pop_back();
+            managedUndoAction_.reset();
+            dirty_ = false;
+            ClearSelection();
+            hover_ = {};
+            ResetFocusImmediately();
+            iconCache_.clear();
+            iconShadowCache_.clear();
+            layoutCache_.clear();
+            layoutDirty_ = true;
+            CreateHistoryBackup(false);
+            SetStatus(L"已撤销真实文件托管操作");
+            Invalidate();
             return;
         }
         state_ = std::move(undoStack_.back());
@@ -17849,6 +18463,187 @@ private:
         return std::filesystem::path(
             stateFile_.wstring() +
             L".session-recovery.json");
+    }
+
+    std::filesystem::path ManagedTransactionPath() const {
+        if (stateFile_.empty()) return {};
+        return std::filesystem::path(
+            stateFile_.wstring() + L".managed-file-transaction.json");
+    }
+
+    std::filesystem::path DefaultManagedLibraryPath() const {
+        PWSTR documents = nullptr;
+        if (SUCCEEDED(SHGetKnownFolderPath(
+                FOLDERID_Documents, KF_FLAG_DEFAULT, nullptr,
+                &documents))) {
+            std::filesystem::path path(documents);
+            CoTaskMemFree(documents);
+            return path / L"Gravity Desktop Files";
+        }
+        return std::filesystem::current_path() / L"Gravity Desktop Files";
+    }
+
+    std::filesystem::path ManagedLibraryPath() const {
+        return state_.managedLibraryPath.empty()
+            ? DefaultManagedLibraryPath()
+            : std::filesystem::path(state_.managedLibraryPath);
+    }
+
+    std::optional<std::filesystem::path> CurrentUserDesktopPath() const {
+        PWSTR desktop = nullptr;
+        if (FAILED(SHGetKnownFolderPath(
+                FOLDERID_Desktop, KF_FLAG_DEFAULT, nullptr, &desktop))) {
+            return std::nullopt;
+        }
+        std::filesystem::path path(desktop);
+        CoTaskMemFree(desktop);
+        return path;
+    }
+
+    bool PersistManagedTransaction(
+        const ManagedFileTransaction& transaction) const {
+        const std::filesystem::path path = ManagedTransactionPath();
+        return !path.empty() && WriteUtf8Atomic(
+            path, SerializeManagedFileTransaction(transaction));
+    }
+
+    void ClearManagedTransaction() const {
+        const std::filesystem::path path = ManagedTransactionPath();
+        if (!path.empty()) {
+            (void)DeleteFileW(path.c_str());
+        }
+    }
+
+    static bool FilePathExists(const std::wstring& path) {
+        return !path.empty() &&
+               GetFileAttributesW(path.c_str()) !=
+                   INVALID_FILE_ATTRIBUTES;
+    }
+
+    bool MoveFileWithoutReplacement(
+        const std::wstring& source,
+        const std::wstring& destination,
+        std::wstring* error = nullptr) const {
+        if (source.empty() || destination.empty() ||
+            !FilePathExists(source)) {
+            if (error != nullptr) *error = L"源文件不存在";
+            return false;
+        }
+        if (FilePathExists(destination)) {
+            if (error != nullptr) *error = L"目标位置已存在同名文件";
+            return false;
+        }
+        std::error_code filesystemError;
+        std::filesystem::create_directories(
+            std::filesystem::path(destination).parent_path(),
+            filesystemError);
+        if (filesystemError) {
+            if (error != nullptr) *error = L"无法创建托管目录";
+            return false;
+        }
+        if (MoveFileExW(
+                source.c_str(), destination.c_str(),
+                MOVEFILE_WRITE_THROUGH) == FALSE) {
+            if (error != nullptr) {
+                *error = L"移动真实文件失败（Windows 错误 " +
+                    std::to_wstring(GetLastError()) + L"）";
+            }
+            return false;
+        }
+        SHChangeNotify(SHCNE_RENAMEITEM, SHCNF_PATHW,
+                       source.c_str(), destination.c_str());
+        return true;
+    }
+
+    bool IsEligibleDesktopManagedFile(
+        const std::wstring& path,
+        std::wstring* reason = nullptr) const {
+        const std::optional<std::filesystem::path> desktop =
+            CurrentUserDesktopPath();
+        if (!desktop.has_value()) {
+            if (reason != nullptr) *reason = L"无法读取当前用户桌面路径";
+            return false;
+        }
+        const std::wstring normalized = NormalizePath(path);
+        const std::wstring parent = NormalizePath(
+            std::filesystem::path(normalized).parent_path().wstring());
+        if (!PathEquals(parent, NormalizePath(desktop->wstring()))) {
+            if (reason != nullptr) *reason = L"该文件不在当前用户桌面目录";
+            return false;
+        }
+        const DWORD attributes = GetFileAttributesW(normalized.c_str());
+        if (attributes == INVALID_FILE_ATTRIBUTES) {
+            if (reason != nullptr) *reason = L"源文件不存在";
+            return false;
+        }
+        if ((attributes & FILE_ATTRIBUTE_DIRECTORY) != 0 ||
+            (attributes & FILE_ATTRIBUTE_REPARSE_POINT) != 0 ||
+            (attributes & FILE_ATTRIBUTE_OFFLINE) != 0) {
+            if (reason != nullptr) {
+                *reason = L"当前仅支持收纳本地普通文件和快捷方式";
+            }
+            return false;
+        }
+        return true;
+    }
+
+    bool StateMatchesManagedTransaction(
+        const ManagedFileTransaction& transaction) {
+        Core* owner = nullptr;
+        FileItem* item = FindItemAnywhere(transaction.itemId, &owner);
+        if (!transaction.itemPresentAfter) {
+            return item == nullptr;
+        }
+        return item != nullptr && owner != nullptr &&
+               item->storageMode == FileStorageMode::Managed &&
+               PathEquals(item->path, transaction.destinationPath);
+    }
+
+    void RecoverPendingManagedTransaction() {
+        const std::filesystem::path journalPath = ManagedTransactionPath();
+        if (journalPath.empty()) return;
+        const std::optional<std::string> text = ReadUtf8File(journalPath);
+        if (!text.has_value()) return;
+        ManagedFileTransaction transaction;
+        if (!DeserializeManagedFileTransaction(*text, transaction)) {
+            SetStatus(L"检测到无效的托管事务日志；未移动任何真实文件");
+            return;
+        }
+        if (stateRecoveryBlocked_) {
+            SetStatus(L"状态处于保护模式；托管事务等待人工恢复");
+            return;
+        }
+        const bool sourceExists = FilePathExists(transaction.sourcePath);
+        const bool destinationExists =
+            FilePathExists(transaction.destinationPath);
+        if (StateMatchesManagedTransaction(transaction) &&
+            destinationExists) {
+            transaction.stage = ManagedTransactionStage::Committed;
+            (void)PersistManagedTransaction(transaction);
+            ClearManagedTransaction();
+            SetStatus(L"已完成上次中断的文件托管事务");
+            return;
+        }
+        if (sourceExists && !destinationExists) {
+            ClearManagedTransaction();
+            SetStatus(L"已取消未完成的文件托管事务；源文件保持原位");
+            return;
+        }
+        if (destinationExists && !sourceExists) {
+            std::wstring rollbackError;
+            if (MoveFileWithoutReplacement(
+                    transaction.destinationPath, transaction.sourcePath,
+                    &rollbackError)) {
+                transaction.stage = ManagedTransactionStage::RolledBack;
+                (void)PersistManagedTransaction(transaction);
+                ClearManagedTransaction();
+                SetStatus(L"已回滚未完成的文件托管事务");
+            } else {
+                SetStatus(L"托管事务需要修复：" + rollbackError);
+            }
+            return;
+        }
+        SetStatus(L"托管事务需要人工修复：源位置和目标位置状态不一致");
     }
 
     void NotifyPendingSessionEndRecovery() {
@@ -18440,6 +19235,7 @@ private:
     WorkspaceState state_;
     ResponsiveMetrics metrics_;
     std::vector<WorkspaceState> undoStack_;
+    std::optional<ManagedUndoAction> managedUndoAction_;
     std::unordered_map<std::uint64_t, CoreLayoutSnapshot>
         lastCoreLayouts_;
     std::filesystem::path stateFile_;
@@ -20032,6 +20828,32 @@ bool RunSelfTest() {
         return false;
     }
 
+    GravityApp protectedManagedRemovalApp;
+    protectedManagedRemovalApp.state_ =
+        makeSubtreeMoveState({{500, 0}}, 0);
+    protectedManagedRemovalApp.stateFile_ =
+        moveTestPath(L"managed-removal-protected");
+    FileItem* protectedManagedItem =
+        protectedManagedRemovalApp.FindItem(1, 500);
+    if (protectedManagedItem == nullptr) {
+        return false;
+    }
+    protectedManagedItem->storageMode = FileStorageMode::Managed;
+    protectedManagedItem->originalPath =
+        L"C:\\Users\\Test\\Desktop\\managed-removal.txt";
+    protectedManagedItem->managedPath =
+        L"C:\\Documents\\Gravity Desktop Files\\managed-500\\managed-removal.txt";
+    protectedManagedItem->path = protectedManagedItem->managedPath;
+    const std::string protectedManagedBefore =
+        SerializeState(protectedManagedRemovalApp.state_);
+    if (protectedManagedRemovalApp.RemoveItemTransactional(
+            1, 500, RemoveItemChoice::RemoveSubtree) ||
+        SerializeState(protectedManagedRemovalApp.state_) !=
+            protectedManagedBefore ||
+        !protectedManagedRemovalApp.undoStack_.empty()) {
+        return false;
+    }
+
     GravityApp parentRemovalApp;
     parentRemovalApp.state_ =
         makeSubtreeMoveState(
@@ -20690,6 +21512,8 @@ bool RunSelfTest() {
     source.coreSelectionEffect = CoreSelectionEffect::RippleOnceThenStatic;
     source.connectionLineWidth = 1.47f;
     source.coreGlowIntensity = 1.32f;
+    source.managedLibraryPath =
+        L"D:\\Gravity Desktop Files Test";
     source.workspaceWidthRatio = 0.41f;
     source.workspaceCollapsed = true;
     source.tutorialCompleted = true;
@@ -20753,6 +21577,10 @@ bool RunSelfTest() {
     item.inProgress = true;
     item.openCount = 7;
     item.recentOpens = {UnixTimeNow() - 60, UnixTimeNow() - 120};
+    item.storageMode = FileStorageMode::Managed;
+    item.originalPath = L"C:\\Users\\Test\\Desktop\\报价.xlsx";
+    item.managedPath = item.path;
+    item.managedAt = 1700000300;
     core.files.push_back(item);
     core.baselineLayoutMode = LayoutMode::GrowToSpace;
     core.baselineLayoutTemplate = LayoutTemplate::CompactDouble;
@@ -20805,6 +21633,10 @@ bool RunSelfTest() {
     if (restoredItem.path != item.path || !restoredItem.favorite ||
         !restoredItem.inProgress || restoredItem.openCount != item.openCount ||
         restoredItem.recentOpens.size() != 2 ||
+        restoredItem.storageMode != FileStorageMode::Managed ||
+        restoredItem.originalPath != item.originalPath ||
+        restoredItem.managedPath != item.managedPath ||
+        restoredItem.managedAt != item.managedAt ||
         restoredItem.originalName != item.originalName ||
         restoredItem.displayName != item.displayName ||
         restoredItem.ring != 0 || restoredItem.ringSlot != 0 ||
@@ -20870,6 +21702,7 @@ bool RunSelfTest() {
         std::abs(restored.connectionLineWidth - 1.47f) > 0.001f ||
         std::abs(restored.coreGlowIntensity - 1.32f) > 0.001f ||
         std::abs(restored.workspaceWidthRatio - 0.41f) > 0.001f ||
+        restored.managedLibraryPath != source.managedLibraryPath ||
         !restored.workspaceCollapsed || !restored.tutorialCompleted) {
         return false;
     }
@@ -20927,6 +21760,80 @@ bool RunSelfTest() {
             }
         }
         stablePositions.push_back(position);
+    }
+
+    ManagedFileTransaction serializedTransaction;
+    serializedTransaction.id = 991;
+    serializedTransaction.coreId = 1;
+    serializedTransaction.itemId = 991;
+    serializedTransaction.operation = ManagedTransactionOperation::Store;
+    serializedTransaction.stage = ManagedTransactionStage::FileMoved;
+    serializedTransaction.sourcePath = L"C:\\Desktop\\managed-test.txt";
+    serializedTransaction.destinationPath =
+        L"C:\\Documents\\Gravity Desktop Files\\managed-991\\managed-test.txt";
+    serializedTransaction.itemPresentAfter = true;
+    serializedTransaction.createdAt = 1700000400;
+    ManagedFileTransaction parsedTransaction;
+    if (!DeserializeManagedFileTransaction(
+            SerializeManagedFileTransaction(serializedTransaction),
+            parsedTransaction) ||
+        parsedTransaction.id != serializedTransaction.id ||
+        parsedTransaction.coreId != serializedTransaction.coreId ||
+        parsedTransaction.itemId != serializedTransaction.itemId ||
+        parsedTransaction.operation != serializedTransaction.operation ||
+        parsedTransaction.stage != serializedTransaction.stage ||
+        parsedTransaction.sourcePath != serializedTransaction.sourcePath ||
+        parsedTransaction.destinationPath != serializedTransaction.destinationPath ||
+        !parsedTransaction.itemPresentAfter ||
+        parsedTransaction.createdAt != serializedTransaction.createdAt) {
+        return false;
+    }
+
+    // A crash after the physical move but before state persistence must put the
+    // file back at its source and clear the journal. This test never touches a
+    // real Desktop or Documents folder.
+    const std::filesystem::path managedRecoverySource =
+        relationTestDirectory / L"managed-recovery-source.txt";
+    const std::filesystem::path managedRecoveryDestination =
+        relationTestDirectory / L"managed-recovery-library" /
+        L"managed-992" / L"managed-recovery-source.txt";
+    if (!WriteUtf8Atomic(managedRecoverySource, "managed recovery")) {
+        return false;
+    }
+    GravityApp managedRecoveryApp;
+    managedRecoveryApp.stateFile_ =
+        relationTestDirectory / L"managed-recovery-state.json";
+    ManagedFileTransaction interruptedTransaction;
+    interruptedTransaction.id = 992;
+    interruptedTransaction.coreId = 1;
+    interruptedTransaction.itemId = 992;
+    interruptedTransaction.operation = ManagedTransactionOperation::Store;
+    interruptedTransaction.stage = ManagedTransactionStage::Prepared;
+    interruptedTransaction.sourcePath = managedRecoverySource.wstring();
+    interruptedTransaction.destinationPath =
+        managedRecoveryDestination.wstring();
+    interruptedTransaction.itemPresentAfter = true;
+    interruptedTransaction.createdAt = UnixTimeNow();
+    if (!managedRecoveryApp.PersistManagedTransaction(interruptedTransaction)) {
+        return false;
+    }
+    std::wstring managedMoveError;
+    if (!managedRecoveryApp.MoveFileWithoutReplacement(
+            interruptedTransaction.sourcePath,
+            interruptedTransaction.destinationPath,
+            &managedMoveError)) {
+        return false;
+    }
+    interruptedTransaction.stage = ManagedTransactionStage::FileMoved;
+    if (!managedRecoveryApp.PersistManagedTransaction(interruptedTransaction)) {
+        return false;
+    }
+    managedRecoveryApp.RecoverPendingManagedTransaction();
+    if (!GravityApp::FilePathExists(managedRecoverySource.wstring()) ||
+        GravityApp::FilePathExists(managedRecoveryDestination.wstring()) ||
+        GravityApp::FilePathExists(
+            managedRecoveryApp.ManagedTransactionPath().wstring())) {
+        return false;
     }
 
     const std::string legacy =
