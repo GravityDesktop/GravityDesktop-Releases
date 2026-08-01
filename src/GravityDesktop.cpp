@@ -3186,6 +3186,7 @@ public:
             break;
         case WM_NCDESTROY:
             if (interactionWindow_ == source) {
+                DestroyDividerTooltip();
                 interactionWindow_ = nullptr;
             }
             SetWindowLongPtrW(source, GWLP_USERDATA, 0);
@@ -3680,6 +3681,7 @@ private:
             ShowWindow(
                 interactionWindow_, SW_SHOWNOACTIVATE);
         }
+        CreateDividerTooltip();
         return true;
     }
 
@@ -3891,6 +3893,7 @@ private:
     }
 
     void DestroyInteractionWindow() {
+        DestroyDividerTooltip();
         if (interactionWindow_ == nullptr) {
             return;
         }
@@ -4016,6 +4019,7 @@ private:
                 SWP_NOREDRAW);
         PresentInteractionSurface(bounds);
         interactionShapes_.clear();
+        UpdateDividerTooltipRectangle();
     }
 
     void ApplyCompanionWorkspaceFrame() {
@@ -9718,11 +9722,11 @@ private:
     D2D1_RECT_F DividerHandleRectangle(
         const D2D1_SIZE_F& client) const {
         (void)client;
-        constexpr float width = 88.0f;
-        constexpr float height = 42.0f;
+        constexpr float width = 20.0f;
+        constexpr float height = 31.0f;
         return D2D1::RectF(
-            2.0f, 2.0f,
-            2.0f + width, 2.0f + height);
+            0.0f, 0.0f,
+            width, height);
     }
 
     bool IsDividerHit(D2D1_POINT_2F point) const {
@@ -9747,24 +9751,26 @@ private:
         }
 
         const D2D1_RECT_F handle = DividerHandleRectangle(client);
-        const float bodyBottom = handle.top + 25.0f;
+        const float bodyBottom = handle.top + 22.0f;
         const D2D1_RECT_F body = D2D1::RectF(
-            handle.left, handle.top, handle.right, bodyBottom);
-        const float triangleCenterX = handle.left + 22.0f;
-        constexpr float triangleHalfWidth = 12.0f;
-        brush_->SetColor(D2D1::ColorF(0xF3F5F6,
-                                      active ? 0.82f : 0.40f));
+            handle.left + 2.0f, handle.top,
+            handle.right - 2.0f, bodyBottom);
+        const float triangleCenterX =
+            (body.left + body.right) / 2.0f;
+        constexpr float triangleHalfWidth = 5.5f;
+        brush_->SetColor(D2D1::ColorF(0x778189,
+                                      active ? 0.90f : 0.34f));
         renderTarget_->FillRoundedRectangle(
             D2D1::RoundedRect(body, 4.0f, 4.0f), brush_.Get());
-        brush_->SetColor(D2D1::ColorF(0x92999F,
-                                      active ? 0.66f : 0.30f));
+        brush_->SetColor(D2D1::ColorF(0x515A61,
+                                      active ? 0.82f : 0.32f));
         renderTarget_->DrawRoundedRectangle(
             D2D1::RoundedRect(body, 4.0f, 4.0f),
             brush_.Get(), active ? 1.0f : 0.75f);
 
-        brush_->SetColor(D2D1::ColorF(0xF3F5F6,
-                                      active ? 0.82f : 0.40f));
-        constexpr int triangleRows = 9;
+        brush_->SetColor(D2D1::ColorF(0x778189,
+                                      active ? 0.90f : 0.34f));
+        constexpr int triangleRows = 7;
         for (int row = 0; row < triangleRows; ++row) {
             const float progress = static_cast<float>(row) /
                 static_cast<float>(triangleRows - 1);
@@ -9776,8 +9782,8 @@ private:
                 D2D1::Point2F(triangleCenterX + halfWidth, y),
                 brush_.Get(), active ? 1.8f : 0.95f);
         }
-        brush_->SetColor(D2D1::ColorF(0x92999F,
-                                      active ? 0.66f : 0.30f));
+        brush_->SetColor(D2D1::ColorF(0x515A61,
+                                      active ? 0.82f : 0.32f));
         renderTarget_->DrawLine(
             D2D1::Point2F(triangleCenterX - triangleHalfWidth, bodyBottom),
             D2D1::Point2F(triangleCenterX, handle.bottom),
@@ -9786,13 +9792,6 @@ private:
             D2D1::Point2F(triangleCenterX, handle.bottom),
             D2D1::Point2F(triangleCenterX + triangleHalfWidth, bodyBottom),
             brush_.Get(), active ? 1.0f : 0.75f);
-        brush_->SetColor(D2D1::ColorF(0x3F474E,
-                                      active ? 0.92f : 0.64f));
-        constexpr wchar_t label[] = L"调整范围";
-        renderTarget_->DrawTextW(
-            label, static_cast<UINT32>(wcslen(label)),
-            bodyFormat_.Get(), body, brush_.Get(),
-            D2D1_DRAW_TEXT_OPTIONS_CLIP);
 
         if (draggingDivider_) {
             const int percent = static_cast<int>(std::round(
@@ -9846,6 +9845,7 @@ private:
 
     void BeginDividerDrag(int x, int y) {
         if (!DividerEnabled()) return;
+        HideDividerTooltip();
         UpdateCoreRatios();
         dividerDragStartRatio_ = state_.workspaceWidthRatio;
         dividerDragPointerOffsetPixels_ = std::max(0, x);
@@ -14504,6 +14504,7 @@ private:
         mouseTracking_ = false;
         if (!draggingDivider_) {
             dividerHovered_ = false;
+            HideDividerTooltip();
         }
         if (appearancePreviewColor_.has_value()) {
             appearancePreviewColor_.reset();
@@ -14616,6 +14617,9 @@ private:
         const bool dividerHovered = IsDividerHit(dip);
         if (dividerHovered_ != dividerHovered) {
             dividerHovered_ = dividerHovered;
+            if (!dividerHovered_) {
+                HideDividerTooltip();
+            }
             Invalidate();
         }
         const D2D1_POINT_2F world = ScreenToWorld(dip);
@@ -17796,6 +17800,94 @@ private:
         return true;
     }
 
+    void UpdateDividerTooltipRectangle() {
+        if (dividerTooltipWindow_ == nullptr ||
+            interactionWindow_ == nullptr) {
+            return;
+        }
+        const D2D1_RECT_F handle =
+            DividerHandleRectangle(ClientDipSize());
+        TOOLINFOW tool{};
+        tool.cbSize = TTTOOLINFOW_V1_SIZE;
+        tool.hwnd = interactionWindow_;
+        tool.uId = 1;
+        tool.rect = RECT{
+            DipToPixels(handle.left),
+            DipToPixels(handle.top),
+            DipToPixels(handle.right + 6.0f),
+            DipToPixels(handle.bottom + 6.0f)};
+        SendMessageW(
+            dividerTooltipWindow_, TTM_NEWTOOLRECTW,
+            0, reinterpret_cast<LPARAM>(&tool));
+    }
+
+    void CreateDividerTooltip() {
+        if (dividerTooltipWindow_ != nullptr ||
+            interactionWindow_ == nullptr) {
+            return;
+        }
+        INITCOMMONCONTROLSEX controls{
+            sizeof(controls), ICC_WIN95_CLASSES};
+        InitCommonControlsEx(&controls);
+        dividerTooltipWindow_ = CreateWindowExW(
+            WS_EX_TOPMOST | WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE,
+            TOOLTIPS_CLASSW, nullptr,
+            WS_POPUP | TTS_NOPREFIX | TTS_ALWAYSTIP,
+            CW_USEDEFAULT, CW_USEDEFAULT,
+            CW_USEDEFAULT, CW_USEDEFAULT,
+            interactionWindow_, nullptr,
+            GetModuleHandleW(nullptr), nullptr);
+        if (dividerTooltipWindow_ == nullptr) {
+            return;
+        }
+        TOOLINFOW tool{};
+        tool.cbSize = TTTOOLINFOW_V1_SIZE;
+        tool.uFlags = TTF_SUBCLASS;
+        tool.hwnd = interactionWindow_;
+        tool.uId = 1;
+        tool.lpszText = const_cast<LPWSTR>(
+            L"拖动调整核心桌面范围");
+        const D2D1_RECT_F handle =
+            DividerHandleRectangle(ClientDipSize());
+        tool.rect = RECT{
+            DipToPixels(handle.left),
+            DipToPixels(handle.top),
+            DipToPixels(handle.right + 6.0f),
+            DipToPixels(handle.bottom + 6.0f)};
+        SendMessageW(
+            dividerTooltipWindow_, TTM_ADDTOOLW,
+            0, reinterpret_cast<LPARAM>(&tool));
+        SendMessageW(
+            dividerTooltipWindow_, TTM_UPDATETIPTEXTW,
+            0, reinterpret_cast<LPARAM>(&tool));
+        SendMessageW(
+            dividerTooltipWindow_, TTM_SETDELAYTIME,
+            TTDT_INITIAL, MAKELPARAM(420, 0));
+        SendMessageW(
+            dividerTooltipWindow_, TTM_SETDELAYTIME,
+            TTDT_RESHOW, MAKELPARAM(80, 0));
+        SetWindowPos(
+            dividerTooltipWindow_, HWND_TOPMOST,
+            0, 0, 0, 0,
+            SWP_NOMOVE | SWP_NOSIZE |
+                SWP_NOACTIVATE | SWP_NOOWNERZORDER);
+    }
+
+    void HideDividerTooltip() {
+        if (dividerTooltipWindow_ != nullptr) {
+            SendMessageW(dividerTooltipWindow_, TTM_POP, 0, 0);
+        }
+    }
+
+    void DestroyDividerTooltip() {
+        if (dividerTooltipWindow_ == nullptr) {
+            return;
+        }
+        HWND tooltip = dividerTooltipWindow_;
+        dividerTooltipWindow_ = nullptr;
+        DestroyWindow(tooltip);
+    }
+
     void LoadState() {
         stateFile_ = StateFilePath();
         const std::optional<std::string> stateText = ReadUtf8File(stateFile_);
@@ -17989,6 +18081,7 @@ private:
 
     HWND window_ = nullptr;
     HWND interactionWindow_ = nullptr;
+    HWND dividerTooltipWindow_ = nullptr;
     HWND lifecycleWindow_ = nullptr;
     float dpi_ = 96.0f;
     std::wstring systemUiFontFamily_ = L"Segoe UI";
