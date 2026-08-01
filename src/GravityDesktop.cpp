@@ -1918,7 +1918,7 @@ bool DeserializeState(const std::string& json, WorkspaceState& state) {
                 NumberMember(*settings, "workspace_ratio",
                     NumberMember(*settings, "workspace_width_ratio",
                         NumberMember(*settings, "divider_position", 0.50)))),
-                0.30f, 0.70f);
+                0.25f, 0.80f);
             loaded.dividerPosition = loaded.workspaceWidthRatio;
             loaded.dividerVisible = BoolMember(*settings, "divider_visible", true);
             loaded.dividerStyle = std::clamp(static_cast<int>(
@@ -3192,7 +3192,7 @@ public:
                 Invalidate();
             }
             if (dividerHover) {
-                SetCursor(LoadCursorW(nullptr, IDC_SIZEWE));
+                SetCursor(LoadCursorW(nullptr, IDC_ARROW));
                 return 0;
             }
             OnMouseMove(InteractionClientXToVisual(source, x), y);
@@ -3253,7 +3253,7 @@ public:
         case WM_MOUSEACTIVATE:
             return MA_NOACTIVATE;
         case WM_SETCURSOR:
-            SetCursor(LoadCursorW(nullptr, IDC_SIZEWE));
+            SetCursor(LoadCursorW(nullptr, IDC_ARROW));
             return TRUE;
         case WM_MOUSEMOVE: {
             if (!dividerHandleMouseTracking_) {
@@ -4173,7 +4173,7 @@ private:
         const int workWidth = std::max(1L, work.right - work.left);
         const int workHeight = std::max(1L, work.bottom - work.top);
         const bool fullScreen = state_.fullScreenWorkMode;
-        const float ratio = std::clamp(state_.workspaceWidthRatio, 0.30f, 0.70f);
+        const float ratio = std::clamp(state_.workspaceWidthRatio, 0.25f, 0.80f);
         const int width = fullScreen
             ? workWidth
             : std::clamp(static_cast<int>(std::round(workWidth * ratio)),
@@ -4323,7 +4323,7 @@ private:
                       workWidth *
                       std::clamp(
                           state_.workspaceWidthRatio,
-                          0.30f, 0.70f))),
+                          0.25f, 0.80f))),
                   1, workWidth);
         const int x = state_.fullScreenWorkMode
             ? workArea.left
@@ -4386,7 +4386,7 @@ private:
             std::max(1L, work.bottom - work.top);
         const bool fullScreen = state_.fullScreenWorkMode;
         const float ratio = std::clamp(
-            state_.workspaceWidthRatio, 0.30f, 0.70f);
+            state_.workspaceWidthRatio, 0.25f, 0.80f);
         const int width = fullScreen
             ? workWidth
             : std::clamp(
@@ -4578,7 +4578,7 @@ private:
         state_.workspaceWidthRatio = std::clamp(
             static_cast<float>(bounds.right - bounds.left) /
                 static_cast<float>(workWidth),
-            0.30f, 0.70f);
+            0.25f, 0.80f);
     }
 
     LRESULT HitTestCompanionFrame(LPARAM lParam) const {
@@ -6194,7 +6194,7 @@ private:
         // v13 remains a desktop companion: the divider may alter the saved
         // right-side ratio, but this is never a free floating resize.
         const float safeWorkspaceRatio = std::clamp(
-            state_.workspaceWidthRatio, 0.30f, 0.70f);
+            state_.workspaceWidthRatio, 0.25f, 0.80f);
         if (std::abs(state_.workspaceWidthRatio - safeWorkspaceRatio) > 0.0001f) {
             state_.workspaceWidthRatio = safeWorkspaceRatio;
             changed = true;
@@ -9924,7 +9924,7 @@ private:
 
         if (draggingDivider_) {
             const int percent = static_cast<int>(std::round(
-                std::clamp(state_.workspaceWidthRatio, 0.30f, 0.70f) *
+                std::clamp(state_.workspaceWidthRatio, 0.25f, 0.80f) *
                 100.0f));
             const std::wstring hint =
                 L"核心桌面：" + std::to_wstring(percent) + L"%";
@@ -9981,7 +9981,7 @@ private:
 
     void SetWorkspaceRatio(float ratio, bool finalize) {
         if (state_.fullScreenWorkMode) return;
-        state_.workspaceWidthRatio = std::clamp(ratio, 0.30f, 0.70f);
+        state_.workspaceWidthRatio = std::clamp(ratio, 0.25f, 0.80f);
         state_.dividerPosition = state_.workspaceWidthRatio;
         ApplyCompanionWorkspaceFrame();
         if (finalize) {
@@ -14695,7 +14695,7 @@ private:
         ScreenToClient(source, &cursor);
         if (source == interactionWindow_) {
             if (IsDividerInteractionPoint(source, cursor.x, cursor.y)) {
-                SetCursor(LoadCursorW(nullptr, IDC_SIZEWE));
+                SetCursor(LoadCursorW(nullptr, IDC_ARROW));
                 return;
             }
             cursor.x = InteractionClientXToVisual(source, cursor.x);
@@ -14725,7 +14725,7 @@ private:
         if (corePlacementMode_) {
             SetCursor(LoadCursorW(nullptr, IDC_CROSS));
         } else if (draggingDivider_) {
-            SetCursor(LoadCursorW(nullptr, IDC_SIZEWE));
+            SetCursor(LoadCursorW(nullptr, IDC_ARROW));
         } else {
             SetCursor(LoadCursorW(
                 nullptr,
@@ -18101,8 +18101,11 @@ private:
         const int top = std::max(1, DipToPixels(5.0f));
         const int lineHeight = std::max(2, DipToPixels(3.0f));
         const int gap = std::max(2, DipToPixels(3.0f));
-        const std::array<float, 7> widths{
-            98.0f, 82.0f, 66.0f, 50.0f, 34.0f, 18.0f, 3.0f};
+        // The final bar becomes the base of a solid, obtuse tip.  This keeps
+        // the marker centered on the divider while making its endpoint read
+        // as an actual inverted triangle instead of a tiny horizontal line.
+        const std::array<float, 6> widths{
+            98.0f, 82.0f, 66.0f, 50.0f, 34.0f, 18.0f};
         const COLORREF lineColor = RGB(73, 82, 88);
         HBRUSH lineBrush = CreateSolidBrush(lineColor);
         HPEN noOutline = CreatePen(PS_NULL, 1, lineColor);
@@ -18117,6 +18120,28 @@ private:
                       y + lineHeight,
                       lineHeight, lineHeight);
         }
+        const int tipBaseY = top + static_cast<int>(widths.size() - 1) *
+            (lineHeight + gap) + lineHeight - 1;
+        const int tipHalfWidth = std::max(2, DipToPixels(9.0f));
+        const int tipY = std::min(
+            static_cast<int>(client.bottom) - 1,
+            tipBaseY + std::max(1, DipToPixels(8.0f)));
+        const POINT tip[] = {
+            {centerX - tipHalfWidth, tipBaseY},
+            {centerX + tipHalfWidth, tipBaseY},
+            {centerX, tipY},
+        };
+        const int tipLineWidth = std::max(2, DipToPixels(widths.back()));
+        const int tipLineY = tipBaseY - lineHeight + 1;
+        HBRUSH tipBrush = CreateSolidBrush(RGB(20, 20, 20));
+        HGDIOBJ oldTipBrush = SelectObject(dc, tipBrush);
+        RoundRect(dc, centerX - tipLineWidth / 2, tipLineY,
+                  centerX - tipLineWidth / 2 + tipLineWidth,
+                  tipLineY + lineHeight,
+                  lineHeight, lineHeight);
+        Polygon(dc, tip, static_cast<int>(std::size(tip)));
+        SelectObject(dc, oldTipBrush);
+        DeleteObject(tipBrush);
         SelectObject(dc, oldPen);
         SelectObject(dc, oldBrush);
         DeleteObject(noOutline);
