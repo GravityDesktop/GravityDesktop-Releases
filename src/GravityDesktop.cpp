@@ -9748,7 +9748,6 @@ private:
 
         const D2D1_RECT_F handle = DividerHandleRectangle(client);
         const float bodyBottom = handle.bottom - 12.0f;
-        const float triangleCenterX = handle.left + 12.0f;
         const D2D1_RECT_F body = D2D1::RectF(
             handle.left, handle.top, handle.right, bodyBottom + 3.0f);
         brush_->SetColor(D2D1::ColorF(0x53616B,
@@ -9765,16 +9764,20 @@ private:
         brush_->SetColor(D2D1::ColorF(0x53616B,
                                       active ? 0.72f : 0.28f));
         constexpr int triangleRows = 7;
-        constexpr float triangleHalfWidth = 10.0f;
+        constexpr float triangleTipX = 0.75f;
+        constexpr float triangleBaseRight = 30.0f;
         for (int row = 0; row < triangleRows; ++row) {
             const float progress = static_cast<float>(row) /
                 static_cast<float>(triangleRows - 1);
             const float y = bodyBottom +
                 (handle.bottom - bodyBottom) * progress;
-            const float halfWidth = triangleHalfWidth * progress;
+            const float left = handle.left +
+                (triangleTipX - handle.left) * progress;
+            const float right = triangleBaseRight +
+                (triangleTipX - triangleBaseRight) * progress;
             renderTarget_->DrawLine(
-                D2D1::Point2F(triangleCenterX - halfWidth, y),
-                D2D1::Point2F(triangleCenterX + halfWidth, y),
+                D2D1::Point2F(left, y),
+                D2D1::Point2F(right, y),
                 brush_.Get(), active ? 1.6f : 0.85f);
         }
         brush_->SetColor(D2D1::ColorF(0xF0F4F6,
