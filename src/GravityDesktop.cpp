@@ -5115,6 +5115,15 @@ private:
             44.0f, metrics_.labelWidth);
     }
 
+    float FileLabelInteractionWidth(const FileItem& item) const {
+        const float minimum = TierIconPixels(item.sizeTier) + 6.0f;
+        const float maximum = std::max(
+            minimum,
+            std::min(metrics_.labelWidth, 80.0f));
+        return std::clamp(
+            EstimatedShortTitleWidth(item), minimum, maximum);
+    }
+
     float NodePitchForCore(const Core& core) const {
         float titleWidth = 44.0f;
         bool usesTwoLines = false;
@@ -5305,8 +5314,7 @@ private:
     }
 
     float ItemHitHalfSize(const Core& core, const FileItem& item) const {
-        return TierContainerPixels(item.sizeTier) *
-               ItemVisualScale(core, item) / 2.0f;
+        return ItemIconSize(core, item) / 2.0f;
     }
 
     float ScreenItemIconSize(const Core& core, const FileItem& item) const {
@@ -7389,6 +7397,20 @@ private:
         rectangle.right += visual.x - base.x;
         rectangle.top += visual.y - base.y;
         rectangle.bottom += visual.y - base.y;
+        // Keep the caption visually attached to the icon. The stable layout
+        // footprint remains unchanged, so this presentation-only lift cannot
+        // trigger collision resolution or move any node.
+        rectangle.top -= 5.0f;
+        rectangle.bottom -= 5.0f;
+        return rectangle;
+    }
+
+    D2D1_RECT_F FileLabelInteractionRectangle(
+        const FileItem& item, D2D1_RECT_F rectangle) const {
+        const float center = (rectangle.left + rectangle.right) / 2.0f;
+        const float halfWidth = FileLabelInteractionWidth(item) / 2.0f;
+        rectangle.left = center - halfWidth;
+        rectangle.right = center + halfWidth;
         return rectangle;
     }
 
@@ -7570,15 +7592,18 @@ private:
                                 position.y - half,
                                 position.x + half,
                                 position.y + half),
-                            5.0f);
+                            4.0f);
                         if (entry.showLabel) {
+                            const D2D1_RECT_F label =
+                                FileLabelInteractionRectangle(
+                                    *entry.item,
+                                    useStableExpansionTargets
+                                        ? entry.labelRect
+                                        : VisualLabelRectangle(
+                                              core, entry));
                             AddInteractionShape(
                                 shapes,
-                                useStableExpansionTargets
-                                    ? entry.labelRect
-                                    : VisualLabelRectangle(
-                                          core, entry),
-                                5.0f);
+                                label, 2.0f);
                         }
                     }
                 }
@@ -10109,18 +10134,27 @@ private:
             const float lineHeight =
                 std::ceil(metrics_.fileFontSize * 1.35f) *
                 screenCompensation;
+            const float compactPadding = 2.0f * screenCompensation;
             const float selectionHalfWidth =
-                std::max(containerHalf + 5.0f,
-                         metrics_.labelWidth *
-                                 screenCompensation /
-                                 2.0f +
-                             3.0f);
+                std::max(
+                    containerHalf + compactPadding,
+                    FileLabelInteractionWidth(item) *
+                            screenCompensation / 2.0f +
+                        compactPadding);
+            const float stableContainerHalf =
+                TierContainerPixels(item.sizeTier) *
+                screenCompensation / 2.0f;
+            const float labelTop =
+                position.y + stableContainerHalf -
+                2.0f * screenCompensation;
+            const float labelBottom =
+                labelTop + lineHeight * 2.0f +
+                6.0f * screenCompensation;
             const D2D1_RECT_F selectionBounds = D2D1::RectF(
                 position.x - selectionHalfWidth,
-                position.y - containerHalf - 5.0f,
+                position.y - containerHalf - compactPadding,
                 position.x + selectionHalfWidth,
-                position.y + containerHalf + 8.0f +
-                    lineHeight * 2.0f + 7.0f);
+                labelBottom + compactPadding);
             brush_->SetColor(D2D1::ColorF(
                 accent,
                 dragging || externalDropTarget
@@ -11518,19 +11552,19 @@ private:
                     ItemHitHalfSize(
                         core, *itemIterator->item) *
                         state_.zoom +
-                    5.0f;
+                    4.0f;
                 const bool iconHit =
                     std::abs(screen.x - position.x) <=
                         hitHalf &&
                     std::abs(screen.y - position.y) <=
                         hitHalf;
                 D2D1_RECT_F label =
-                    VisualLabelRectangle(
-                        core, *itemIterator);
-                label.left -= 5.0f;
-                label.top -= 5.0f;
-                label.right += 5.0f;
-                label.bottom += 5.0f;
+                    FileLabelInteractionRectangle(
+                        *itemIterator->item,
+                        VisualLabelRectangle(
+                            core, *itemIterator));
+                label.top -= 2.0f;
+                label.bottom += 2.0f;
                 const bool labelHit =
                     itemIterator->showLabel &&
                     PointInside(screen, label);
