@@ -15933,6 +15933,81 @@ private:
         managedCollectionSessionLibraryPath_.clear();
     }
 
+    bool RemoveSafeArchivedReferencesFromCandidate(
+        WorkspaceState& candidate,
+        const std::wstring& sourcePath) const {
+        std::unordered_set<std::uint64_t> removedIds;
+        for (const Core& core : candidate.cores) {
+            if (!core.archived) {
+                continue;
+            }
+            for (const FileItem& item : core.files) {
+                if (PathEquals(item.path, sourcePath)) {
+                    removedIds.insert(item.id);
+                }
+            }
+        }
+        if (removedIds.empty()) {
+            return false;
+        }
+
+        // Do not silently rewrite an archived relationship tree.  A plain
+        // archived reference is safe to retire when the file is collected;
+        // any parent, child, root, or current-version role is left intact.
+        for (const Core& core : candidate.cores) {
+            for (const FileItem& item : core.files) {
+                if (!removedIds.contains(item.id) &&
+                    removedIds.contains(item.parentFileId)) {
+                    return false;
+                }
+            }
+        }
+        for (const FileFamily& family : candidate.families) {
+            if (removedIds.contains(family.rootFileId) ||
+                removedIds.contains(family.currentFileId)) {
+                return false;
+            }
+        }
+
+        WorkspaceState cleaned = candidate;
+        for (Core& core : cleaned.cores) {
+            if (!core.archived) {
+                continue;
+            }
+            core.files.erase(
+                std::remove_if(
+                    core.files.begin(), core.files.end(),
+                    [&removedIds](const FileItem& item) {
+                        return removedIds.contains(item.id);
+                    }),
+                core.files.end());
+            core.savedBaselineLayout.erase(
+                std::remove_if(
+                    core.savedBaselineLayout.begin(),
+                    core.savedBaselineLayout.end(),
+                    [&removedIds](
+                        const CoreBaselineFileLayout& layout) {
+                        return removedIds.contains(layout.fileId);
+                    }),
+                core.savedBaselineLayout.end());
+        }
+        for (FileFamily& family : cleaned.families) {
+            family.snapshots.erase(
+                std::remove_if(
+                    family.snapshots.begin(), family.snapshots.end(),
+                    [&removedIds](
+                        const FileFamilyMemberSnapshot& snapshot) {
+                        return removedIds.contains(snapshot.fileId);
+                    }),
+                family.snapshots.end());
+        }
+        if (!ValidateRelationState(cleaned).IsValid()) {
+            return false;
+        }
+        candidate = std::move(cleaned);
+        return true;
+    }
+
     bool StoreDesktopFileInCore(
         const std::wstring& sourcePath,
         std::uint64_t targetCoreId,
@@ -15954,8 +16029,23 @@ private:
             return false;
         }
         Core* existingOwner = nullptr;
-        if (FileItem* existing = FindItemByPath(sourcePath, &existingOwner);
-            existing != nullptr) {
+        FileItem* existing = nullptr;
+        for (Core& core : state_.cores) {
+            if (core.archived) {
+                continue;
+            }
+            const auto found = std::find_if(
+                core.files.begin(), core.files.end(),
+                [&sourcePath](const FileItem& item) {
+                    return PathEquals(item.path, sourcePath);
+                });
+            if (found != core.files.end()) {
+                existingOwner = &core;
+                existing = &*found;
+                break;
+            }
+        }
+        if (existing != nullptr) {
             SetStatus(existingOwner != nullptr && existingOwner->id != targetCoreId
                 ? L"该文件已经属于其他核心；未自动跨核心移动"
                 : L"该文件已经存在于当前核心；未创建重复入口");
@@ -16120,6 +16210,11 @@ private:
                 LayoutTemplate::HighCapacityDouble;
         }
         RefreshAutomaticCoreIdentity(*candidateCore);
+        // Archived cores are not active owners.  Retire a matching plain
+        // archived reference in the same atomic state write when possible,
+        // so it cannot reappear later as a stale missing entry.
+        (void)RemoveSafeArchivedReferencesFromCandidate(
+            candidate, sourcePath);
         const RelationValidationResult validation =
             ValidateRelationState(candidate);
         if (!validation.IsValid() || !WriteUtf8Atomic(
@@ -19824,6 +19919,50 @@ bool RunSelfTest() {
     managedCollectionSessionApp.SetStatus(L"普通状态");
     if (managedCollectionSessionApp.
             managedCollectionUndoStatusAvailable_) {
+        return false;
+    }
+
+    WorkspaceState archivedReferenceCandidate;
+    Core archivedReferenceCore;
+    archivedReferenceCore.id = 810;
+    archivedReferenceCore.archived = true;
+    FileItem archivedReference;
+    archivedReference.id = 811;
+    archivedReference.path = L"C:\\GravityDesktopSelfTest\\archived.txt";
+    archivedReferenceCore.files.push_back(archivedReference);
+    archivedReferenceCandidate.cores.push_back(
+        std::move(archivedReferenceCore));
+    Core activeReferenceCore;
+    activeReferenceCore.id = 812;
+    archivedReferenceCandidate.cores.push_back(
+        std::move(activeReferenceCore));
+    if (!managedCollectionSessionApp.
+            RemoveSafeArchivedReferencesFromCandidate(
+                archivedReferenceCandidate,
+                L"C:\\GravityDesktopSelfTest\\archived.txt") ||
+        !archivedReferenceCandidate.cores.front().files.empty()) {
+        return false;
+    }
+    WorkspaceState protectedArchivedCandidate;
+    Core protectedArchivedCore;
+    protectedArchivedCore.id = 813;
+    protectedArchivedCore.archived = true;
+    FileItem protectedArchivedReference;
+    protectedArchivedReference.id = 814;
+    protectedArchivedReference.path =
+        L"C:\\GravityDesktopSelfTest\\relationship.txt";
+    FileItem protectedArchivedChild;
+    protectedArchivedChild.id = 815;
+    protectedArchivedChild.parentFileId = protectedArchivedReference.id;
+    protectedArchivedCore.files.push_back(protectedArchivedReference);
+    protectedArchivedCore.files.push_back(protectedArchivedChild);
+    protectedArchivedCandidate.cores.push_back(
+        std::move(protectedArchivedCore));
+    if (managedCollectionSessionApp.
+            RemoveSafeArchivedReferencesFromCandidate(
+                protectedArchivedCandidate,
+                L"C:\\GravityDesktopSelfTest\\relationship.txt") ||
+        protectedArchivedCandidate.cores.front().files.size() != 2) {
         return false;
     }
 
