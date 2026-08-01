@@ -7814,10 +7814,8 @@ private:
             if (DividerEnabled()) {
                 AddInteractionShape(
                     shapes,
-                    D2D1::RectF(
-                        0.0f, 0.0f, 12.0f,
-                        client.height),
-                    0.0f);
+                    DividerHandleRectangle(client),
+                    6.0f);
             }
             if (CoreDistanceSliderOpen()) {
                 AddInteractionShape(
@@ -9717,22 +9715,79 @@ private:
                !state_.workspaceCollapsed;
     }
 
+    D2D1_RECT_F DividerHandleRectangle(
+        const D2D1_SIZE_F& client) const {
+        constexpr float width = 34.0f;
+        constexpr float height = 22.0f;
+        const float centerY = std::clamp(
+            client.height * 0.46f,
+            height * 0.5f + 8.0f,
+            std::max(height * 0.5f + 8.0f,
+                     client.height - height * 0.5f - 8.0f));
+        return D2D1::RectF(
+            2.0f, centerY - height * 0.5f,
+            2.0f + width, centerY + height * 0.5f);
+    }
+
     bool IsDividerHit(D2D1_POINT_2F point) const {
-        return DividerEnabled() && point.x >= 0.0f && point.x <= 12.0f;
+        if (!DividerEnabled()) return false;
+        const D2D1_RECT_F handle = DividerHandleRectangle(ClientDipSize());
+        constexpr float hitPadding = 6.0f;
+        return point.x >= handle.left - hitPadding &&
+               point.x <= handle.right + hitPadding &&
+               point.y >= handle.top - hitPadding &&
+               point.y <= handle.bottom + hitPadding;
     }
 
     void DrawWorkspaceDivider(const D2D1_SIZE_F& client) {
         if (!DividerEnabled()) return;
         const bool active = dividerHovered_ || draggingDivider_;
-        brush_->SetColor(D2D1::ColorF(active ? 0x53616B : 0x858C91,
-                                      active ? 0.92f : 0.58f));
+        brush_->SetColor(D2D1::ColorF(0x59636B,
+                                      active ? 0.38f : 0.20f));
         renderTarget_->DrawLine(D2D1::Point2F(0.75f, 0.0f),
                                 D2D1::Point2F(0.75f, client.height),
-                                brush_.Get(), active ? 2.0f : 1.25f);
+                                brush_.Get(), active ? 1.5f : 1.0f);
+
+        const D2D1_RECT_F handle = DividerHandleRectangle(client);
+        brush_->SetColor(D2D1::ColorF(0x53616B,
+                                      active ? 0.72f : 0.28f));
+        renderTarget_->FillRoundedRectangle(
+            D2D1::RoundedRect(handle, 7.0f, 7.0f), brush_.Get());
         if (active) {
-            brush_->SetColor(D2D1::ColorF(0xA9B0B4, 0.30f));
-            renderTarget_->FillRectangle(D2D1::RectF(0.0f, 0.0f, 4.0f, client.height),
-                                         brush_.Get());
+            brush_->SetColor(D2D1::ColorF(0xE8EEF1, 0.78f));
+            renderTarget_->DrawRoundedRectangle(
+                D2D1::RoundedRect(handle, 7.0f, 7.0f),
+                brush_.Get(), 1.0f);
+        }
+        brush_->SetColor(D2D1::ColorF(0xF0F4F6,
+                                      active ? 0.90f : 0.52f));
+        constexpr wchar_t glyph[] = L"↔";
+        renderTarget_->DrawTextW(
+            glyph, 1, bodyFormat_.Get(), handle, brush_.Get(),
+            D2D1_DRAW_TEXT_OPTIONS_CLIP);
+
+        if (active) {
+            const int percent = static_cast<int>(std::round(
+                std::clamp(state_.workspaceWidthRatio, 0.30f, 0.70f) *
+                100.0f));
+            const std::wstring hint = draggingDivider_
+                ? L"核心桌面：" + std::to_wstring(percent) + L"%"
+                : L"拖动调整核心桌面范围";
+            const float hintWidth = draggingDivider_ ? 124.0f : 178.0f;
+            const D2D1_RECT_F hintRect = D2D1::RectF(
+                handle.right + 8.0f,
+                handle.top - 2.0f,
+                std::min(client.width - 4.0f,
+                         handle.right + 8.0f + hintWidth),
+                handle.bottom + 2.0f);
+            brush_->SetColor(D2D1::ColorF(0x172846, 0.74f));
+            renderTarget_->FillRoundedRectangle(
+                D2D1::RoundedRect(hintRect, 6.0f, 6.0f), brush_.Get());
+            brush_->SetColor(D2D1::ColorF(0xE8EEF1, 0.94f));
+            renderTarget_->DrawTextW(
+                hint.c_str(), static_cast<UINT32>(hint.size()),
+                hudFormat_.Get(), hintRect, brush_.Get(),
+                D2D1_DRAW_TEXT_OPTIONS_CLIP);
         }
     }
 
@@ -9742,9 +9797,10 @@ private:
         state_.dividerPosition = state_.workspaceWidthRatio;
         ApplyCompanionWorkspaceFrame();
         if (finalize) {
-            ApplyCoreRatiosToWorkspace();
-            RefreshResponsiveMetrics(true);
-            layoutDirty_ = true;
+            // Resizing the companion boundary is not a layout command. Keep
+            // every core and file at its current world position; only refresh
+            // the saved ratios used for a later restart or monitor change.
+            UpdateCoreRatios();
             ScheduleSave();
         }
         Invalidate();
@@ -9764,18 +9820,36 @@ private:
     void BeginDividerDrag(int x, int y) {
         if (!DividerEnabled()) return;
         UpdateCoreRatios();
+        dividerDragStartRatio_ = state_.workspaceWidthRatio;
+        dividerDragPointerOffsetPixels_ = std::max(0, x);
         draggingDivider_ = true;
         dividerHovered_ = true;
         SetCapture(window_);
-        UpdateWorkspaceRatioFromScreenPoint(x, y);
+        UpdateWorkspaceRatioFromScreenPoint(
+            x - dividerDragPointerOffsetPixels_, y);
+    }
+
+    void CancelDividerDrag() {
+        if (!draggingDivider_) return;
+        const float restoreRatio = dividerDragStartRatio_;
+        draggingDivider_ = false;
+        dividerHovered_ = false;
+        if (GetCapture() == window_) {
+            ReleaseCapture();
+        }
+        SetWorkspaceRatio(restoreRatio, false);
+        dividerDragPointerOffsetPixels_ = 0;
+        SetStatus(L"已取消分界线调整");
+        Invalidate();
     }
 
     void EndDividerDrag() {
         if (!draggingDivider_) return;
-        draggingDivider_ = false;
-        dividerHovered_ = false;
         if (GetCapture() == window_) ReleaseCapture();
         SetWorkspaceRatio(state_.workspaceWidthRatio, true);
+        draggingDivider_ = false;
+        dividerHovered_ = false;
+        dividerDragPointerOffsetPixels_ = 0;
         SetStatus(L"右侧工作区宽度已保存");
     }
 
@@ -14059,7 +14133,8 @@ private:
             return;
         }
         if (draggingDivider_) {
-            UpdateWorkspaceRatioFromScreenPoint(x, y);
+            UpdateWorkspaceRatioFromScreenPoint(
+                x - dividerDragPointerOffsetPixels_, y);
             EndDividerDrag();
             return;
         }
@@ -14343,6 +14418,7 @@ private:
             }
         }
         if (IsDividerHit(dip)) {
+            PushUndo(state_);
             SetWorkspaceRatio(0.50f, true);
             SetStatus(L"右侧工作区已恢复默认 50% 宽度");
             return;
@@ -14506,7 +14582,8 @@ private:
             return;
         }
         if (draggingDivider_) {
-            UpdateWorkspaceRatioFromScreenPoint(x, y);
+            UpdateWorkspaceRatioFromScreenPoint(
+                x - dividerDragPointerOffsetPixels_, y);
             return;
         }
         const bool dividerHovered = IsDividerHit(dip);
@@ -14607,8 +14684,11 @@ private:
         if (draggingCoreDistanceSlider_) {
             EndCoreDistanceSliderDrag(false);
         }
-        draggingDivider_ = false;
-        dividerHovered_ = false;
+        if (draggingDivider_) {
+            CancelDividerDrag();
+        } else {
+            dividerHovered_ = false;
+        }
         panning_ = false;
         draggingCore_ = false;
         draggingItem_ = false;
@@ -15227,6 +15307,10 @@ private:
                 }
                 return;
             }
+        }
+        if (key == VK_ESCAPE && draggingDivider_) {
+            CancelDividerDrag();
+            return;
         }
         if (tutorialActive_) {
             if (key == VK_ESCAPE) {
@@ -17998,6 +18082,8 @@ private:
     std::uint64_t dragCoreId_ = 0;
     std::uint64_t dragItemId_ = 0;
     std::uint64_t dragTargetCoreId_ = 0;
+    float dividerDragStartRatio_ = 0.50f;
+    int dividerDragPointerOffsetPixels_ = 0;
     std::uint64_t externalDropCoreId_ = 0;
     std::uint64_t externalDropItemId_ = 0;
     std::uint64_t relationTargetItemId_ = 0;
