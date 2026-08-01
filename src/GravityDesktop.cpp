@@ -9778,10 +9778,39 @@ private:
                                 brush_.Get(), active ? 1.5f : 0.8f);
         brush_->SetColor(D2D1::ColorF(0xF0F4F6,
                                       active ? 0.90f : 0.52f));
-        constexpr wchar_t glyph[] = L"↔";
-        renderTarget_->DrawTextW(
-            glyph, 1, bodyFormat_.Get(), body, brush_.Get(),
-            D2D1_DRAW_TEXT_OPTIONS_CLIP);
+        const float iconY = (body.top + body.bottom) * 0.5f;
+        const float iconLeft = centerX - 8.0f;
+        const float iconRight = centerX + 8.0f;
+        const float iconArm = 4.0f;
+        const float iconStroke = active ? 1.7f : 1.1f;
+        renderTarget_->DrawLine(
+            D2D1::Point2F(iconLeft, iconY),
+            D2D1::Point2F(iconLeft + iconArm, iconY - iconArm),
+            brush_.Get(), iconStroke);
+        renderTarget_->DrawLine(
+            D2D1::Point2F(iconLeft, iconY),
+            D2D1::Point2F(iconLeft + iconArm, iconY + iconArm),
+            brush_.Get(), iconStroke);
+        renderTarget_->DrawLine(
+            D2D1::Point2F(iconLeft + iconArm, iconY),
+            D2D1::Point2F(iconRight - iconArm, iconY),
+            brush_.Get(), iconStroke);
+        renderTarget_->DrawLine(
+            D2D1::Point2F(iconRight, iconY),
+            D2D1::Point2F(iconRight - iconArm, iconY - iconArm),
+            brush_.Get(), iconStroke);
+        renderTarget_->DrawLine(
+            D2D1::Point2F(iconRight, iconY),
+            D2D1::Point2F(iconRight - iconArm, iconY + iconArm),
+            brush_.Get(), iconStroke);
+        renderTarget_->DrawLine(
+            D2D1::Point2F(centerX - 1.5f, iconY - 4.0f),
+            D2D1::Point2F(centerX - 1.5f, iconY + 4.0f),
+            brush_.Get(), iconStroke);
+        renderTarget_->DrawLine(
+            D2D1::Point2F(centerX + 1.5f, iconY - 4.0f),
+            D2D1::Point2F(centerX + 1.5f, iconY + 4.0f),
+            brush_.Get(), iconStroke);
 
         if (active) {
             const int percent = static_cast<int>(std::round(
@@ -9862,11 +9891,11 @@ private:
 
     void EndDividerDrag() {
         if (!draggingDivider_) return;
-        if (GetCapture() == window_) ReleaseCapture();
         SetWorkspaceRatio(state_.workspaceWidthRatio, true);
         draggingDivider_ = false;
         dividerHovered_ = false;
         dividerDragPointerOffsetPixels_ = 0;
+        if (GetCapture() == window_) ReleaseCapture();
         SetStatus(L"右侧工作区宽度已保存");
     }
 
