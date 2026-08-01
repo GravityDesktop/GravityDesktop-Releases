@@ -3183,6 +3183,7 @@ public:
         case WM_MOUSEMOVE: {
             const int x = GET_X_LPARAM(lParam);
             const int y = GET_Y_LPARAM(lParam);
+            EnsurePointerLeaveTracking(source);
             const bool dividerHover =
                 IsDividerInteractionPoint(source, x, y);
             if (!draggingDivider_ && dividerHovered_ != dividerHover) {
@@ -14674,11 +14675,24 @@ private:
         }
     }
 
+    void EnsurePointerLeaveTracking(HWND source) {
+        if (mouseTracking_ || source == nullptr) return;
+        TRACKMOUSEEVENT tracking{
+            sizeof(tracking), TME_LEAVE, source, 0};
+        if (TrackMouseEvent(&tracking) != FALSE) {
+            mouseTracking_ = true;
+        }
+    }
+
     void OnPointerLeave() {
         mouseTracking_ = false;
         if (!draggingDivider_) {
+            const bool wasDividerHovered = dividerHovered_;
             dividerHovered_ = false;
             HideDividerTooltip();
+            if (wasDividerHovered) {
+                UpdateDividerHandleVisual();
+            }
         }
         if (appearancePreviewColor_.has_value()) {
             appearancePreviewColor_.reset();
@@ -14737,16 +14751,8 @@ private:
     }
 
     void OnMouseMove(int x, int y) {
-        if (!mouseTracking_) {
-            TRACKMOUSEEVENT tracking{
-                sizeof(tracking), TME_LEAVE,
-                interactionWindow_ != nullptr
-                    ? interactionWindow_
-                    : window_,
-                0};
-            TrackMouseEvent(&tracking);
-            mouseTracking_ = true;
-        }
+        EnsurePointerLeaveTracking(
+            interactionWindow_ != nullptr ? interactionWindow_ : window_);
 
         const D2D1_POINT_2F dip = PixelToDip(x, y);
         if (corePlacementMode_) {
@@ -18013,7 +18019,7 @@ private:
             return;
         }
         const BYTE alpha = (dividerHovered_ || draggingDivider_)
-            ? 238 : 92;
+            ? 255 : 92;
         SetLayeredWindowAttributes(
             dividerHandleWindow_, RGB(255, 0, 255), alpha,
             LWA_COLORKEY | LWA_ALPHA);
@@ -18106,7 +18112,10 @@ private:
         // horizontal stroke.  No rounded bar is overlaid on that triangle.
         const std::array<float, 5> widths{
             98.0f, 82.0f, 66.0f, 50.0f, 34.0f};
-        const COLORREF lineColor = RGB(73, 82, 88);
+        const bool active = dividerHovered_ || draggingDivider_;
+        const COLORREF lineColor = active
+            ? RGB(0, 0, 0)
+            : RGB(73, 82, 88);
         HBRUSH lineBrush = CreateSolidBrush(lineColor);
         HPEN noOutline = CreatePen(PS_NULL, 1, lineColor);
         HGDIOBJ oldBrush = SelectObject(dc, lineBrush);
@@ -18131,7 +18140,7 @@ private:
             {centerX + tipHalfWidth, tipBaseY},
             {centerX, tipY},
         };
-        HBRUSH tipBrush = CreateSolidBrush(RGB(20, 20, 20));
+        HBRUSH tipBrush = CreateSolidBrush(RGB(0, 0, 0));
         HGDIOBJ oldTipBrush = SelectObject(dc, tipBrush);
         Polygon(dc, tip, static_cast<int>(std::size(tip)));
         SelectObject(dc, oldTipBrush);
