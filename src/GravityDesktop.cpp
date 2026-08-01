@@ -19339,7 +19339,8 @@ bool RunSelfTest() {
     }
     const D2D1_POINT_2F previewCoreScreen =
         externalRelationApp.WorldToScreen(
-            previewCore->position);
+            externalRelationApp.VisualCorePosition(
+                *previewCore));
     const POINTL previewCorePoint{
         static_cast<LONG>(std::round(
             previewCoreScreen.x)),
