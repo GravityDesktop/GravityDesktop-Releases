@@ -18332,9 +18332,10 @@ private:
                 ? interactionWindow_
                 : window_;
         editWindow_ = CreateWindowExW(
-            WS_EX_TOOLWINDOW | WS_EX_CLIENTEDGE,
+            WS_EX_TOOLWINDOW,
             L"EDIT", initialValue.c_str(),
-            WS_POPUP | WS_VISIBLE | ES_AUTOHSCROLL | ES_CENTER,
+            WS_POPUP | WS_BORDER | WS_VISIBLE |
+                ES_AUTOHSCROLL | ES_CENTER,
             0, 0, 180, 28, editOwner,
             nullptr, GetModuleHandleW(nullptr), nullptr);
         if (editWindow_ == nullptr) {
