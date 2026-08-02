@@ -77,5 +77,8 @@
   <ItemGroup>
     <ClCompile Include="src\GravityDesktop.cpp" />
   </ItemGroup>
+  <ItemGroup>
+    <ResourceCompile Include="src\GravityDesktop.rc" />
+  </ItemGroup>
   <Import Project="$(VCTargetsPath)\Microsoft.Cpp.targets" />
 </Project>
