@@ -18422,7 +18422,7 @@ private:
             ClientToScreen(window_, &origin);
         }
         const int left = origin.x +
-            static_cast<int>((center - 95.0f) * scale);
+            static_cast<int>((center - editingWidthDip_ * 0.5f) * scale);
         const int top = origin.y +
             static_cast<int>((label.top - 2.0f) * scale);
         SetWindowPos(editWindow_, HWND_TOP, left, top, width, height, SWP_NOACTIVATE);
