@@ -4501,6 +4501,7 @@ private:
             editingItemId_ = 0;
             editingRenameTarget_ = RenameTargetKind::Core;
             editingPreservedExtension_.clear();
+            editingWidthDip_ = 96.0f;
             coreShortLabelEditWindow_ = nullptr;
             oldCoreShortLabelEditProc_ = nullptr;
             coreShortLabelEditingCoreId_ = 0;
@@ -18283,6 +18284,7 @@ private:
         editingItemId_ = 0;
         editingRenameTarget_ = RenameTargetKind::Core;
         editingPreservedExtension_.clear();
+        editingWidthDip_ = RenameEditorWidth(core->name);
         CreateRenameEditWindow(core->name);
     }
 
@@ -18308,7 +18310,20 @@ private:
             : item->displayName.empty()
                 ? MakeDisplayName(item->path, item->isDirectory)
                 : item->displayName;
+        editingWidthDip_ = RenameEditorWidth(initial);
         CreateRenameEditWindow(initial);
+    }
+
+    float RenameEditorWidth(const std::wstring& value) const {
+        float units = 0.0f;
+        for (const wchar_t character : value) {
+            units += character >= 0x2E80 ? 1.0f
+                                         : (std::iswspace(character) ? 0.35f
+                                                                      : 0.58f);
+        }
+        return std::clamp(
+            units * metrics_.fileFontSize + 18.0f,
+            72.0f, 148.0f);
     }
 
     void CreateRenameEditWindow(const std::wstring& initialValue) {
@@ -18327,6 +18342,7 @@ private:
             editingItemId_ = 0;
             editingRenameTarget_ = RenameTargetKind::Core;
             editingPreservedExtension_.clear();
+            editingWidthDip_ = 96.0f;
             return;
         }
         SendMessageW(editWindow_, WM_SETFONT,
@@ -18374,7 +18390,7 @@ private:
                 *entry->item, VisualLabelRectangle(*core, *entry));
         }
         const float scale = dpi_ / 96.0f;
-        const int width = static_cast<int>(190.0f * scale);
+        const int width = static_cast<int>(editingWidthDip_ * scale);
         const int height = static_cast<int>(29.0f * scale);
         const float center = (label.left + label.right) * 0.5f;
         POINT origin{0, 0};
@@ -18401,6 +18417,7 @@ private:
         editingItemId_ = 0;
         editingRenameTarget_ = RenameTargetKind::Core;
         editingPreservedExtension_.clear();
+        editingWidthDip_ = 96.0f;
         std::wstring value;
         if (commit) {
             const int length = GetWindowTextLengthW(edit);
@@ -20059,6 +20076,7 @@ private:
     std::uint64_t editingItemId_ = 0;
     RenameTargetKind editingRenameTarget_ = RenameTargetKind::Core;
     std::wstring editingPreservedExtension_;
+    float editingWidthDip_ = 96.0f;
     HWND coreShortLabelEditWindow_ = nullptr;
     WNDPROC oldCoreShortLabelEditProc_ = nullptr;
     std::uint64_t coreShortLabelEditingCoreId_ = 0;
