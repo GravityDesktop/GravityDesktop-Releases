@@ -10778,22 +10778,45 @@ private:
                 position.y - iconSize / 2.0f - compactPadding,
                 position.x + selectionHalfWidth,
                 labelBottom + compactPadding);
-            brush_->SetColor(D2D1::ColorF(
-                accent,
-                dragging || externalDropTarget
-                    ? 0.24f
-                    : (selected ? 0.18f : 0.085f)));
-            renderTarget_->FillRoundedRectangle(
-                D2D1::RoundedRect(selectionBounds, 4.0f, 4.0f),
-                brush_.Get());
-            if (selected || dragging || externalDropTarget) {
-                brush_->SetColor(D2D1::ColorF(
-                    accent,
-                    dragging || externalDropTarget ? 0.74f : 0.48f));
+            if (dragging || externalDropTarget) {
+                // Drop previews remain one connected target region so the
+                // user can see the complete relation destination.
+                brush_->SetColor(D2D1::ColorF(accent, 0.24f));
+                renderTarget_->FillRoundedRectangle(
+                    D2D1::RoundedRect(selectionBounds, 4.0f, 4.0f),
+                    brush_.Get());
+                brush_->SetColor(D2D1::ColorF(accent, 0.74f));
                 renderTarget_->DrawRoundedRectangle(
-                    D2D1::RoundedRect(
-                        selectionBounds, 4.0f, 4.0f),
+                    D2D1::RoundedRect(selectionBounds, 4.0f, 4.0f),
                     brush_.Get(), 1.0f);
+            } else {
+                // Explorer uses separate selection surfaces for the icon and
+                // caption.  Keeping the caption rectangle tight prevents a
+                // large blue panel from swallowing the neighboring nodes.
+                const D2D1_RECT_F iconBounds = D2D1::RectF(
+                    position.x - iconSize / 2.0f - compactPadding,
+                    position.y - iconSize / 2.0f - compactPadding,
+                    position.x + iconSize / 2.0f + compactPadding,
+                    position.y + iconSize / 2.0f + compactPadding);
+                const D2D1_RECT_F labelBounds = D2D1::RectF(
+                    position.x - selectionHalfWidth,
+                    labelTop,
+                    position.x + selectionHalfWidth,
+                    labelBottom);
+                brush_->SetColor(D2D1::ColorF(
+                    accent, selected ? 0.19f : 0.085f));
+                renderTarget_->FillRoundedRectangle(
+                    D2D1::RoundedRect(iconBounds, 2.0f, 2.0f),
+                    brush_.Get());
+                renderTarget_->FillRoundedRectangle(
+                    D2D1::RoundedRect(labelBounds, 1.0f, 1.0f),
+                    brush_.Get());
+                if (selected) {
+                    brush_->SetColor(D2D1::ColorF(accent, 0.48f));
+                    renderTarget_->DrawRoundedRectangle(
+                        D2D1::RoundedRect(iconBounds, 2.0f, 2.0f),
+                        brush_.Get(), 1.0f);
+                }
             }
         }
 
