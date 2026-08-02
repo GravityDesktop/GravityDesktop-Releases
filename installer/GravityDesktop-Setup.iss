@@ -16,6 +16,8 @@ AppComments=桌面文件工作关系整理工具
 DefaultDirName={localappdata}\Programs\Gravity Desktop
 DefaultGroupName={#MyAppName}
 DisableProgramGroupPage=yes
+DisableWelcomePage=no
+ShowLanguageDialog=no
 PrivilegesRequired=lowest
 PrivilegesRequiredOverridesAllowed=commandline
 ArchitecturesAllowed=x64compatible
@@ -36,9 +38,18 @@ CloseApplicationsFilter={#MyAppExeName}
 RestartApplications=no
 AppMutex=Local\GravityDesktop.SingleInstance.9D19E743
 
+[Languages]
+Name: "chinesesimp"; MessagesFile: "compiler:Languages\ChineseSimplified.isl"
+
+[Messages]
+SetupAppTitle=引力桌面安装程序
+SetupWindowTitle=引力桌面安装程序
+SetupAppRunningError=检测到引力桌面正在运行。请先退出引力桌面，然后继续安装。
+UninstallAppRunningError=检测到引力桌面正在运行。请先退出引力桌面，然后继续卸载。
+
 [Tasks]
-Name: "desktopicon"; Description: "创建桌面快捷方式"; GroupDescription: "附加快捷方式:"; Flags: unchecked
-Name: "autostart"; Description: "开机时自动启动引力桌面"; GroupDescription: "启动选项:"; Flags: unchecked
+Name: "desktopicon"; Description: "创建桌面快捷方式"; GroupDescription: "附加快捷方式："; Flags: unchecked
+Name: "autostart"; Description: "开机时自动启动引力桌面"; GroupDescription: "启动选项："; Flags: unchecked
 
 [Files]
 Source: "..\out\Release\{#MyAppExeName}"; DestDir: "{app}"; Flags: ignoreversion
