@@ -103,6 +103,11 @@ constexpr UINT kRefreshInteractionLayerMessage = WM_APP + 4;
 constexpr UINT kCommitCoreShortLabelMessage = WM_APP + 5;
 constexpr UINT kPreviewCoreShortLabelMessage = WM_APP + 6;
 constexpr UINT kTrayIconId = 1;
+constexpr wchar_t kAutoStartRegistrySubkey[] =
+    L"Software\\Microsoft\\Windows\\CurrentVersion\\Run";
+constexpr wchar_t kAutoStartRegistryValueName[] = L"GravityDesktop";
+constexpr wchar_t kDevelopmentAutoStartRegistryValueName[] =
+    L"GravityDesktop.Development";
 constexpr float kPi = 3.14159265358979323846f;
 constexpr std::array<int, 3> kRingCapacities{6, 13, 0};
 constexpr std::array<int, 3> kRingStarts{0, 6, 19};
@@ -303,6 +308,7 @@ enum MenuCommand : UINT {
     MenuDisperseCores,
     MenuArrangeAll,
     MenuSaveNow,
+    MenuToggleAutoStart,
     MenuOpenDataFolder,
     MenuAdjustCoreDistance,
     MenuConnectionStyleThin,
@@ -1550,6 +1556,217 @@ std::wstring NormalizePath(const std::wstring& path) {
     }
     normalized.resize(written);
     return normalized;
+}
+
+std::wstring CurrentExecutablePath() {
+    // Windows executable paths may exceed MAX_PATH when long-path support is
+    // enabled. Keep the registry command exact rather than silently truncating
+    // it to an old fixed buffer.
+    std::wstring buffer(32768, L'\0');
+    const DWORD written = GetModuleFileNameW(
+        nullptr, buffer.data(), static_cast<DWORD>(buffer.size()));
+    if (written == 0 || written >= buffer.size()) {
+        return {};
+    }
+    buffer.resize(written);
+    return NormalizePath(buffer);
+}
+
+bool IsDevelopmentBuildExecutable(const std::wstring& executablePath) {
+    if (executablePath.empty()) {
+        return false;
+    }
+    // The checked-in project builds to <project>\\out\\<configuration>.
+    // Treat only that layout as development so a formal installed release
+    // never overwrites the user's official GravityDesktop Run value.
+    const std::filesystem::path executable(executablePath);
+    const std::filesystem::path projectRoot =
+        executable.parent_path().parent_path().parent_path();
+    std::error_code error;
+    return std::filesystem::exists(
+        projectRoot / L"GravityDesktop.sln", error) && !error;
+}
+
+const wchar_t* AutoStartRegistryValueName(
+    const std::wstring& executablePath) {
+    return IsDevelopmentBuildExecutable(executablePath)
+        ? kDevelopmentAutoStartRegistryValueName
+        : kAutoStartRegistryValueName;
+}
+
+std::wstring BuildAutoStartCommand(
+    const std::wstring& executablePath) {
+    if (executablePath.empty()) {
+        return {};
+    }
+    return L"\"" + executablePath + L"\" --autostart";
+}
+
+bool AutoStartCommandMatches(
+    const std::wstring& command,
+    const std::wstring& expectedExecutablePath) {
+    if (command.empty() || expectedExecutablePath.empty()) {
+        return false;
+    }
+    int argumentCount = 0;
+    LPWSTR* arguments = CommandLineToArgvW(
+        command.c_str(), &argumentCount);
+    if (arguments == nullptr) {
+        return false;
+    }
+    const bool matches =
+        argumentCount == 2 &&
+        PathEquals(NormalizePath(arguments[0]), expectedExecutablePath) &&
+        CompareStringOrdinal(
+            arguments[1], -1, L"--autostart", -1, TRUE) == CSTR_EQUAL;
+    LocalFree(arguments);
+    return matches;
+}
+
+enum class AutoStartRegistrationState : int {
+    Disabled = 0,
+    Enabled = 1,
+    NeedsRepair = 2,
+    Unavailable = 3,
+};
+
+struct AutoStartRegistrationStatus {
+    AutoStartRegistrationState state =
+        AutoStartRegistrationState::Unavailable;
+    LONG error = ERROR_SUCCESS;
+    std::wstring valueName;
+};
+
+AutoStartRegistrationStatus ReadAutoStartRegistration() {
+    AutoStartRegistrationStatus status;
+    const std::wstring executablePath = CurrentExecutablePath();
+    if (executablePath.empty()) {
+        status.error = GetLastError();
+        return status;
+    }
+    status.valueName = AutoStartRegistryValueName(executablePath);
+
+    HKEY key = nullptr;
+    LONG result = RegOpenKeyExW(
+        HKEY_CURRENT_USER, kAutoStartRegistrySubkey, 0,
+        KEY_QUERY_VALUE, &key);
+    if (result == ERROR_FILE_NOT_FOUND) {
+        status.state = AutoStartRegistrationState::Disabled;
+        return status;
+    }
+    if (result != ERROR_SUCCESS) {
+        status.error = result;
+        return status;
+    }
+
+    DWORD type = 0;
+    DWORD byteCount = 0;
+    result = RegQueryValueExW(
+        key, status.valueName.c_str(), nullptr,
+        &type, nullptr, &byteCount);
+    if (result == ERROR_FILE_NOT_FOUND) {
+        RegCloseKey(key);
+        status.state = AutoStartRegistrationState::Disabled;
+        return status;
+    }
+    if (result != ERROR_SUCCESS ||
+        (type != REG_SZ && type != REG_EXPAND_SZ) ||
+        byteCount < sizeof(wchar_t)) {
+        RegCloseKey(key);
+        status.state = result == ERROR_SUCCESS
+            ? AutoStartRegistrationState::NeedsRepair
+            : AutoStartRegistrationState::Unavailable;
+        status.error = result;
+        return status;
+    }
+
+    std::wstring value(
+        static_cast<std::size_t>(byteCount / sizeof(wchar_t)), L'\0');
+    result = RegQueryValueExW(
+        key, status.valueName.c_str(), nullptr,
+        &type, reinterpret_cast<BYTE*>(value.data()), &byteCount);
+    RegCloseKey(key);
+    if (result != ERROR_SUCCESS) {
+        status.error = result;
+        return status;
+    }
+    while (!value.empty() && value.back() == L'\0') {
+        value.pop_back();
+    }
+    if (type == REG_EXPAND_SZ) {
+        const DWORD expandedLength = ExpandEnvironmentStringsW(
+            value.c_str(), nullptr, 0);
+        if (expandedLength == 0) {
+            status.state = AutoStartRegistrationState::NeedsRepair;
+            status.error = GetLastError();
+            return status;
+        }
+        std::wstring expanded(
+            static_cast<std::size_t>(expandedLength), L'\0');
+        if (ExpandEnvironmentStringsW(
+                value.c_str(), expanded.data(), expandedLength) == 0) {
+            status.state = AutoStartRegistrationState::NeedsRepair;
+            status.error = GetLastError();
+            return status;
+        }
+        expanded.resize(expandedLength - 1);
+        value = std::move(expanded);
+    }
+    status.state = AutoStartCommandMatches(value, executablePath)
+        ? AutoStartRegistrationState::Enabled
+        : AutoStartRegistrationState::NeedsRepair;
+    return status;
+}
+
+bool WriteAutoStartRegistration(bool enabled) {
+    const std::wstring executablePath = CurrentExecutablePath();
+    if (executablePath.empty()) {
+        return false;
+    }
+    const wchar_t* valueName =
+        AutoStartRegistryValueName(executablePath);
+    HKEY key = nullptr;
+    const LONG openResult = enabled
+        ? RegCreateKeyExW(
+              HKEY_CURRENT_USER, kAutoStartRegistrySubkey, 0,
+              nullptr, REG_OPTION_NON_VOLATILE,
+              KEY_QUERY_VALUE | KEY_SET_VALUE, nullptr, &key, nullptr)
+        : RegOpenKeyExW(
+              HKEY_CURRENT_USER, kAutoStartRegistrySubkey, 0,
+              KEY_QUERY_VALUE | KEY_SET_VALUE, &key);
+    if (!enabled && openResult == ERROR_FILE_NOT_FOUND) {
+        return true;
+    }
+    if (openResult != ERROR_SUCCESS) {
+        return false;
+    }
+    LONG result = ERROR_SUCCESS;
+    if (enabled) {
+        const std::wstring command = BuildAutoStartCommand(executablePath);
+        const DWORD bytes = static_cast<DWORD>(
+            (command.size() + 1) * sizeof(wchar_t));
+        result = RegSetValueExW(
+            key, valueName, 0, REG_SZ,
+            reinterpret_cast<const BYTE*>(command.c_str()), bytes);
+    } else {
+        result = RegDeleteValueW(key, valueName);
+        if (result == ERROR_FILE_NOT_FOUND) {
+            result = ERROR_SUCCESS;
+        }
+    }
+    RegCloseKey(key);
+    if (result != ERROR_SUCCESS) {
+        return false;
+    }
+    const AutoStartRegistrationStatus actual =
+        ReadAutoStartRegistration();
+    return actual.state ==
+        (enabled ? AutoStartRegistrationState::Enabled
+                 : AutoStartRegistrationState::Disabled);
+}
+
+bool RemoveAutoStartRegistrationForUninstall() {
+    return WriteAutoStartRegistration(false);
 }
 
 std::int64_t UnixTimeNow() {
@@ -3074,7 +3291,9 @@ bool IconFullyOutsideViewport(D2D1_POINT_2F screen, float iconHalf,
 
 class GravityApp {
 public:
-    explicit GravityApp(bool benchmarkMode = false) : benchmarkMode_(benchmarkMode) {}
+    explicit GravityApp(bool benchmarkMode = false,
+                        bool autoStartMode = false)
+        : benchmarkMode_(benchmarkMode), autoStartMode_(autoStartMode) {}
 
     friend bool RunSelfTest();
 
@@ -3135,7 +3354,11 @@ public:
         if (!benchmarkMode_) {
             state_.workspacePaused = false;
         }
-        tutorialActive_ = !benchmarkMode_ && !state_.firstRunCompleted;
+        // Login launch restores the desktop companion quietly. A first-use
+        // tutorial is reserved for an explicit user launch so it never
+        // interrupts the shell while Explorer is still establishing itself.
+        tutorialActive_ =
+            !benchmarkMode_ && !autoStartMode_ && !state_.firstRunCompleted;
         ApplyCompanionWorkspaceFrame();
         if (!CreateInteractionWindow() || !CreateDividerHandleWindow()) {
             return false;
@@ -8490,6 +8713,31 @@ private:
         if (menu == nullptr) {
             return;
         }
+
+        HMENU generalMenu = CreatePopupMenu();
+        const AutoStartRegistrationStatus autoStart =
+            ReadAutoStartRegistration();
+        UINT autoStartFlags = MF_STRING;
+        std::wstring autoStartLabel =
+            L"登录Windows后自动启动引力桌面";
+        if (autoStart.state == AutoStartRegistrationState::Enabled) {
+            autoStartFlags |= MF_CHECKED;
+        } else if (autoStart.state ==
+                   AutoStartRegistrationState::NeedsRepair) {
+            autoStartLabel += L"（启动项需要修复）";
+        } else if (autoStart.state ==
+                   AutoStartRegistrationState::Unavailable) {
+            autoStartLabel += L"（无法读取）";
+            autoStartFlags |= MF_GRAYED;
+        }
+        AppendMenuW(
+            generalMenu, autoStartFlags, MenuToggleAutoStart,
+            autoStartLabel.c_str());
+        AppendMenuW(
+            menu, MF_POPUP,
+            reinterpret_cast<UINT_PTR>(generalMenu), L"常规");
+        AppendMenuW(menu, MF_SEPARATOR, 0, nullptr);
+
         HMENU densityMenu = CreatePopupMenu();
         AppendMenuW(
             densityMenu,
@@ -8601,6 +8849,28 @@ private:
         DestroyMenu(menu);
         ExecuteMenuCommand(command);
         Invalidate();
+    }
+
+    void ToggleAutoStart() {
+        const AutoStartRegistrationStatus before =
+            ReadAutoStartRegistration();
+        if (before.state == AutoStartRegistrationState::Unavailable) {
+            SetStatus(
+                L"无法设置开机启动，请检查系统权限或安全软件设置。");
+            return;
+        }
+        const bool shouldEnable =
+            before.state != AutoStartRegistrationState::Enabled;
+        if (!WriteAutoStartRegistration(shouldEnable)) {
+            // Do not trust a stale UI checkmark. The next settings open reads
+            // the actual Run value again, and this operation reports failure.
+            SetStatus(
+                L"无法设置开机启动，请检查系统权限或安全软件设置。");
+            return;
+        }
+        SetStatus(shouldEnable
+            ? L"已设置：登录Windows后自动启动引力桌面"
+            : L"已关闭：登录Windows后不自动启动引力桌面");
     }
 
     bool CorePlacementPointValid(
@@ -15696,6 +15966,9 @@ private:
                 SetStatus(L"布局已保存");
             }
             break;
+        case MenuToggleAutoStart:
+            ToggleAutoStart();
+            break;
         case MenuOpenDataFolder:
             OpenDataFolder();
             break;
@@ -19957,6 +20230,7 @@ private:
     std::filesystem::path stateFile_;
     bool dirty_ = false;
     bool benchmarkMode_ = false;
+    bool autoStartMode_ = false;
     bool initialized_ = false;
     bool shuttingDown_ = false;
     bool sessionEndSaveFailed_ = false;
@@ -20231,6 +20505,24 @@ LRESULT CALLBACK DividerHandleWindowProcedure(
 }
 
 bool RunSelfTest() {
+    // Registry mutation is deliberately excluded from the built-in tests: a
+    // diagnostic run must never create a Windows login entry. These checks
+    // cover the exact quoted command and reject a stale or incomplete entry.
+    const std::wstring testAutoStartPath =
+        L"C:\\Program Files\\Gravity Desktop\\GravityDesktop.exe";
+    const std::wstring testAutoStartCommand =
+        BuildAutoStartCommand(testAutoStartPath);
+    if (!AutoStartCommandMatches(
+            testAutoStartCommand, testAutoStartPath) ||
+        AutoStartCommandMatches(
+            L"\"C:\\Program Files\\Gravity Desktop\\OldGravityDesktop.exe\" --autostart",
+            testAutoStartPath) ||
+        AutoStartCommandMatches(
+            L"\"C:\\Program Files\\Gravity Desktop\\GravityDesktop.exe\"",
+            testAutoStartPath)) {
+        return false;
+    }
+
     const D2D1_SIZE_F viewport = D2D1::SizeF(100.0f, 100.0f);
     if (IconFullyOutsideViewport(D2D1::Point2F(-10.0f, 50.0f), 20.0f, viewport) ||
         IconFullyOutsideViewport(D2D1::Point2F(110.0f, 50.0f), 20.0f, viewport) ||
@@ -22762,6 +23054,13 @@ int APIENTRY wWinMain(_In_ HINSTANCE instance, _In_opt_ HINSTANCE,
     if (commandLine != nullptr && wcsstr(commandLine, L"--self-test") != nullptr) {
         return RunSelfTest() ? 0 : 2;
     }
+    if (commandLine != nullptr &&
+        wcsstr(commandLine, L"--uninstall-cleanup") != nullptr) {
+        return RemoveAutoStartRegistrationForUninstall() ? 0 : 1;
+    }
+    const bool autoStartLaunch =
+        commandLine != nullptr &&
+        wcsstr(commandLine, L"--autostart") != nullptr;
 
     SetProcessDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2);
     const HRESULT comResult = OleInitialize(nullptr);
@@ -22776,10 +23075,12 @@ int APIENTRY wWinMain(_In_ HINSTANCE instance, _In_opt_ HINSTANCE,
         if (instanceMutex != nullptr) {
             CloseHandle(instanceMutex);
         }
-        if (HWND existing = FindExistingGravityWindow();
-            existing != nullptr) {
-            PostMessageW(
-                existing, kRestoreExistingInstanceMessage, 0, 0);
+        if (!autoStartLaunch) {
+            if (HWND existing = FindExistingGravityWindow();
+                existing != nullptr) {
+                PostMessageW(
+                    existing, kRestoreExistingInstanceMessage, 0, 0);
+            }
         }
         OleUninitialize();
         return 0;
@@ -22837,7 +23138,7 @@ int APIENTRY wWinMain(_In_ HINSTANCE instance, _In_opt_ HINSTANCE,
 
     const bool benchmarkMode =
         commandLine != nullptr && wcsstr(commandLine, L"--benchmark-layout") != nullptr;
-    GravityApp app(benchmarkMode);
+    GravityApp app(benchmarkMode, autoStartLaunch);
     (void)TaskbarCreatedMessage();
     constexpr DWORD lifecycleExStyle =
         WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE;
