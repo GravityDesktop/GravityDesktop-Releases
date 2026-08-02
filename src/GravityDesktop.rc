@@ -1,6 +1,9 @@
 #pragma code_page(65001)
 
 #include <winver.h>
+#include "GravityDesktopResource.h"
+
+IDI_GRAVITYDESKTOP ICON "GravityDesktop.ico"
 
 VS_VERSION_INFO VERSIONINFO
  FILEVERSION 0,1,0,0

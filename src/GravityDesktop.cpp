@@ -12,6 +12,8 @@
 #include <wincodec.h>
 #include <wrl/client.h>
 
+#include "GravityDesktopResource.h"
+
 #include <algorithm>
 #include <array>
 #include <atomic>
@@ -467,6 +469,16 @@ HWND FindExistingGravityWindow() {
             reinterpret_cast<LPARAM>(&result));
     }
     return result;
+}
+
+HICON LoadGravityApplicationIcon(int width, int height) {
+    HICON icon = static_cast<HICON>(LoadImageW(
+        GetModuleHandleW(nullptr),
+        MAKEINTRESOURCEW(IDI_GRAVITYDESKTOP), IMAGE_ICON,
+        width, height, LR_DEFAULTCOLOR | LR_SHARED));
+    return icon != nullptr
+        ? icon
+        : LoadIconW(nullptr, IDI_APPLICATION);
 }
 
 UINT32 RgbFromColorRef(COLORREF color) {
@@ -5125,7 +5137,9 @@ private:
         icon.uID = kTrayIconId;
         icon.uFlags = NIF_MESSAGE | NIF_ICON | NIF_TIP;
         icon.uCallbackMessage = kTrayCallbackMessage;
-        icon.hIcon = LoadIconW(nullptr, IDI_APPLICATION);
+        icon.hIcon = LoadGravityApplicationIcon(
+            GetSystemMetrics(SM_CXSMICON),
+            GetSystemMetrics(SM_CYSMICON));
         wcsncpy_s(icon.szTip, L"引力桌面工作区", _TRUNCATE);
         trayIconAdded_ = Shell_NotifyIconW(NIM_ADD, &icon) != FALSE;
     }
@@ -23091,8 +23105,12 @@ int APIENTRY wWinMain(_In_ HINSTANCE instance, _In_opt_ HINSTANCE,
     windowClass.lpfnWndProc = WindowProcedure;
     windowClass.hInstance = instance;
     windowClass.hCursor = LoadCursorW(nullptr, IDC_ARROW);
-    windowClass.hIcon = LoadIconW(nullptr, IDI_APPLICATION);
-    windowClass.hIconSm = windowClass.hIcon;
+    windowClass.hIcon = LoadGravityApplicationIcon(
+        GetSystemMetrics(SM_CXICON),
+        GetSystemMetrics(SM_CYICON));
+    windowClass.hIconSm = LoadGravityApplicationIcon(
+        GetSystemMetrics(SM_CXSMICON),
+        GetSystemMetrics(SM_CYSMICON));
     windowClass.lpszClassName = kWindowClass;
     if (RegisterClassExW(&windowClass) == 0) {
         CloseHandle(instanceMutex);
