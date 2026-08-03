@@ -89,11 +89,13 @@ constexpr UINT_PTR kSelectionDismissTimer = 9;
 constexpr UINT_PTR kDesktopHostWatchTimer = 10;
 constexpr UINT_PTR kDesktopReconnectTimer = 11;
 constexpr UINT_PTR kInteractionLayerRepairTimer = 12;
+constexpr UINT_PTR kDesktopVisibilityRestoreTimer = 13;
 constexpr auto kManagedCollectionConfirmationWindow =
     std::chrono::minutes(10);
 constexpr UINT kDesktopHostWatchIntervalMs = 2000;
 constexpr UINT kDesktopReconnectIntervalMs = 250;
 constexpr UINT kInteractionLayerRepairDelayMs = 600;
+constexpr UINT kDesktopVisibilityRestoreDelayMs = 180;
 constexpr int kDesktopReconnectAttemptLimit = 40;
 constexpr std::size_t kMaxRelationTraversalNodes = 4096;
 constexpr std::size_t kMaxRelationTraversalDepth = 256;
@@ -3733,8 +3735,13 @@ public:
         case WM_ERASEBKGND:
             return 1;
         case WM_SIZE:
-            if (wParam != SIZE_MINIMIZED &&
-                !desktopReconnectInProgress_) {
+            if (wParam == SIZE_MINIMIZED) {
+                // Win+D may minimize an Explorer companion fallback just as
+                // it minimizes ordinary windows. This is not a user request
+                // to hide the desktop layer, so restore it after the shell
+                // finishes its transition.
+                ScheduleDesktopVisibilityRestore();
+            } else if (!desktopReconnectInProgress_) {
                 Resize();
             }
             return 0;
@@ -3748,6 +3755,8 @@ public:
                         kRefreshInteractionLayerMessage,
                         0, 0);
                 }
+            } else if (wParam == FALSE) {
+                ScheduleDesktopVisibilityRestore();
             }
             break;
         case WM_WINDOWPOSCHANGED:
@@ -5077,6 +5086,53 @@ private:
         ApplyCompanionWorkspaceFrame();
         ScheduleSave();
         SyncCoreSelectionRippleTimer();
+        Invalidate();
+    }
+
+    bool ShouldRestoreDesktopVisibility() const {
+        return initialized_ && workspaceVisible_ &&
+               !state_.workspacePaused && !hidingToTray_ &&
+               !shuttingDown_ && !exitRequested_;
+    }
+
+    void ScheduleDesktopVisibilityRestore() {
+        if (!ShouldRestoreDesktopVisibility() ||
+            window_ == nullptr || IsWindow(window_) == FALSE) {
+            return;
+        }
+        // A short one-shot delay lets Win+D complete its minimize/hide pass
+        // before restoring this desktop companion below normal application
+        // windows. Repeated shell notifications simply restart the delay.
+        SetTimer(window_, kDesktopVisibilityRestoreTimer,
+                 kDesktopVisibilityRestoreDelayMs, nullptr);
+    }
+
+    void RestoreDesktopVisibilityAfterShellTransition() {
+        if (window_ != nullptr) {
+            KillTimer(window_, kDesktopVisibilityRestoreTimer);
+        }
+        if (!ShouldRestoreDesktopVisibility() ||
+            window_ == nullptr || IsWindow(window_) == FALSE) {
+            return;
+        }
+
+        if (IsIconic(window_) != FALSE) {
+            ShowWindow(window_, SW_RESTORE);
+        }
+        if (IsWindowVisible(window_) == FALSE) {
+            ShowWindow(window_, SW_SHOWNOACTIVATE);
+        }
+
+        // Reapply the companion frame instead of restoring any layout data.
+        // This keeps the visual layer below ordinary windows while ensuring
+        // the interaction islands and divider recover with it.
+        ApplyCompanionWorkspaceFrame();
+        if (interactionWindow_ != nullptr &&
+            IsWindow(interactionWindow_) != FALSE) {
+            ShowWindow(interactionWindow_, SW_SHOWNOACTIVATE);
+        }
+        EnsureInteractionWindowPresented();
+        SyncDividerHandleWindowFrame();
         Invalidate();
     }
 
@@ -19788,7 +19844,9 @@ private:
     }
 
     void OnTimer(WPARAM timer) {
-        if (timer == kSaveTimer) {
+        if (timer == kDesktopVisibilityRestoreTimer) {
+            RestoreDesktopVisibilityAfterShellTransition();
+        } else if (timer == kSaveTimer) {
             KillTimer(window_, kSaveTimer);
             SaveState();
         } else if (timer == kStatusTimer) {
