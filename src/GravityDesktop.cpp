@@ -63,6 +63,8 @@ constexpr wchar_t kInteractionWindowClass[] =
     L"GravityDesktop.InteractionIslands";
 constexpr wchar_t kDividerHandleWindowClass[] =
     L"GravityDesktop.DividerHandle";
+constexpr wchar_t kSettingsWindowClass[] =
+    L"GravityDesktop.SettingsWindow";
 constexpr wchar_t kShellLifecycleWindowClass[] =
     L"GravityDesktop.ShellLifecycle";
 constexpr wchar_t kWindowTitle[] = L"引力桌面系统";
@@ -191,6 +193,16 @@ enum class ConnectionLineColorMode : int {
     Black = 1,
     White = 2,
     Custom = 3,
+};
+
+enum class SettingsPage : int {
+    General = 0,
+    Appearance,
+    Workspace,
+    Data,
+    CoreManagement,
+    Help,
+    Advanced,
 };
 
 constexpr float kConnectionLineWidthThin = 0.8f;
@@ -1113,6 +1125,9 @@ struct WorkspaceState {
     float dividerPosition = 0.50f;
     bool dividerVisible = true;
     int dividerStyle = 0;
+    bool settingsWindowPositionValid = false;
+    float settingsWindowXRatio = 0.5f;
+    float settingsWindowYRatio = 0.5f;
     // Empty means the durable default beneath the user's Documents folder.
     // The managed library is never derived from an install or state path.
     std::wstring managedLibraryPath;
@@ -1326,6 +1341,8 @@ class GravityApp;
 LRESULT CALLBACK InteractionWindowProcedure(
     HWND window, UINT message, WPARAM wParam, LPARAM lParam);
 LRESULT CALLBACK DividerHandleWindowProcedure(
+    HWND window, UINT message, WPARAM wParam, LPARAM lParam);
+LRESULT CALLBACK SettingsWindowProcedure(
     HWND window, UINT message, WPARAM wParam, LPARAM lParam);
 
 std::wstring Trim(std::wstring text) {
@@ -1998,6 +2015,12 @@ std::string SerializeState(const WorkspaceState& state) {
            << ", \"divider_visible\": "
            << (state.dividerVisible ? "true" : "false")
            << ", \"divider_style\": " << state.dividerStyle
+           << ", \"settings_window_position_valid\": "
+           << (state.settingsWindowPositionValid ? "true" : "false")
+           << ", \"settings_window_x_ratio\": "
+           << state.settingsWindowXRatio
+           << ", \"settings_window_y_ratio\": "
+           << state.settingsWindowYRatio
            << ", \"managed_library_path\": "
            << EscapeJson(state.managedLibraryPath)
            << ", \"workspace_collapsed\": "
@@ -2274,6 +2297,14 @@ bool DeserializeState(const std::string& json, WorkspaceState& state) {
             loaded.dividerVisible = BoolMember(*settings, "divider_visible", true);
             loaded.dividerStyle = std::clamp(static_cast<int>(
                 NumberMember(*settings, "divider_style", 0.0)), 0, 1);
+            loaded.settingsWindowPositionValid = BoolMember(
+                *settings, "settings_window_position_valid", false);
+            loaded.settingsWindowXRatio = std::clamp(static_cast<float>(
+                NumberMember(*settings, "settings_window_x_ratio", 0.5)),
+                0.0f, 1.0f);
+            loaded.settingsWindowYRatio = std::clamp(static_cast<float>(
+                NumberMember(*settings, "settings_window_y_ratio", 0.5)),
+                0.0f, 1.0f);
             loaded.managedLibraryPath = StringMember(
                 *settings, "managed_library_path", L"");
             loaded.workspaceCollapsed = BoolMember(*settings,
@@ -3405,6 +3436,10 @@ public:
         }
         EndRename(false);
         CancelCoreShortLabelEdit();
+        if (settingsWindow_ != nullptr &&
+            IsWindow(settingsWindow_) != FALSE) {
+            DestroyWindow(settingsWindow_);
+        }
         DestroyDividerHandleWindow();
         DestroyInteractionWindow();
         if (window_ != nullptr) {
@@ -3859,6 +3894,12 @@ public:
             break;
         }
         return DefWindowProcW(
+            source, message, wParam, lParam);
+    }
+
+    LRESULT HandleSettingsWindowMessage(
+        HWND source, UINT message, WPARAM wParam, LPARAM lParam) {
+        return HandleSettingsWindowMessageImpl(
             source, message, wParam, lParam);
     }
 
@@ -8596,7 +8637,7 @@ private:
 
     D2D1_RECT_F WorkspaceControlRectangle(const D2D1_SIZE_F& client, int index) const {
         static constexpr std::array<float, kWorkspaceControlCount> regularWidths{
-            102.0f, 66.0f, 76.0f, 68.0f,
+            102.0f, 66.0f, 104.0f, 68.0f,
             92.0f, 112.0f, 52.0f};
         static constexpr std::array<float, kWorkspaceControlCount> compactWidths{
             46.0f, 54.0f, 58.0f, 54.0f,
@@ -8660,7 +8701,7 @@ private:
         const std::array<const wchar_t*, kWorkspaceControlCount> labels{
             compact ? L"＋" : L"＋ 创建核心",
             L"撤销",
-            compact ? L"整理" : L"整理 ▾",
+            compact ? L"整理" : L"整理工作区 ▾",
             L"设置",
             compact ? L"隐藏" : L"隐藏到托盘",
             state_.fullScreenWorkMode
@@ -8714,13 +8755,13 @@ private:
         }
         AppendMenuW(
             menu, MF_STRING, MenuDisperseCores,
-            L"整理核心位置");
+            L"重新排列所有核心");
         AppendMenuW(
             menu, MF_STRING, MenuOptimizeAll,
-            L"分散重叠核心");
+            L"仅分开重叠核心");
         AppendMenuW(
             menu, MF_STRING, MenuArrangeAll,
-            L"整理全部（核心＋文件）");
+            L"重新排列全部内容…（核心＋文件）");
         const D2D1_RECT_F button =
             WorkspaceControlRectangle(ClientDipSize(), 2);
         POINT screen{
@@ -8735,6 +8776,362 @@ private:
         Invalidate();
     }
 
+    static constexpr UINT kSettingsPageCommandBase = 6000;
+    static constexpr UINT kSettingsArchivedCoreCommandBase = 6300;
+
+    int SettingsDipToPixels(int value) const {
+        const UINT dpi = settingsWindow_ != nullptr
+            ? GetDpiForWindow(settingsWindow_)
+            : 96;
+        return MulDiv(value, static_cast<int>(dpi), 96);
+    }
+
+    void ApplySettingsControlFont(HWND control) const {
+        SendMessageW(
+            control, WM_SETFONT,
+            reinterpret_cast<WPARAM>(GetStockObject(DEFAULT_GUI_FONT)), TRUE);
+    }
+
+    HWND CreateSettingsText(HWND parent, const wchar_t* text,
+                            int x, int y, int width, int height,
+                            DWORD extraStyle = 0) const {
+        HWND control = CreateWindowExW(
+            0, L"STATIC", text,
+            WS_CHILD | WS_VISIBLE | extraStyle,
+            SettingsDipToPixels(x), SettingsDipToPixels(y),
+            SettingsDipToPixels(width), SettingsDipToPixels(height),
+            parent, nullptr, GetModuleHandleW(nullptr), nullptr);
+        if (control != nullptr) {
+            ApplySettingsControlFont(control);
+        }
+        return control;
+    }
+
+    HWND CreateSettingsButton(HWND parent, const wchar_t* text,
+                              int x, int y, int width, int height,
+                              UINT command, DWORD extraStyle = 0) const {
+        HWND control = CreateWindowExW(
+            0, L"BUTTON", text,
+            WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_PUSHBUTTON | extraStyle,
+            SettingsDipToPixels(x), SettingsDipToPixels(y),
+            SettingsDipToPixels(width), SettingsDipToPixels(height),
+            parent, reinterpret_cast<HMENU>(
+                static_cast<UINT_PTR>(command)),
+            GetModuleHandleW(nullptr), nullptr);
+        if (control != nullptr) {
+            ApplySettingsControlFont(control);
+        }
+        return control;
+    }
+
+    const wchar_t* SettingsPageName(SettingsPage page) const {
+        switch (page) {
+        case SettingsPage::General: return L"常规";
+        case SettingsPage::Appearance: return L"外观与动效";
+        case SettingsPage::Workspace: return L"工作区";
+        case SettingsPage::Data: return L"数据与备份";
+        case SettingsPage::CoreManagement: return L"核心管理";
+        case SettingsPage::Help: return L"帮助";
+        case SettingsPage::Advanced: return L"高级";
+        default: return L"设置";
+        }
+    }
+
+    void ClearSettingsPageControls() {
+        if (settingsContentWindow_ == nullptr) {
+            return;
+        }
+        while (HWND child = GetWindow(settingsContentWindow_, GW_CHILD)) {
+            DestroyWindow(child);
+        }
+        settingsArchivedCoreIds_.clear();
+    }
+
+    void RebuildSettingsWindow() {
+        if (settingsWindow_ == nullptr ||
+            IsWindow(settingsWindow_) == FALSE ||
+            settingsContentWindow_ == nullptr) {
+            return;
+        }
+        ClearSettingsPageControls();
+        CreateSettingsText(
+            settingsContentWindow_, SettingsPageName(settingsPage_),
+            16, 14, 320, 26);
+        switch (settingsPage_) {
+        case SettingsPage::General: {
+            HWND autoStart = CreateSettingsButton(
+                settingsContentWindow_, L"登录 Windows 后自动启动引力桌面",
+                16, 58, 330, 28, MenuToggleAutoStart, BS_AUTOCHECKBOX);
+            const AutoStartRegistrationStatus status =
+                ReadAutoStartRegistration();
+            if (autoStart != nullptr) {
+                SendMessageW(
+                    autoStart, BM_SETCHECK,
+                    status.state == AutoStartRegistrationState::Enabled
+                        ? BST_CHECKED : BST_UNCHECKED, 0);
+                if (status.state == AutoStartRegistrationState::Unavailable) {
+                    EnableWindow(autoStart, FALSE);
+                }
+            }
+            CreateSettingsText(
+                settingsContentWindow_,
+                status.state == AutoStartRegistrationState::NeedsRepair
+                    ? L"当前启动项指向旧路径；重新勾选可修复。"
+                    : L"该设置只影响当前 Windows 用户。",
+                16, 94, 340, 34);
+            break;
+        }
+        case SettingsPage::Appearance: {
+            CreateSettingsText(settingsContentWindow_, L"布局密度", 16, 54, 180, 22);
+            const std::array<std::pair<const wchar_t*, UINT>, 3> density{{
+                {L"紧凑", MenuDensityCompact}, {L"标准", MenuDensityStandard},
+                {L"清晰", MenuDensityClear}}};
+            for (int index = 0; index < 3; ++index) {
+                HWND button = CreateSettingsButton(
+                    settingsContentWindow_, density[index].first,
+                    16 + index * 92, 78, 82, 28, density[index].second);
+                if (button != nullptr &&
+                    static_cast<int>(state_.densityMode) == index) {
+                    SendMessageW(button, BM_SETCHECK, BST_CHECKED, 0);
+                }
+            }
+            CreateSettingsText(settingsContentWindow_, L"全局动画强度", 16, 122, 180, 22);
+            const std::array<std::pair<const wchar_t*, UINT>, 4> animation{{
+                {L"关闭", MenuAnimationOff}, {L"简洁", MenuAnimationSimple},
+                {L"标准", MenuAnimationStandard}, {L"柔和", MenuAnimationSoft}}};
+            for (int index = 0; index < 4; ++index) {
+                CreateSettingsButton(settingsContentWindow_, animation[index].first,
+                    16 + index * 78, 146, 70, 28, animation[index].second);
+            }
+            CreateSettingsText(settingsContentWindow_, L"核心选中效果", 16, 190, 180, 22);
+            CreateSettingsButton(settingsContentWindow_, L"柔和波纹扩散", 16, 214, 116, 28,
+                                 MenuCoreSelectionEffectRotate);
+            CreateSettingsButton(settingsContentWindow_, L"播放一次后保持静态", 140, 214, 142, 28,
+                                 MenuCoreSelectionEffectOnce);
+            CreateSettingsButton(settingsContentWindow_, L"仅显示静态光环", 16, 250, 116, 28,
+                                 MenuCoreSelectionEffectStatic);
+            break;
+        }
+        case SettingsPage::Workspace:
+            CreateSettingsText(settingsContentWindow_,
+                L"复位视图只恢复画布缩放与视图偏移，不改变核心、文件或关系。",
+                16, 56, 340, 40);
+            CreateSettingsButton(settingsContentWindow_, L"复位视图", 16, 108, 130, 30,
+                                 MenuResetView);
+            break;
+        case SettingsPage::Data:
+            CreateSettingsText(settingsContentWindow_,
+                L"布局备份不会移动、删除或覆盖真实文件。", 16, 56, 340, 24);
+            CreateSettingsButton(settingsContentWindow_, L"立即保存布局", 16, 94, 136, 30,
+                                 MenuSaveNow);
+            CreateSettingsButton(settingsContentWindow_, L"导出布局备份", 16, 132, 136, 30,
+                                 MenuExportLayout);
+            CreateSettingsButton(settingsContentWindow_, L"导入布局备份", 16, 170, 136, 30,
+                                 MenuImportLayout);
+            break;
+        case SettingsPage::CoreManagement: {
+            CreateSettingsButton(settingsContentWindow_, L"检查失效文件引用", 16, 56, 156, 30,
+                                 MenuRefreshReferences);
+            CreateSettingsText(settingsContentWindow_, L"恢复归档核心", 16, 104, 220, 22);
+            int row = 0;
+            for (const Core& core : state_.cores) {
+                if (!core.archived || row >= 6) {
+                    continue;
+                }
+                settingsArchivedCoreIds_.push_back(core.id);
+                CreateSettingsButton(settingsContentWindow_, core.name.c_str(),
+                    16, 130 + row * 34, 240, 28,
+                    kSettingsArchivedCoreCommandBase +
+                        static_cast<UINT>(settingsArchivedCoreIds_.size() - 1));
+                ++row;
+            }
+            if (settingsArchivedCoreIds_.empty()) {
+                CreateSettingsText(settingsContentWindow_, L"没有归档核心", 16, 132, 220, 24);
+            }
+            break;
+        }
+        case SettingsPage::Help:
+            CreateSettingsText(settingsContentWindow_,
+                L"重新打开三步使用教程；不会创建测试文件或改动现有布局。",
+                16, 56, 340, 40);
+            CreateSettingsButton(settingsContentWindow_, L"重新打开使用教程", 16, 108, 160, 30,
+                                 MenuTrayTutorial);
+            break;
+        case SettingsPage::Advanced:
+            CreateSettingsText(settingsContentWindow_,
+                L"程序数据文件夹包含状态、备份和日志。不要手动删除未知文件。",
+                16, 56, 340, 40);
+            CreateSettingsButton(settingsContentWindow_, L"打开程序数据文件夹", 16, 108, 180, 30,
+                                 MenuOpenDataFolder);
+            break;
+        }
+    }
+
+    void LayoutSettingsWindow() {
+        if (settingsWindow_ == nullptr || settingsContentWindow_ == nullptr) {
+            return;
+        }
+        RECT client{};
+        GetClientRect(settingsWindow_, &client);
+        const int navigationWidth = SettingsDipToPixels(142);
+        ::SetWindowPos(settingsContentWindow_, nullptr,
+            navigationWidth + SettingsDipToPixels(10), SettingsDipToPixels(10),
+            std::max(1, static_cast<int>(client.right) - navigationWidth - SettingsDipToPixels(20)),
+            std::max(1, static_cast<int>(client.bottom) - SettingsDipToPixels(20)),
+            SWP_NOZORDER | SWP_NOACTIVATE);
+    }
+
+    void SelectSettingsPage(SettingsPage page) {
+        settingsPage_ = page;
+        RebuildSettingsWindow();
+    }
+
+    void RecordSettingsWindowPosition(bool save) {
+        if (settingsWindow_ == nullptr ||
+            IsWindow(settingsWindow_) == FALSE ||
+            IsIconic(settingsWindow_) != FALSE) {
+            return;
+        }
+        RECT bounds{};
+        GetWindowRect(settingsWindow_, &bounds);
+        const HMONITOR monitor = MonitorFromRect(
+            &bounds, MONITOR_DEFAULTTONEAREST);
+        MONITORINFO info{sizeof(info)};
+        if (monitor == nullptr || GetMonitorInfoW(monitor, &info) == FALSE) {
+            return;
+        }
+        const int availableWidth = std::max(
+            1, static_cast<int>((info.rcWork.right - info.rcWork.left) -
+                                (bounds.right - bounds.left)));
+        const int availableHeight = std::max(
+            1, static_cast<int>((info.rcWork.bottom - info.rcWork.top) -
+                                (bounds.bottom - bounds.top)));
+        state_.settingsWindowXRatio = std::clamp(
+            static_cast<float>(bounds.left - info.rcWork.left) /
+                static_cast<float>(availableWidth), 0.0f, 1.0f);
+        state_.settingsWindowYRatio = std::clamp(
+            static_cast<float>(bounds.top - info.rcWork.top) /
+                static_cast<float>(availableHeight), 0.0f, 1.0f);
+        state_.settingsWindowPositionValid = true;
+        if (save) {
+            ScheduleSave(false);
+        }
+    }
+
+    void ShowSettingsWindow() {
+        if (settingsWindow_ != nullptr &&
+            IsWindow(settingsWindow_) != FALSE) {
+            ShowWindow(settingsWindow_, SW_RESTORE);
+            SetForegroundWindow(settingsWindow_);
+            return;
+        }
+        const UINT dpi = window_ != nullptr ? GetDpiForWindow(window_) : 96;
+        const int width = MulDiv(520, static_cast<int>(dpi), 96);
+        const int height = MulDiv(430, static_cast<int>(dpi), 96);
+        POINT cursor{};
+        GetCursorPos(&cursor);
+        const HMONITOR monitor = MonitorFromPoint(cursor, MONITOR_DEFAULTTONEAREST);
+        MONITORINFO info{sizeof(info)};
+        if (monitor == nullptr || GetMonitorInfoW(monitor, &info) == FALSE) {
+            info.rcWork = RECT{0, 0, GetSystemMetrics(SM_CXSCREEN), GetSystemMetrics(SM_CYSCREEN)};
+        }
+        const int availableWidth = std::max(
+            0, static_cast<int>(info.rcWork.right - info.rcWork.left) - width);
+        const int availableHeight = std::max(
+            0, static_cast<int>(info.rcWork.bottom - info.rcWork.top) - height);
+        const int x = info.rcWork.left + (state_.settingsWindowPositionValid
+            ? static_cast<int>(std::lround(availableWidth * state_.settingsWindowXRatio))
+            : availableWidth / 2);
+        const int y = info.rcWork.top + (state_.settingsWindowPositionValid
+            ? static_cast<int>(std::lround(availableHeight * state_.settingsWindowYRatio))
+            : availableHeight / 2);
+        const DWORD style = WS_OVERLAPPEDWINDOW & ~(WS_THICKFRAME | WS_MAXIMIZEBOX);
+        settingsWindow_ = CreateWindowExW(
+            WS_EX_APPWINDOW, kSettingsWindowClass, L"引力桌面设置", style,
+            x, y, width, height, nullptr, nullptr,
+            GetModuleHandleW(nullptr), this);
+        if (settingsWindow_ == nullptr) {
+            SetStatus(L"无法打开设置窗口");
+            return;
+        }
+        settingsContentWindow_ = CreateWindowExW(
+            0, L"STATIC", L"", WS_CHILD | WS_VISIBLE | WS_CLIPCHILDREN,
+            0, 0, 1, 1, settingsWindow_, nullptr,
+            GetModuleHandleW(nullptr), nullptr);
+        ApplySettingsControlFont(settingsContentWindow_);
+        static constexpr std::array<const wchar_t*, 7> pages{{
+            L"常规", L"外观与动效", L"工作区", L"数据与备份",
+            L"核心管理", L"帮助", L"高级"}};
+        for (int index = 0; index < static_cast<int>(pages.size()); ++index) {
+            CreateSettingsButton(settingsWindow_, pages[index],
+                12, 14 + index * 38, 126, 30,
+                kSettingsPageCommandBase + static_cast<UINT>(index));
+        }
+        CreateSettingsText(settingsWindow_, L"设置项即时预览", 16, 304, 120, 22);
+        LayoutSettingsWindow();
+        RebuildSettingsWindow();
+        ShowWindow(settingsWindow_, SW_SHOW);
+        UpdateWindow(settingsWindow_);
+    }
+
+    LRESULT HandleSettingsWindowMessageImpl(
+        HWND source, UINT message, WPARAM wParam, LPARAM lParam) {
+        switch (message) {
+        case WM_COMMAND: {
+            const UINT command = LOWORD(wParam);
+            if (command >= kSettingsPageCommandBase &&
+                command < kSettingsPageCommandBase + 7) {
+                SelectSettingsPage(static_cast<SettingsPage>(
+                    command - kSettingsPageCommandBase));
+                return 0;
+            }
+            if (command >= kSettingsArchivedCoreCommandBase &&
+                command < kSettingsArchivedCoreCommandBase +
+                    settingsArchivedCoreIds_.size()) {
+                RestoreCore(settingsArchivedCoreIds_[command -
+                    kSettingsArchivedCoreCommandBase]);
+                RebuildSettingsWindow();
+                return 0;
+            }
+            if (command == MenuTrayTutorial) {
+                ShowWindow(source, SW_HIDE);
+            }
+            ExecuteMenuCommand(command);
+            RebuildSettingsWindow();
+            return 0;
+        }
+        case WM_SIZE:
+            LayoutSettingsWindow();
+            return 0;
+        case WM_EXITSIZEMOVE:
+            RecordSettingsWindowPosition(true);
+            return 0;
+        case WM_KEYDOWN:
+            if (wParam == VK_ESCAPE) {
+                ShowWindow(source, SW_HIDE);
+                return 0;
+            }
+            break;
+        case WM_CLOSE:
+            ShowWindow(source, SW_HIDE);
+            return 0;
+        case WM_NCDESTROY:
+            if (settingsContentWindow_ != nullptr) {
+                settingsContentWindow_ = nullptr;
+            }
+            if (settingsWindow_ == source) {
+                settingsWindow_ = nullptr;
+            }
+            SetWindowLongPtrW(source, GWLP_USERDATA, 0);
+            break;
+        default:
+            break;
+        }
+        return DefWindowProcW(source, message, wParam, lParam);
+    }
+
+    // Kept only for source compatibility while both public entry points are
+    // migrated to the single modeless settings window below.
     void ShowGlobalSettingsMenu() {
         HMENU menu = CreatePopupMenu();
         if (menu == nullptr) {
@@ -10390,7 +10787,7 @@ private:
             return true;
         }
         if (PointInside(point, WorkspaceControlRectangle(client, 3))) {
-            ShowGlobalSettingsMenu();
+            ShowSettingsWindow();
             return true;
         }
         if (PointInside(point, WorkspaceControlRectangle(client, 4))) {
@@ -14111,11 +14508,24 @@ private:
                         required - distance;
                     const float unitX = deltaX / distance;
                     const float unitY = deltaY / distance;
-                    const float shift = overlap * 0.5f + 0.5f;
-                    firstScreen.x -= unitX * shift;
-                    firstScreen.y -= unitY * shift;
-                    secondScreen.x += unitX * shift;
-                    secondScreen.y += unitY * shift;
+                    if (first.layoutLocked && second.layoutLocked) {
+                        continue;
+                    }
+                    if (first.layoutLocked) {
+                        const float shift = overlap + 0.5f;
+                        secondScreen.x += unitX * shift;
+                        secondScreen.y += unitY * shift;
+                    } else if (second.layoutLocked) {
+                        const float shift = overlap + 0.5f;
+                        firstScreen.x -= unitX * shift;
+                        firstScreen.y -= unitY * shift;
+                    } else {
+                        const float shift = overlap * 0.5f + 0.5f;
+                        firstScreen.x -= unitX * shift;
+                        firstScreen.y -= unitY * shift;
+                        secondScreen.x += unitX * shift;
+                        secondScreen.y += unitY * shift;
+                    }
                     const float firstRadius =
                         CoreScreenRadius(first) + 8.0f;
                     const float secondRadius =
@@ -14140,10 +14550,12 @@ private:
                         std::max(
                             50.0f + secondRadius,
                             client.height - secondRadius));
-                    first.position =
-                        ScreenToWorld(firstScreen);
-                    second.position =
-                        ScreenToWorld(secondScreen);
+                    if (!first.layoutLocked) {
+                        first.position = ScreenToWorld(firstScreen);
+                    }
+                    if (!second.layoutLocked) {
+                        second.position = ScreenToWorld(secondScreen);
+                    }
                     passChanged = true;
                     changed = true;
                 }
@@ -14158,6 +14570,9 @@ private:
         }
         const std::wstring monitorId = CurrentMonitorId();
         for (Core* core : cores) {
+            if (core->layoutLocked) {
+                continue;
+            }
             const D2D1_POINT_2F screen =
                 WorldToScreen(core->position);
             core->xRatio = std::clamp(
@@ -14219,7 +14634,34 @@ private:
 
         std::vector<bool> used(cells.size(), false);
         const std::wstring monitorId = CurrentMonitorId();
+        // A locked core remains at its saved position even during a global
+        // command. Reserve its nearest grid cell so editable cores distribute
+        // around it instead of being assigned into the same space.
+        for (const Core* core : cores) {
+            if (!core->layoutLocked) {
+                continue;
+            }
+            const D2D1_POINT_2F current = WorldToScreen(core->position);
+            std::size_t bestIndex = cells.size();
+            float bestDistance = FLT_MAX;
+            for (std::size_t index = 0; index < cells.size(); ++index) {
+                if (used[index]) {
+                    continue;
+                }
+                const float distance = DistanceSquared(current, cells[index]);
+                if (distance < bestDistance) {
+                    bestDistance = distance;
+                    bestIndex = index;
+                }
+            }
+            if (bestIndex != cells.size()) {
+                used[bestIndex] = true;
+            }
+        }
         for (Core* core : cores) {
+            if (core->layoutLocked) {
+                continue;
+            }
             const D2D1_POINT_2F current =
                 WorldToScreen(core->position);
             std::size_t bestIndex = cells.size();
@@ -14254,12 +14696,28 @@ private:
         StableLayouts();
         ScheduleSave();
         SetStatus(
-            L"所有核心已按完整簇团分散；文件槽位、角度和相对结构保持不变");
+            L"所有未锁定核心已重新排列；锁定核心及其文件位置保持不变");
         Invalidate();
     }
 
     void ArrangeAllCores() {
         if (state_.cores.empty()) {
+            return;
+        }
+        const std::size_t lockedCount = static_cast<std::size_t>(
+            std::count_if(state_.cores.begin(), state_.cores.end(),
+                [](const Core& core) { return core.layoutLocked; }));
+        std::wstring confirmation =
+            L"将重新排列所有未锁定核心及其文件。\n\n"
+            L"不会改变文件归属、父子关系或真实文件位置。\n"
+            L"操作前会保留撤销快照。";
+        if (lockedCount > 0) {
+            confirmation += L"\n\n" + std::to_wstring(lockedCount) +
+                L" 个锁定核心将保持不变。";
+        }
+        if (MessageBoxW(
+                window_, confirmation.c_str(), L"重新排列全部内容",
+                MB_OKCANCEL | MB_ICONQUESTION | MB_DEFBUTTON2) != IDOK) {
             return;
         }
         bool preserveManual = true;
@@ -14289,11 +14747,15 @@ private:
             coreIds.push_back(core.id);
         }
         for (const std::uint64_t coreId : coreIds) {
+            const Core* core = FindCore(coreId);
+            if (core != nullptr && core->layoutLocked) {
+                continue;
+            }
             GrowCoreToSpace(
                 coreId, preserveManual, false);
         }
         SetStatus(
-            L"一键整理完成：先分散核心，再逐个向空白处生长");
+            L"已重新排列全部未锁定内容；锁定核心及其文件位置保持不变");
         Invalidate();
     }
 
@@ -16025,7 +16487,7 @@ private:
             ToggleWorkspacePause();
             break;
         case MenuTraySettings:
-            ShowGlobalSettingsMenu();
+            ShowSettingsWindow();
             break;
         case MenuTrayTutorial:
             StartTutorial();
@@ -20476,6 +20938,10 @@ private:
     std::wstring coreShortLabelPreview_;
     std::wstring coreShortLabelEditError_;
     WorkspaceState coreShortLabelEditSnapshot_;
+    HWND settingsWindow_ = nullptr;
+    HWND settingsContentWindow_ = nullptr;
+    SettingsPage settingsPage_ = SettingsPage::General;
+    std::vector<std::uint64_t> settingsArchivedCoreIds_;
     // Only used while relation recovery protection blocks the main state
     // file. It keeps this independent visual preference writable without
     // overriding the protected relationship document.
@@ -20594,6 +21060,23 @@ LRESULT CALLBACK DividerHandleWindowProcedure(
     }
     if (app != nullptr) {
         return app->HandleDividerHandleMessage(
+            window, message, wParam, lParam);
+    }
+    return DefWindowProcW(window, message, wParam, lParam);
+}
+
+LRESULT CALLBACK SettingsWindowProcedure(
+    HWND window, UINT message, WPARAM wParam, LPARAM lParam) {
+    GravityApp* app = reinterpret_cast<GravityApp*>(
+        GetWindowLongPtrW(window, GWLP_USERDATA));
+    if (message == WM_NCCREATE) {
+        const auto* create = reinterpret_cast<CREATESTRUCTW*>(lParam);
+        app = static_cast<GravityApp*>(create->lpCreateParams);
+        SetWindowLongPtrW(
+            window, GWLP_USERDATA, reinterpret_cast<LONG_PTR>(app));
+    }
+    if (app != nullptr) {
+        return app->HandleSettingsWindowMessage(
             window, message, wParam, lParam);
     }
     return DefWindowProcW(window, message, wParam, lParam);
@@ -22722,6 +23205,9 @@ bool RunSelfTest() {
         L"D:\\Gravity Desktop Files Test";
     source.workspaceWidthRatio = 0.41f;
     source.workspaceCollapsed = true;
+    source.settingsWindowPositionValid = true;
+    source.settingsWindowXRatio = 0.27f;
+    source.settingsWindowYRatio = 0.73f;
     source.tutorialCompleted = true;
     Core core;
     core.id = kUnclassifiedCoreId;
@@ -22809,7 +23295,10 @@ bool RunSelfTest() {
     if (!DeserializeState(SerializeState(source), restored)) {
         return false;
     }
-    if (restored.cores.size() != 1 || restored.cores.front().files.size() != 1 ||
+    if (!restored.settingsWindowPositionValid ||
+        std::abs(restored.settingsWindowXRatio - source.settingsWindowXRatio) > 0.001f ||
+        std::abs(restored.settingsWindowYRatio - source.settingsWindowYRatio) > 0.001f ||
+        restored.cores.size() != 1 || restored.cores.front().files.size() != 1 ||
         restored.families.size() != 1 || restored.families.front().rootFileId != item.id ||
         restored.cores.front().shortLabel != core.shortLabel) {
         return false;
@@ -23217,6 +23706,15 @@ int APIENTRY wWinMain(_In_ HINSTANCE instance, _In_opt_ HINSTANCE,
     dividerHandleClass.lpszClassName =
         kDividerHandleWindowClass;
     if (RegisterClassExW(&dividerHandleClass) == 0) {
+        CloseHandle(instanceMutex);
+        OleUninitialize();
+        return 1;
+    }
+    WNDCLASSEXW settingsClass = windowClass;
+    settingsClass.style = CS_HREDRAW | CS_VREDRAW;
+    settingsClass.lpfnWndProc = SettingsWindowProcedure;
+    settingsClass.lpszClassName = kSettingsWindowClass;
+    if (RegisterClassExW(&settingsClass) == 0) {
         CloseHandle(instanceMutex);
         OleUninitialize();
         return 1;
