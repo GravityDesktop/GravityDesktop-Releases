@@ -3611,7 +3611,7 @@ public:
             return 0;
         }
         case WM_MOUSELEAVE:
-            OnPointerLeave();
+            OnPointerLeave(source);
             return 0;
         case WM_CANCELMODE:
             CancelPointerOperation();
@@ -3645,6 +3645,7 @@ public:
         case WM_NCDESTROY:
             if (interactionWindow_ == source) {
                 DestroyDividerTooltip();
+                ClearInteractionWindowRuntime(source);
                 interactionWindow_ = nullptr;
             }
             SetWindowLongPtrW(source, GWLP_USERDATA, 0);
@@ -3664,7 +3665,11 @@ public:
         case WM_ERASEBKGND:
             return 1;
         case WM_NCHITTEST:
-            return HTCLIENT;
+            // This popup paints the hollow guide strokes only. Mouse input is
+            // handled by the full triangular region on interactionWindow_, so
+            // moving between a black stroke and a transparent gap never
+            // toggles hover state or flickers the handle.
+            return HTTRANSPARENT;
         case WM_MOUSEACTIVATE:
             return MA_NOACTIVATE;
         case WM_SETCURSOR:
@@ -3821,7 +3826,7 @@ public:
             OnMouseMove(GET_X_LPARAM(lParam), GET_Y_LPARAM(lParam));
             return 0;
         case WM_MOUSELEAVE:
-            OnPointerLeave();
+            OnPointerLeave(source);
             return 0;
         case WM_CANCELMODE:
             CancelPointerOperation();
@@ -3899,6 +3904,8 @@ public:
             return 0;
         case WM_NCDESTROY:
             if (window_ == source) {
+                CancelPointerLeaveTracking(source);
+                StopSelectionDismissTimer();
                 window_ = nullptr;
             }
             SetWindowLongPtrW(source, GWLP_USERDATA, 0);
@@ -4299,6 +4306,30 @@ private:
     bool ScreenPointInsideInteractionIsland(
         POINT screenPoint) const {
         const HWND windowAtPoint = WindowFromPoint(screenPoint);
+        auto pointInsideWindowRegion =
+            [screenPoint](HWND target) {
+                if (target == nullptr ||
+                    IsWindowVisible(target) == FALSE) {
+                    return false;
+                }
+                RECT frame{};
+                if (GetWindowRect(target, &frame) == FALSE) {
+                    return false;
+                }
+                HRGN region = CreateRectRgn(0, 0, 0, 0);
+                if (region == nullptr) {
+                    return false;
+                }
+                const int regionKind = GetWindowRgn(target, region);
+                const bool inside =
+                    regionKind != ERROR &&
+                    PtInRegion(
+                        region,
+                        screenPoint.x - frame.left,
+                        screenPoint.y - frame.top) != FALSE;
+                DeleteObject(region);
+                return inside;
+            };
         // The short-label editor is a temporary activating popup so Windows
         // can deliver keyboard and IME input. It is intentionally separate
         // from the non-activating interaction-island window. Treat it as an
@@ -4311,6 +4342,10 @@ private:
              IsChild(coreShortLabelEditWindow_, windowAtPoint) != FALSE)) {
             return true;
         }
+        if (windowAtPoint == dividerHandleWindow_ &&
+            pointInsideWindowRegion(dividerHandleWindow_)) {
+            return true;
+        }
         const bool interactionReceivesPoint =
             windowAtPoint == interactionWindow_ ||
             (interactionWindow_ != nullptr &&
@@ -4321,47 +4356,35 @@ private:
         if (!interactionReceivesPoint) {
             return false;
         }
-        bool insideInteractionIsland = false;
-        if (interactionWindow_ != nullptr &&
-            IsWindowVisible(interactionWindow_) != FALSE) {
-            RECT frame{};
-            if (GetWindowRect(interactionWindow_, &frame) != FALSE) {
-                HRGN region = CreateRectRgn(0, 0, 0, 0);
-                if (region != nullptr) {
-                    const int regionKind =
-                        GetWindowRgn(interactionWindow_, region);
-                    insideInteractionIsland =
-                        regionKind != ERROR &&
-                        PtInRegion(
-                            region,
-                            screenPoint.x - frame.left,
-                            screenPoint.y - frame.top) != FALSE;
-                    DeleteObject(region);
-                }
-            }
-        }
-        return insideInteractionIsland;
+        return pointInsideWindowRegion(interactionWindow_);
     }
 
     void SyncSelectionDismissTimer() {
         if (window_ == nullptr) {
+            selectionDismissTimerActive_ = false;
+            selectionDismissButtonsDown_ = false;
             return;
         }
         const bool shouldRun =
-            selected_.kind != HitKind::None ||
-            focusedCoreId_ != 0 ||
-            FocusAnimationActive() ||
-            CoreDistanceSliderOpen() ||
-            CoreAppearancePanelOpen();
+            initialized_ && workspaceVisible_ &&
+            !state_.workspacePaused && !shuttingDown_ &&
+            !exitRequested_ &&
+            (selected_.kind != HitKind::None ||
+             focusedCoreId_ != 0 ||
+             FocusAnimationActive() ||
+             CoreDistanceSliderOpen() ||
+             CoreAppearancePanelOpen());
         if (shouldRun && !selectionDismissTimerActive_) {
             selectionDismissButtonsDown_ =
                 (GetAsyncKeyState(VK_LBUTTON) & 0x8000) != 0 ||
                 (GetAsyncKeyState(VK_RBUTTON) & 0x8000) != 0 ||
                 (GetAsyncKeyState(VK_MBUTTON) & 0x8000) != 0;
-            SetTimer(
-                window_, kSelectionDismissTimer,
-                32, nullptr);
-            selectionDismissTimerActive_ = true;
+            selectionDismissTimerActive_ =
+                SetTimer(window_, kSelectionDismissTimer,
+                         32, nullptr) != 0;
+            if (!selectionDismissTimerActive_) {
+                selectionDismissButtonsDown_ = false;
+            }
         } else if (!shouldRun &&
                    selectionDismissTimerActive_) {
             KillTimer(window_, kSelectionDismissTimer);
@@ -4446,21 +4469,49 @@ private:
         Invalidate();
     }
 
+    void ClearInteractionWindowRuntime(HWND source) {
+        CancelPointerLeaveTracking(source);
+        if (interactionDropTargetRegistered_) {
+            if (source != nullptr && IsWindow(source) != FALSE) {
+                RevokeDragDrop(source);
+            }
+            interactionDropTargetRegistered_ = false;
+        }
+        DiscardInteractionSurface();
+        interactionShapes_.clear();
+        interactionDividerRegionIncluded_ = false;
+        editWindow_ = nullptr;
+        oldEditProc_ = nullptr;
+        editingCoreId_ = 0;
+        editingItemId_ = 0;
+        editingRenameTarget_ = RenameTargetKind::Core;
+        editingPreservedExtension_.clear();
+        editingWidthDip_ = 96.0f;
+        coreShortLabelEditWindow_ = nullptr;
+        oldCoreShortLabelEditProc_ = nullptr;
+        coreShortLabelEditingCoreId_ = 0;
+        coreShortLabelPreview_.clear();
+        coreShortLabelEditError_.clear();
+        hover_ = {};
+        hasMarqueeLabels_ = false;
+        marqueeItemId_ = 0;
+        if (window_ != nullptr) {
+            KillTimer(window_, kHoverTooltipTimer);
+            KillTimer(window_, kMarqueeTimer);
+            KillTimer(window_, kRelationPreviewTimer);
+        }
+    }
+
     void DestroyInteractionWindow() {
         DestroyDividerTooltip();
         if (interactionWindow_ == nullptr) {
+            ClearInteractionWindowRuntime(nullptr);
             return;
         }
-        if (interactionDropTargetRegistered_) {
-            RevokeDragDrop(interactionWindow_);
-            interactionDropTargetRegistered_ = false;
-        }
         HWND interaction = interactionWindow_;
+        ClearInteractionWindowRuntime(interaction);
         interactionWindow_ = nullptr;
-        DiscardInteractionSurface();
         DestroyWindow(interaction);
-        interactionShapes_.clear();
-        interactionDividerRegionIncluded_ = false;
     }
 
     void AttachInteractionWindowToCompanionLayer() {
@@ -4616,8 +4667,7 @@ private:
         if (source != interactionWindow_ || !DividerEnabled()) {
             return false;
         }
-        const int overhang = interactionContentOffsetPixels_;
-        const int width = DividerHandleWidthPixels();
+        const int centerX = interactionContentOffsetPixels_;
         const int tipY = std::min(
             DividerHandleHeightPixels() - 1,
             std::max(1, DipToPixels(46.0f)));
@@ -4627,8 +4677,9 @@ private:
         const float remaining = 1.0f -
             static_cast<float>(y) / static_cast<float>(tipY);
         const float halfWidth =
-            static_cast<float>(width) * 0.5f * remaining;
-        return std::abs(static_cast<float>(x - overhang)) <= halfWidth;
+            static_cast<float>(DividerHandleWidthPixels()) *
+            0.5f * remaining;
+        return std::abs(static_cast<float>(x - centerX)) <= halfWidth;
     }
 
     void ApplyCompanionWorkspaceFrame() {
@@ -4821,26 +4872,8 @@ private:
         }
         if (interactionWindow_ != nullptr &&
             IsWindow(interactionWindow_) == FALSE) {
-            if (interactionDropTargetRegistered_) {
-                RevokeDragDrop(interactionWindow_);
-            }
+            ClearInteractionWindowRuntime(interactionWindow_);
             interactionWindow_ = nullptr;
-            interactionDropTargetRegistered_ = false;
-            DiscardInteractionSurface();
-            interactionShapes_.clear();
-            interactionDividerRegionIncluded_ = false;
-            editWindow_ = nullptr;
-            oldEditProc_ = nullptr;
-            editingCoreId_ = 0;
-            editingItemId_ = 0;
-            editingRenameTarget_ = RenameTargetKind::Core;
-            editingPreservedExtension_.clear();
-            editingWidthDip_ = 96.0f;
-            coreShortLabelEditWindow_ = nullptr;
-            oldCoreShortLabelEditProc_ = nullptr;
-            coreShortLabelEditingCoreId_ = 0;
-            coreShortLabelPreview_.clear();
-            coreShortLabelEditError_.clear();
         }
         if (window_ != nullptr &&
             IsWindow(window_) == FALSE) {
@@ -4894,6 +4927,22 @@ private:
         selectionDismissTimerActive_ = false;
         SyncSelectionDismissTimer();
         SyncCoreSelectionRippleTimer();
+        if (FocusAnimationActive() ||
+            !coreExpansionFrom_.empty()) {
+            const bool animationTimerStarted =
+                workspaceVisible_ && !state_.workspacePaused &&
+                SetTimer(window_, kAnimationTimer, 16, nullptr) != 0;
+            if (!animationTimerStarted) {
+                focusAnimationState_ =
+                    focusedCoreId_ == 0
+                        ? FocusAnimationState::Idle
+                        : FocusAnimationState::Focused;
+                animationCoreFrom_.clear();
+                animationFromFocus_.clear();
+                coreExpansionFrom_.clear();
+                layoutDirty_ = true;
+            }
+        }
         if (dirty_) {
             SetTimer(window_, kSaveTimer, 600, nullptr);
         }
@@ -5151,16 +5200,20 @@ private:
                 ShowWindow(interactionWindow_, SW_SHOWNOACTIVATE);
             }
             EnsureInteractionWindowPresented();
+            SyncSelectionDismissTimer();
             SyncCoreSelectionRippleTimer();
             Invalidate();
         } else {
             if (window_ == nullptr ||
                 IsWindow(window_) == FALSE) {
                 workspaceVisible_ = false;
+                StopSelectionDismissTimer();
                 return;
             }
             if (SaveState()) {
                 workspaceVisible_ = false;
+                StopSelectionDismissTimer();
+                OnPointerLeave(pointerLeaveTrackingWindow_);
                 hidingToTray_ = true;
                 if (interactionWindow_ != nullptr) {
                     ShowWindow(interactionWindow_, SW_HIDE);
@@ -5237,6 +5290,8 @@ private:
         state_.workspacePaused = !state_.workspacePaused;
         if (state_.workspacePaused) {
             workspaceVisible_ = false;
+            StopSelectionDismissTimer();
+            OnPointerLeave(pointerLeaveTrackingWindow_);
             hidingToTray_ = true;
             if (interactionWindow_ != nullptr) {
                 ShowWindow(interactionWindow_, SW_HIDE);
@@ -5263,6 +5318,7 @@ private:
             }
         }
         ScheduleSave();
+        SyncSelectionDismissTimer();
         SyncCoreSelectionRippleTimer();
     }
 
@@ -8578,15 +8634,10 @@ private:
             }
         }
         if (valid && includeDividerRegion) {
-            const int handleWidth = DividerHandleWidthPixels();
-            const int tipY = std::min(
-                DividerHandleHeightPixels() - 1,
-                std::max(1, DipToPixels(46.0f)));
-            const POINT points[3]{
-                POINT{0, 0},
-                POINT{handleWidth, 0},
-                POINT{interactionContentOffsetPixels_, tipY}};
-            HRGN dividerRegion = CreatePolygonRgn(points, 3, WINDING);
+            const auto points = DividerInteractionTrianglePoints(
+                interactionContentOffsetPixels_);
+            HRGN dividerRegion = CreatePolygonRgn(
+                points.data(), static_cast<int>(points.size()), WINDING);
             if (dividerRegion == nullptr ||
                 CombineRgn(
                     combined, combined, dividerRegion, RGN_OR) == ERROR) {
@@ -8902,6 +8953,14 @@ private:
             DeleteObject(settingsEmphasisFont_);
             settingsEmphasisFont_ = nullptr;
         }
+    }
+
+    void StopSelectionDismissTimer() {
+        if (window_ != nullptr) {
+            KillTimer(window_, kSelectionDismissTimer);
+        }
+        selectionDismissTimerActive_ = false;
+        selectionDismissButtonsDown_ = false;
     }
 
     void ApplySettingsControlFont(HWND control) const {
@@ -16196,16 +16255,36 @@ private:
     }
 
     void EnsurePointerLeaveTracking(HWND source) {
-        if (mouseTracking_ || source == nullptr) return;
+        if (source == nullptr ||
+            pointerLeaveTrackingWindow_ == source) {
+            return;
+        }
+        CancelPointerLeaveTracking();
         TRACKMOUSEEVENT tracking{
             sizeof(tracking), TME_LEAVE, source, 0};
         if (TrackMouseEvent(&tracking) != FALSE) {
-            mouseTracking_ = true;
+            pointerLeaveTrackingWindow_ = source;
         }
     }
 
-    void OnPointerLeave() {
-        mouseTracking_ = false;
+    void CancelPointerLeaveTracking(HWND source = nullptr) {
+        if (pointerLeaveTrackingWindow_ == nullptr ||
+            (source != nullptr &&
+             pointerLeaveTrackingWindow_ != source)) {
+            return;
+        }
+        const HWND tracked = pointerLeaveTrackingWindow_;
+        pointerLeaveTrackingWindow_ = nullptr;
+        if (IsWindow(tracked) != FALSE) {
+            TRACKMOUSEEVENT cancel{
+                sizeof(cancel), TME_LEAVE | TME_CANCEL,
+                tracked, 0};
+            TrackMouseEvent(&cancel);
+        }
+    }
+
+    void OnPointerLeave(HWND source) {
+        CancelPointerLeaveTracking(source);
         if (!draggingDivider_) {
             const bool wasDividerHovered = dividerHovered_;
             dividerHovered_ = false;
@@ -16223,38 +16302,7 @@ private:
         Invalidate();
     }
 
-    void BeginItemOpenCursorFeedback() {
-        if (window_ == nullptr || IsWindow(window_) == FALSE) {
-            return;
-        }
-        itemOpenCursorFeedbackActive_ = true;
-        SetCursor(LoadCursorW(nullptr, IDC_APPSTARTING));
-    }
-
-    void EndItemOpenCursorFeedback() {
-        itemOpenCursorFeedbackActive_ = false;
-
-        POINT cursor{};
-        if (GetCursorPos(&cursor) == FALSE) {
-            return;
-        }
-        const HWND cursorWindow = WindowFromPoint(cursor);
-        if (cursorWindow == window_ ||
-            cursorWindow == interactionWindow_) {
-            SetInteractionCursor(cursorWindow);
-        } else {
-            // ShellExecuteEx has completed. Do not keep a synthetic busy
-            // cursor while the target app finishes loading; this mirrors the
-            // ordinary desktop icon behaviour for fast file associations.
-            SetCursor(LoadCursorW(nullptr, IDC_ARROW));
-        }
-    }
-
     void SetInteractionCursor(HWND source) {
-        if (itemOpenCursorFeedbackActive_) {
-            SetCursor(LoadCursorW(nullptr, IDC_APPSTARTING));
-            return;
-        }
         POINT cursor{};
         GetCursorPos(&cursor);
         ScreenToClient(source, &cursor);
@@ -19401,14 +19449,15 @@ private:
         }
 
         SHELLEXECUTEINFOW execute{sizeof(execute)};
-        execute.fMask = SEE_MASK_FLAG_NO_UI;
+        // Use the Shell's asynchronous desktop-style invocation. Cursor
+        // ownership remains entirely with Windows and the target application;
+        // GravityDesktop must not install a synthetic global busy cursor.
+        execute.fMask = SEE_MASK_FLAG_NO_UI | SEE_MASK_ASYNCOK;
         execute.hwnd = window_;
         execute.lpVerb = L"open";
         execute.lpFile = item->path.c_str();
         execute.nShow = SW_SHOWNORMAL;
-        BeginItemOpenCursorFeedback();
         const BOOL opened = ShellExecuteExW(&execute);
-        EndItemOpenCursorFeedback();
         if (opened != FALSE) {
             item->missing = false;
             ++item->openCount;
@@ -20730,26 +20779,29 @@ private:
         return std::max(1, DipToPixels(60.0f));
     }
 
+    std::array<POINT, 3> DividerInteractionTrianglePoints(
+        int centerX) const {
+        const int halfWidth = DividerHandleWidthPixels() / 2;
+        const int tipY = std::min(
+            DividerHandleHeightPixels() - 1,
+            std::max(1, DipToPixels(46.0f)));
+        return {
+            POINT{centerX - halfWidth, 0},
+            POINT{centerX + halfWidth, 0},
+            POINT{centerX, tipY},
+        };
+    }
+
     void UpdateDividerHandleHitRegion() {
         if (dividerHandleWindow_ == nullptr ||
             IsWindow(dividerHandleWindow_) == FALSE) {
             return;
         }
         const int width = DividerHandleWidthPixels();
-        const int height = DividerHandleHeightPixels();
         const int centerX = width / 2;
-        const int top = std::max(1, DipToPixels(5.0f));
-        const int tipY = std::min(
-            height - 1, top + std::max(1, DipToPixels(36.0f)));
-        const int topHalfWidth = std::max(1, DipToPixels(49.0f));
-        const int padding = std::max(1, DipToPixels(5.0f));
-        const POINT points[3]{
-            POINT{std::max(0, centerX - topHalfWidth - padding),
-                  std::max(0, top - padding)},
-            POINT{std::min(width, centerX + topHalfWidth + padding),
-                  std::max(0, top - padding)},
-            POINT{centerX, std::min(height, tipY + padding)}};
-        if (HRGN region = CreatePolygonRgn(points, 3, WINDING);
+        const auto points = DividerInteractionTrianglePoints(centerX);
+        if (HRGN region = CreatePolygonRgn(
+                points.data(), static_cast<int>(points.size()), WINDING);
             region != nullptr) {
             // SetWindowRgn takes ownership on success. The region makes the
             // entire inverted-triangle surface draggable while allowing the
@@ -21214,7 +21266,6 @@ private:
     bool hidingToTray_ = false;
     bool exitRequested_ = false;
     bool workspaceVisible_ = true;
-    bool itemOpenCursorFeedbackActive_ = false;
     bool trayIconAdded_ = false;
     bool trayRebuildPending_ = false;
     bool shellHookRegistered_ = false;
@@ -21291,7 +21342,7 @@ private:
     std::unordered_map<std::uint64_t, CoreLayoutInvariant> layoutInvariants_;
     std::chrono::steady_clock::time_point coreExpansionStarted_ =
         std::chrono::steady_clock::now();
-    bool mouseTracking_ = false;
+    HWND pointerLeaveTrackingWindow_ = nullptr;
     bool panning_ = false;
     bool draggingCore_ = false;
     bool draggingItem_ = false;
