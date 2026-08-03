@@ -90,14 +90,12 @@ constexpr UINT_PTR kDesktopHostWatchTimer = 10;
 constexpr UINT_PTR kDesktopReconnectTimer = 11;
 constexpr UINT_PTR kInteractionLayerRepairTimer = 12;
 constexpr UINT_PTR kDesktopVisibilityRestoreTimer = 13;
-constexpr UINT_PTR kItemOpenCursorTimer = 14;
 constexpr auto kManagedCollectionConfirmationWindow =
     std::chrono::minutes(10);
 constexpr UINT kDesktopHostWatchIntervalMs = 2000;
 constexpr UINT kDesktopReconnectIntervalMs = 250;
 constexpr UINT kInteractionLayerRepairDelayMs = 600;
 constexpr UINT kDesktopVisibilityRestoreDelayMs = 180;
-constexpr UINT kItemOpenCursorFeedbackMs = 900;
 constexpr int kDesktopReconnectAttemptLimit = 40;
 constexpr std::size_t kMaxRelationTraversalNodes = 4096;
 constexpr std::size_t kMaxRelationTraversalDepth = 256;
@@ -16231,17 +16229,9 @@ private:
         }
         itemOpenCursorFeedbackActive_ = true;
         SetCursor(LoadCursorW(nullptr, IDC_APPSTARTING));
-        // ShellExecuteEx returns before the target application is ready. Keep
-        // Windows' normal app-starting cursor briefly so opening a core file
-        // has the same immediate acknowledgement as a desktop icon.
-        SetTimer(window_, kItemOpenCursorTimer,
-                 kItemOpenCursorFeedbackMs, nullptr);
     }
 
     void EndItemOpenCursorFeedback() {
-        if (window_ != nullptr) {
-            KillTimer(window_, kItemOpenCursorTimer);
-        }
         itemOpenCursorFeedbackActive_ = false;
 
         POINT cursor{};
@@ -16252,19 +16242,10 @@ private:
         if (cursorWindow == window_ ||
             cursorWindow == interactionWindow_) {
             SetInteractionCursor(cursorWindow);
-        } else if (cursorWindow != nullptr) {
-            // The pointer may already be over the program that was opened.
-            // Ask that window to restore its own normal cursor instead of
-            // leaving the app-starting cursor globally active until the user
-            // moves the mouse again.
-            const LRESULT cursorSet = SendMessageW(
-                cursorWindow, WM_SETCURSOR,
-                reinterpret_cast<WPARAM>(cursorWindow),
-                MAKELPARAM(HTCLIENT, WM_MOUSEMOVE));
-            if (cursorSet == 0) {
-                SetCursor(LoadCursorW(nullptr, IDC_ARROW));
-            }
         } else {
+            // ShellExecuteEx has completed. Do not keep a synthetic busy
+            // cursor while the target app finishes loading; this mirrors the
+            // ordinary desktop icon behaviour for fast file associations.
             SetCursor(LoadCursorW(nullptr, IDC_ARROW));
         }
     }
@@ -19425,8 +19406,10 @@ private:
         execute.lpVerb = L"open";
         execute.lpFile = item->path.c_str();
         execute.nShow = SW_SHOWNORMAL;
-        if (ShellExecuteExW(&execute) != FALSE) {
-            BeginItemOpenCursorFeedback();
+        BeginItemOpenCursorFeedback();
+        const BOOL opened = ShellExecuteExW(&execute);
+        EndItemOpenCursorFeedback();
+        if (opened != FALSE) {
             item->missing = false;
             ++item->openCount;
             item->lastOpened = UnixTimeNow();
@@ -19895,9 +19878,7 @@ private:
     }
 
     void OnTimer(WPARAM timer) {
-        if (timer == kItemOpenCursorTimer) {
-            EndItemOpenCursorFeedback();
-        } else if (timer == kDesktopVisibilityRestoreTimer) {
+        if (timer == kDesktopVisibilityRestoreTimer) {
             RestoreDesktopVisibilityAfterShellTransition();
         } else if (timer == kSaveTimer) {
             KillTimer(window_, kSaveTimer);
