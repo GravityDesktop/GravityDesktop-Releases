@@ -4493,6 +4493,13 @@ private:
     }
 
     HWND DesktopCompanionInsertAfter() const {
+        // A fallback popup is allowed only as a temporary desktop companion.
+        // It must never sit in the ordinary top-level z-order, where it can
+        // cover a maximized application. The child-hosted path below keeps the
+        // intended Explorer ordering; a fallback is always sent to the bottom.
+        if (!desktopChildHosted_) {
+            return HWND_BOTTOM;
+        }
         HWND previous = HWND_TOP;
         for (HWND candidate = GetTopWindow(nullptr);
              candidate != nullptr;
@@ -4533,6 +4540,15 @@ private:
             return;
         }
         workspaceVisible_ = true;
+        const bool wasChildHosted = desktopChildHosted_;
+        // A transient Explorer/UIPI timing failure used to leave the visual
+        // layer permanently as an owned popup. Retry promotion while the
+        // desktop host is healthy; on success reapply child coordinates once.
+        AttachToDesktopCompanionLayer();
+        if (!wasChildHosted && desktopChildHosted_) {
+            ApplyCompanionWorkspaceFrame();
+            return;
+        }
         AttachInteractionWindowToCompanionLayer();
         ShowWindow(interactionWindow_, SW_SHOWNOACTIVATE);
         // Shell foreground changes can demote this non-activating popup while
@@ -4639,7 +4655,8 @@ private:
         if (window_ == nullptr) return;
         HWND desktopHost = FindDesktopViewHost();
         if (desktopHost == nullptr) return;
-        if (desktopHost == desktopHost_ && desktopHostAttachmentAttempted_) {
+        if (desktopHost == desktopHost_ && desktopChildHosted_ &&
+            GetParent(window_) == desktopHost) {
             AttachInteractionWindowToCompanionLayer();
             AttachDividerHandleWindowToCompanionLayer();
             return;
@@ -4680,7 +4697,13 @@ private:
             reinterpret_cast<LONG_PTR>(desktopHost));
         SetWindowPos(window_, nullptr, 0, 0, 0, 0,
             SWP_FRAMECHANGED | SWP_NOMOVE | SWP_NOSIZE |
-            SWP_NOACTIVATE | SWP_NOZORDER);
+                SWP_NOACTIVATE | SWP_NOZORDER);
+        // Do not wait for a later frame update to demote a fallback popup.
+        // This keeps ordinary windows, including their maximize transition,
+        // above the companion surface from the first visible frame.
+        SetWindowPos(window_, HWND_BOTTOM, 0, 0, 0, 0,
+            SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE |
+                SWP_NOOWNERZORDER | SWP_NOREDRAW);
         AttachDividerHandleWindowToCompanionLayer();
     }
 
