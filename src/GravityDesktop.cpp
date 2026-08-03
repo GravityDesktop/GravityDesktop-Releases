@@ -4315,10 +4315,27 @@ private:
         }
     }
 
+    struct MouseButtonState {
+        bool anyDown = false;
+        bool anyPressedSinceLastPoll = false;
+    };
+
+    MouseButtonState QueryMouseButtons() const {
+        const SHORT left = GetAsyncKeyState(VK_LBUTTON);
+        const SHORT right = GetAsyncKeyState(VK_RBUTTON);
+        const SHORT middle = GetAsyncKeyState(VK_MBUTTON);
+        return {
+            (left & 0x8000) != 0 ||
+                (right & 0x8000) != 0 ||
+                (middle & 0x8000) != 0,
+            (left & 0x0001) != 0 ||
+                (right & 0x0001) != 0 ||
+                (middle & 0x0001) != 0,
+        };
+    }
+
     bool AnyMouseButtonDown() const {
-        return (GetAsyncKeyState(VK_LBUTTON) & 0x8000) != 0 ||
-               (GetAsyncKeyState(VK_RBUTTON) & 0x8000) != 0 ||
-               (GetAsyncKeyState(VK_MBUTTON) & 0x8000) != 0;
+        return QueryMouseButtons().anyDown;
     }
 
     UINT TrackPopupMenuPreservingSelection(
@@ -4336,7 +4353,8 @@ private:
         if (!selectionDismissTimerActive_) {
             return;
         }
-        const bool buttonDown = AnyMouseButtonDown();
+        const MouseButtonState mouseButtons = QueryMouseButtons();
+        const bool buttonDown = mouseButtons.anyDown;
         if (popupMenuOpen_) {
             selectionDismissButtonsDown_ = buttonDown;
             return;
@@ -4344,7 +4362,10 @@ private:
         const bool pressedNow =
             buttonDown && !selectionDismissButtonsDown_;
         selectionDismissButtonsDown_ = buttonDown;
-        if (!pressedNow) {
+        // A desktop click can be fully passed through to Explorer between two
+        // 32 ms timer ticks. The low-order GetAsyncKeyState bit preserves
+        // that short press so transient panels still close reliably.
+        if (!pressedNow && !mouseButtons.anyPressedSinceLastPoll) {
             return;
         }
         if (draggingCore_ || draggingItem_ || draggingDivider_ ||
