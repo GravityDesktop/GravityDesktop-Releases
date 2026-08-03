@@ -6927,15 +6927,15 @@ private:
             draggingCore_ && dragCoreId_ != 0
                 ? dragCoreId_
                 : focusedCoreId_;
-        if (anchoredCoreId != 0) {
-            std::stable_sort(
-                corePlacementOrder.begin(), corePlacementOrder.end(),
-                [anchoredCoreId](const Core* first,
-                                 const Core* second) {
-                    return first->id == anchoredCoreId &&
-                           second->id != anchoredCoreId;
-                });
-        }
+        std::stable_sort(
+            corePlacementOrder.begin(), corePlacementOrder.end(),
+            [anchoredCoreId](const Core* first, const Core* second) {
+                if (first->layoutLocked != second->layoutLocked) {
+                    return first->layoutLocked;
+                }
+                return first->id == anchoredCoreId &&
+                       second->id != anchoredCoreId;
+            });
         for (Core* corePointer : corePlacementOrder) {
             Core& core = *corePointer;
             // Core movement is a last-stage hard-body rule.  File extents are
@@ -6946,6 +6946,14 @@ private:
             D2D1_POINT_2F preferred =
                 clampCore(WorldToScreen(core.position));
             D2D1_POINT_2F resolved = preferred;
+            if (core.layoutLocked) {
+                // A locked core is an obstacle, never a collision candidate
+                // that gets visually displaced by another cluster.
+                coreBoundaries.push_back(
+                    {core.id, resolved, coreCollisionRadius});
+                coreDisplayPositions_[core.id] = ScreenToWorld(resolved);
+                continue;
+            }
             bool placed = false;
             for (int shell = 0; shell <= 50 && !placed; ++shell) {
                 const int directions = shell == 0 ? 1 : 24;
@@ -7543,6 +7551,9 @@ private:
         const std::wstring monitorId = CurrentMonitorId();
         bool changed = false;
         for (Core& core : state_.cores) {
+            if (core.layoutLocked) {
+                continue;
+            }
             const auto found =
                 coreDisplayPositions_.find(core.id);
             if (found == coreDisplayPositions_.end()) {
@@ -9370,6 +9381,10 @@ private:
     void OpenCoreDistanceSlider(std::uint64_t coreId) {
         const Core* core = FindCore(coreId);
         if (core == nullptr) return;
+        if (core->layoutLocked) {
+            SetStatus(L"当前核心与文件位置已锁定；无法调整圈距或整体角度");
+            return;
+        }
         CloseCoreAppearancePanel();
         coreDistanceSliderCoreId_ = coreId;
         coreDistanceSliderActive_ = true;
@@ -11947,6 +11962,38 @@ private:
         }
         renderTarget_->SetTransform(D2D1::Matrix3x2F::Identity());
 
+        if (core.layoutLocked) {
+            // The lock is intentionally a small persistent status marker.
+            // It belongs to the core's display layer and never expands the
+            // hit region or changes any layout geometry.
+            const float lockSize = std::clamp(coreRadius * 0.34f, 8.0f, 12.0f);
+            const D2D1_POINT_2F lockCenter = D2D1::Point2F(
+                center.x - coreRadius * 0.62f,
+                center.y - coreRadius * 0.62f);
+            const D2D1_RECT_F lockBody = D2D1::RectF(
+                lockCenter.x - lockSize * 0.50f,
+                lockCenter.y - lockSize * 0.03f,
+                lockCenter.x + lockSize * 0.50f,
+                lockCenter.y + lockSize * 0.50f);
+            brush_->SetColor(D2D1::ColorF(0x17212D, 0.82f));
+            renderTarget_->FillRoundedRectangle(
+                D2D1::RoundedRect(lockBody, 2.0f, 2.0f), brush_.Get());
+            brush_->SetColor(D2D1::ColorF(0xF7FAFF, 0.92f));
+            renderTarget_->DrawRoundedRectangle(
+                D2D1::RoundedRect(
+                    D2D1::RectF(lockCenter.x - lockSize * 0.28f,
+                                 lockCenter.y - lockSize * 0.46f,
+                                 lockCenter.x + lockSize * 0.28f,
+                                 lockCenter.y + lockSize * 0.20f),
+                    lockSize * 0.26f, lockSize * 0.26f),
+                brush_.Get(), 1.15f);
+            renderTarget_->FillEllipse(
+                D2D1::Ellipse(
+                    D2D1::Point2F(lockCenter.x, lockCenter.y + lockSize * 0.21f),
+                    1.0f, 1.0f),
+                brush_.Get());
+        }
+
         const std::wstring name = Shorten(core.name, 18);
         const D2D1_RECT_F nameRect =
             CoreNameRectangle(core, center, coreRadius);
@@ -13474,17 +13521,13 @@ private:
     }
 
     bool ConfirmExplicitLayoutCommand(const Core& core,
-                                      const wchar_t* command) const {
+                                      const wchar_t* command) {
         if (!core.layoutLocked) {
             return true;
         }
-        const std::wstring message =
-            L"当前布局已锁定。\n\n执行“" +
-            std::wstring(command) +
-            L"”会解除锁定并重新整理文件。是否继续？";
-        return MessageBoxW(
-                   window_, message.c_str(), L"布局已锁定",
-                   MB_YESNO | MB_ICONQUESTION | MB_DEFBUTTON2) == IDYES;
+        SetStatus(L"当前核心与文件位置已锁定；请先解除锁定后再执行“" +
+                  std::wstring(command) + L"”");
+        return false;
     }
 
     void OptimizeCoreLayout(Core& core, bool preserveManual = true) {
@@ -13953,8 +13996,8 @@ private:
         core->layoutLocked = !core->layoutLocked;
         ScheduleSave();
         SetStatus(core->layoutLocked
-                      ? L"当前核心布局已锁定；自动整理和方向调整不会改动它"
-                      : L"当前核心布局已解锁；可再次进行整理和方向调整");
+                      ? L"已锁定核心与文件位置；拖动、自动整理和布局调节不会移动已有节点"
+                      : L"已解除核心与文件位置锁定；可以重新拖动和调整布局");
         Invalidate();
     }
 
@@ -14313,6 +14356,9 @@ private:
         Core* core = FindCore(coreId);
         if (core == nullptr || core->savedBaselineLayout.empty()) {
             SetStatus(L"当前核心尚未保存默认布局");
+            return;
+        }
+        if (!ConfirmExplicitLayoutCommand(*core, L"恢复我的布局")) {
             return;
         }
         PushUndo(state_);
@@ -14896,6 +14942,12 @@ private:
         dragMoved_ = false;
         dragSnapshot_ = state_;
         if (hit.kind == HitKind::Core) {
+            if (const Core* core = FindCore(hit.coreId);
+                core != nullptr && core->layoutLocked) {
+                SetStatus(L"当前核心与文件位置已锁定；请先解除锁定后再拖动");
+                Invalidate();
+                return;
+            }
             draggingCore_ = true;
             dragCoreId_ = hit.coreId;
             if (Core* core = FindCore(hit.coreId)) {
@@ -14903,6 +14955,9 @@ private:
             }
             SetCapture(window_);
         } else if (hit.kind == HitKind::Item) {
+            const Core* ownerCore = FindCore(hit.coreId);
+            dragItemPositionLocked_ =
+                ownerCore != nullptr && ownerCore->layoutLocked;
             draggingItem_ = true;
             dragCoreId_ = hit.coreId;
             dragItemId_ = hit.itemId;
@@ -14992,7 +15047,9 @@ private:
             const bool connectToCore = draggedItem != nullptr && targetId != 0 &&
                 (draggedItem->detachedFromUpper ||
                  (draggedItem->parentFileId != 0 && dropHit.kind == HitKind::Core));
-            if (connectToCore) {
+            if (dragItemPositionLocked_ && !connectToCore) {
+                SetStatus(L"当前核心与文件位置已锁定；拖动只可用于建立关系或重新连接到核心");
+            } else if (connectToCore) {
                 AttachItemToCore(dragCoreId_, dragItemId_, targetId,
                                  std::move(dragSnapshot_));
             } else if (targetId != 0 && targetId != dragCoreId_) {
@@ -15521,6 +15578,7 @@ private:
         panning_ = false;
         draggingCore_ = false;
         draggingItem_ = false;
+        dragItemPositionLocked_ = false;
         dragMoved_ = false;
         relationTargetItemId_ = 0;
         relationTargetCoreId_ = 0;
@@ -15717,11 +15775,14 @@ private:
             AppendMenuW(menu, MF_STRING, MenuCoreAppearanceSettings,
                         L"核心外观设置...");
             AppendMenuW(menu, MF_SEPARATOR, 0, nullptr);
-            AppendMenuW(menu, MF_STRING, MenuOptimizeCore,
+            const bool layoutLocked = core != nullptr && core->layoutLocked;
+            const UINT layoutCommandState =
+                MF_STRING | (layoutLocked ? MF_GRAYED : 0);
+            AppendMenuW(menu, layoutCommandState, MenuOptimizeCore,
                         L"恢复推荐布局");
-            AppendMenuW(menu, MF_STRING, MenuKeepAngles,
+            AppendMenuW(menu, layoutCommandState, MenuKeepAngles,
                         L"按圈均匀排列");
-            AppendMenuW(menu, MF_STRING, MenuSingleRing,
+            AppendMenuW(menu, layoutCommandState, MenuSingleRing,
                         L"单环均匀排列");
             const std::size_t attachedCount =
                 core != nullptr ? AttachedFileCount(*core) : 0;
@@ -15733,7 +15794,7 @@ private:
                     : L"紧凑双环（内5＋外10）";
             AppendMenuW(
                 menu,
-                MF_STRING | (attachedCount > 15 ? MF_GRAYED : 0),
+                layoutCommandState | (attachedCount > 15 ? MF_GRAYED : 0),
                 MenuCompactDouble, compactLabel.c_str());
             const std::wstring extendedLabel =
                 attachedCount > 18
@@ -15743,16 +15804,16 @@ private:
                     : L"扩展双环（内6＋外12）";
             AppendMenuW(
                 menu,
-                MF_STRING | (attachedCount > 18 ? MF_GRAYED : 0),
+                layoutCommandState | (attachedCount > 18 ? MF_GRAYED : 0),
                 MenuHighCapacityDouble, extendedLabel.c_str());
-            AppendMenuW(menu, MF_STRING, MenuGrowToSpace,
+            AppendMenuW(menu, layoutCommandState, MenuGrowToSpace,
                         L"向空白处展开");
             HMENU layoutAdjustmentMenu = CreatePopupMenu();
             HMENU connectionStyleMenu = CreateConnectionStyleMenu();
             if (layoutAdjustmentMenu != nullptr &&
                 connectionStyleMenu != nullptr) {
                 AppendMenuW(
-                    layoutAdjustmentMenu, MF_STRING,
+                    layoutAdjustmentMenu, layoutCommandState,
                     MenuAdjustCoreDistance,
                     L"打开布局调节面板...");
                 AppendMenuW(
@@ -15771,21 +15832,21 @@ private:
                     DestroyMenu(layoutAdjustmentMenu);
                 }
                 AppendMenuW(
-                    menu, MF_STRING, MenuAdjustCoreDistance,
+                    menu, layoutCommandState, MenuAdjustCoreDistance,
                     L"调整布局...");
             }
             AppendMenuW(menu, MF_SEPARATOR, 0, nullptr);
             AppendMenuW(
-                menu, MF_STRING, MenuToggleLayoutLock,
+                menu, MF_STRING | (layoutLocked ? MF_CHECKED : 0), MenuToggleLayoutLock,
                 core != nullptr && core->layoutLocked
-                    ? L"解除布局锁定"
-                    : L"锁定布局");
+                    ? L"解除核心与文件位置锁定"
+                    : L"锁定核心与文件位置");
             AppendMenuW(menu, MF_STRING, MenuSaveCoreBaseline,
                         L"设为默认布局");
             const bool hasSavedBaseline =
                 core != nullptr && !core->savedBaselineLayout.empty();
             AppendMenuW(menu,
-                        MF_STRING | (!hasSavedBaseline ? MF_GRAYED : 0),
+                        layoutCommandState | (!hasSavedBaseline ? MF_GRAYED : 0),
                         MenuRestoreCoreBaseline,
                         hasSavedBaseline
                             ? L"恢复默认布局"
@@ -16547,15 +16608,9 @@ private:
             SetStatus(L"收纳失败：目标父文件不存在");
             return false;
         }
-        if (target->layoutLocked) {
-            if (MessageBoxW(
-                    window_,
-                    L"当前核心布局已锁定。\n\n是否解除锁定并收纳文件？",
-                    L"收纳到核心",
-                    MB_YESNO | MB_ICONQUESTION | MB_DEFBUTTON2) != IDYES) {
-                return false;
-            }
-        }
+        // A locked layout protects existing node positions, not the ability
+        // to add a new managed file. The new file receives an unused slot;
+        // no existing item is moved and the lock remains active.
         if (!ConfirmManagedCollection(sourcePath, *target)) {
             SetStatus(L"已取消收纳；真实文件仍保留在 Windows 桌面");
             return false;
@@ -16631,9 +16686,6 @@ private:
             }
             SetStatus(L"收纳失败：目标核心状态已变化，已回滚真实文件");
             return false;
-        }
-        if (candidateCore->layoutLocked) {
-            candidateCore->layoutLocked = false;
         }
         FileItem item;
         item.id = candidate.nextId++;
@@ -16780,17 +16832,6 @@ private:
 
         WorkspaceState before = state_;
         const bool dirtyBefore = dirty_;
-        if (creatingReference && target->layoutLocked) {
-            const int choice = MessageBoxW(
-                window_,
-                L"当前核心布局已锁定。\n\n是否解除锁定并加入子文件？",
-                L"加入子文件",
-                MB_YESNO | MB_ICONQUESTION | MB_DEFBUTTON2);
-            if (choice != IDYES) {
-                return false;
-            }
-            target->layoutLocked = false;
-        }
 
         std::uint64_t childId = 0;
         D2D1_POINT_2F childOriginalWorld = dropWorld;
@@ -16983,15 +17024,6 @@ private:
 
         WorkspaceState before = state_;
         const bool dirtyBefore = dirty_;
-        if (target->layoutLocked) {
-            const int choice = MessageBoxW(
-                window_, L"当前核心布局已锁定。\n\n是否解除锁定并加入文件？",
-                L"加入文件", MB_YESNO | MB_ICONQUESTION | MB_DEFBUTTON2);
-            if (choice != IDYES) {
-                return;
-            }
-            target->layoutLocked = false;
-        }
         int added = 0;
         int moved = 0;
         int skipped = 0;
@@ -17677,15 +17709,6 @@ private:
         Core* target = FindCore(targetId);
         if (target == nullptr) {
             return;
-        }
-        if (target->layoutLocked) {
-            const int choice = MessageBoxW(
-                window_, L"目标核心布局已锁定。\n\n是否解除锁定并加入文件？",
-                L"移动文件", MB_YESNO | MB_ICONQUESTION | MB_DEFBUTTON2);
-            if (choice != IDYES) {
-                return;
-            }
-            target->layoutLocked = false;
         }
         std::vector<std::uint64_t> movedIds;
         std::wstring moveError;
@@ -20408,6 +20431,7 @@ private:
     bool dividerHovered_ = false;
     bool dividerHandleMouseTracking_ = false;
     bool dragMoved_ = false;
+    bool dragItemPositionLocked_ = false;
     std::uint64_t dragCoreId_ = 0;
     std::uint64_t dragItemId_ = 0;
     std::uint64_t dragTargetCoreId_ = 0;
