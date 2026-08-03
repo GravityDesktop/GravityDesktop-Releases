@@ -16252,6 +16252,20 @@ private:
         if (cursorWindow == window_ ||
             cursorWindow == interactionWindow_) {
             SetInteractionCursor(cursorWindow);
+        } else if (cursorWindow != nullptr) {
+            // The pointer may already be over the program that was opened.
+            // Ask that window to restore its own normal cursor instead of
+            // leaving the app-starting cursor globally active until the user
+            // moves the mouse again.
+            const LRESULT cursorSet = SendMessageW(
+                cursorWindow, WM_SETCURSOR,
+                reinterpret_cast<WPARAM>(cursorWindow),
+                MAKELPARAM(HTCLIENT, WM_MOUSEMOVE));
+            if (cursorSet == 0) {
+                SetCursor(LoadCursorW(nullptr, IDC_ARROW));
+            }
+        } else {
+            SetCursor(LoadCursorW(nullptr, IDC_ARROW));
         }
     }
 
