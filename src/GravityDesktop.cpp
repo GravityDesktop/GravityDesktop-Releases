@@ -65,6 +65,8 @@ constexpr wchar_t kDividerHandleWindowClass[] =
     L"GravityDesktop.DividerHandle";
 constexpr wchar_t kSettingsWindowClass[] =
     L"GravityDesktop.SettingsWindow";
+constexpr wchar_t kSettingsContentWindowClass[] =
+    L"GravityDesktop.SettingsContent";
 constexpr wchar_t kShellLifecycleWindowClass[] =
     L"GravityDesktop.ShellLifecycle";
 constexpr wchar_t kWindowTitle[] = L"引力桌面系统";
@@ -1343,6 +1345,8 @@ LRESULT CALLBACK InteractionWindowProcedure(
 LRESULT CALLBACK DividerHandleWindowProcedure(
     HWND window, UINT message, WPARAM wParam, LPARAM lParam);
 LRESULT CALLBACK SettingsWindowProcedure(
+    HWND window, UINT message, WPARAM wParam, LPARAM lParam);
+LRESULT CALLBACK SettingsContentWindowProcedure(
     HWND window, UINT message, WPARAM wParam, LPARAM lParam);
 
 std::wstring Trim(std::wstring text) {
@@ -8786,10 +8790,46 @@ private:
         return MulDiv(value, static_cast<int>(dpi), 96);
     }
 
+    void CreateSettingsFonts() {
+        if (settingsFont_ != nullptr || settingsWindow_ == nullptr) {
+            return;
+        }
+        const int normalHeight = -SettingsDipToPixels(14);
+        const int titleHeight = -SettingsDipToPixels(18);
+        settingsFont_ = CreateFontW(
+            normalHeight, 0, 0, 0, FW_NORMAL, FALSE, FALSE, FALSE,
+            DEFAULT_CHARSET, OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS,
+            CLEARTYPE_QUALITY, DEFAULT_PITCH | FF_DONTCARE, L"Segoe UI");
+        settingsTitleFont_ = CreateFontW(
+            titleHeight, 0, 0, 0, FW_SEMIBOLD, FALSE, FALSE, FALSE,
+            DEFAULT_CHARSET, OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS,
+            CLEARTYPE_QUALITY, DEFAULT_PITCH | FF_DONTCARE, L"Segoe UI");
+        settingsEmphasisFont_ = CreateFontW(
+            normalHeight, 0, 0, 0, FW_SEMIBOLD, FALSE, FALSE, FALSE,
+            DEFAULT_CHARSET, OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS,
+            CLEARTYPE_QUALITY, DEFAULT_PITCH | FF_DONTCARE, L"Segoe UI");
+    }
+
+    void DestroySettingsFonts() {
+        if (settingsFont_ != nullptr) {
+            DeleteObject(settingsFont_);
+            settingsFont_ = nullptr;
+        }
+        if (settingsTitleFont_ != nullptr) {
+            DeleteObject(settingsTitleFont_);
+            settingsTitleFont_ = nullptr;
+        }
+        if (settingsEmphasisFont_ != nullptr) {
+            DeleteObject(settingsEmphasisFont_);
+            settingsEmphasisFont_ = nullptr;
+        }
+    }
+
     void ApplySettingsControlFont(HWND control) const {
         SendMessageW(
             control, WM_SETFONT,
-            reinterpret_cast<WPARAM>(GetStockObject(DEFAULT_GUI_FONT)), TRUE);
+            reinterpret_cast<WPARAM>(settingsFont_ != nullptr
+                ? settingsFont_ : GetStockObject(DEFAULT_GUI_FONT)), TRUE);
     }
 
     HWND CreateSettingsText(HWND parent, const wchar_t* text,
@@ -8812,7 +8852,7 @@ private:
                               UINT command, DWORD extraStyle = 0) const {
         HWND control = CreateWindowExW(
             0, L"BUTTON", text,
-            WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_PUSHBUTTON | extraStyle,
+            WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_OWNERDRAW | extraStyle,
             SettingsDipToPixels(x), SettingsDipToPixels(y),
             SettingsDipToPixels(width), SettingsDipToPixels(height),
             parent, reinterpret_cast<HMENU>(
@@ -8822,6 +8862,180 @@ private:
             ApplySettingsControlFont(control);
         }
         return control;
+    }
+
+    HWND CreateSettingsHeading(HWND parent, const wchar_t* text,
+                               int x, int y, int width, int height) const {
+        HWND control = CreateSettingsText(parent, text, x, y, width, height);
+        if (control != nullptr && settingsTitleFont_ != nullptr) {
+            SendMessageW(control, WM_SETFONT,
+                reinterpret_cast<WPARAM>(settingsTitleFont_), TRUE);
+        }
+        return control;
+    }
+
+    bool SettingsCommandSelected(UINT command) const {
+        switch (command) {
+        case MenuToggleAutoStart:
+            return ReadAutoStartRegistration().state ==
+                AutoStartRegistrationState::Enabled;
+        case MenuDensityCompact:
+            return state_.densityMode == DensityMode::Compact;
+        case MenuDensityStandard:
+            return state_.densityMode == DensityMode::Standard;
+        case MenuDensityClear:
+            return state_.densityMode == DensityMode::Clear;
+        case MenuAnimationOff:
+            return state_.animationMode == AnimationMode::Off;
+        case MenuAnimationSimple:
+            return state_.animationMode == AnimationMode::Simple;
+        case MenuAnimationStandard:
+            return state_.animationMode == AnimationMode::Standard;
+        case MenuAnimationSoft:
+            return state_.animationMode == AnimationMode::Soft;
+        case MenuCoreSelectionEffectRotate:
+            return state_.coreSelectionEffect ==
+                CoreSelectionEffect::GentleRipple;
+        case MenuCoreSelectionEffectOnce:
+            return state_.coreSelectionEffect ==
+                CoreSelectionEffect::RippleOnceThenStatic;
+        case MenuCoreSelectionEffectStatic:
+            return state_.coreSelectionEffect ==
+                CoreSelectionEffect::Static;
+        default:
+            return false;
+        }
+    }
+
+    void DrawSettingsButton(const DRAWITEMSTRUCT& item) const {
+        if (item.hDC == nullptr || item.hwndItem == nullptr) {
+            return;
+        }
+        const UINT command = item.CtlID;
+        const bool navigation = command >= kSettingsPageCommandBase &&
+            command < kSettingsPageCommandBase + 7;
+        const bool disabled = (item.itemState & ODS_DISABLED) != 0 ||
+            IsWindowEnabled(item.hwndItem) == FALSE;
+        const bool pressed = (item.itemState & ODS_SELECTED) != 0;
+        const bool hot = (item.itemState & ODS_HOTLIGHT) != 0;
+        const bool selected = navigation
+            ? static_cast<int>(settingsPage_) ==
+                static_cast<int>(command - kSettingsPageCommandBase)
+            : SettingsCommandSelected(command);
+
+        const COLORREF neutral = RGB(248, 250, 252);
+        const COLORREF border = RGB(214, 221, 229);
+        const COLORREF accent = RGB(20, 118, 206);
+        const COLORREF selectedBackground = RGB(225, 240, 253);
+        const COLORREF hoveredBackground = RGB(239, 245, 250);
+        const COLORREF text = disabled ? RGB(147, 156, 166) : RGB(42, 51, 61);
+        RECT bounds = item.rcItem;
+        InflateRect(&bounds, -1, -1);
+
+        COLORREF fill = neutral;
+        if (navigation) {
+            fill = selected ? selectedBackground :
+                (hot ? hoveredBackground : RGB(244, 247, 250));
+        } else if (selected) {
+            fill = selectedBackground;
+        } else if (pressed) {
+            fill = RGB(232, 239, 246);
+        } else if (hot) {
+            fill = hoveredBackground;
+        }
+        if (disabled) {
+            fill = RGB(244, 246, 248);
+        }
+
+        HBRUSH fillBrush = CreateSolidBrush(fill);
+        HPEN borderPen = CreatePen(PS_SOLID, 1,
+            navigation && !selected ? RGB(244, 247, 250) : border);
+        HGDIOBJ oldBrush = SelectObject(item.hDC, fillBrush);
+        HGDIOBJ oldPen = SelectObject(item.hDC, borderPen);
+        RoundRect(item.hDC, bounds.left, bounds.top, bounds.right, bounds.bottom,
+            SettingsDipToPixels(5), SettingsDipToPixels(5));
+        SelectObject(item.hDC, oldPen);
+        SelectObject(item.hDC, oldBrush);
+        DeleteObject(borderPen);
+        DeleteObject(fillBrush);
+
+        if (navigation && selected) {
+            HBRUSH accentBrush = CreateSolidBrush(accent);
+            RECT marker{bounds.left, bounds.top + SettingsDipToPixels(5),
+                bounds.left + SettingsDipToPixels(3),
+                bounds.bottom - SettingsDipToPixels(5)};
+            FillRect(item.hDC, &marker, accentBrush);
+            DeleteObject(accentBrush);
+        }
+
+        RECT textBounds = bounds;
+        if (command == MenuToggleAutoStart) {
+            const int box = SettingsDipToPixels(15);
+            RECT check{bounds.left + SettingsDipToPixels(10),
+                bounds.top + (bounds.bottom - bounds.top - box) / 2,
+                bounds.left + SettingsDipToPixels(10) + box,
+                bounds.top + (bounds.bottom - bounds.top + box) / 2};
+            HBRUSH checkBrush = CreateSolidBrush(selected ? accent : RGB(255, 255, 255));
+            HPEN checkPen = CreatePen(PS_SOLID, 1, selected ? accent : border);
+            oldBrush = SelectObject(item.hDC, checkBrush);
+            oldPen = SelectObject(item.hDC, checkPen);
+            RoundRect(item.hDC, check.left, check.top, check.right, check.bottom,
+                SettingsDipToPixels(3), SettingsDipToPixels(3));
+            SelectObject(item.hDC, oldPen);
+            SelectObject(item.hDC, oldBrush);
+            DeleteObject(checkPen);
+            DeleteObject(checkBrush);
+            if (selected) {
+                HPEN tick = CreatePen(PS_SOLID, 2, RGB(255, 255, 255));
+                oldPen = SelectObject(item.hDC, tick);
+                MoveToEx(item.hDC, check.left + box / 4, check.top + box / 2, nullptr);
+                LineTo(item.hDC, check.left + box / 2 - 1, check.bottom - box / 4);
+                LineTo(item.hDC, check.right - box / 5, check.top + box / 4);
+                SelectObject(item.hDC, oldPen);
+                DeleteObject(tick);
+            }
+            textBounds.left = check.right + SettingsDipToPixels(8);
+        }
+
+        wchar_t label[256]{};
+        GetWindowTextW(item.hwndItem, label, static_cast<int>(std::size(label)));
+        HGDIOBJ oldFont = SelectObject(item.hDC,
+            navigation && selected && settingsEmphasisFont_ != nullptr
+                ? settingsEmphasisFont_
+                : (settingsFont_ != nullptr ? settingsFont_
+                    : GetStockObject(DEFAULT_GUI_FONT)));
+        SetBkMode(item.hDC, TRANSPARENT);
+        SetTextColor(item.hDC, navigation && selected ? RGB(24, 76, 122) : text);
+        DrawTextW(item.hDC, label, -1, &textBounds,
+            DT_SINGLELINE | DT_VCENTER | DT_CENTER | DT_END_ELLIPSIS);
+        SelectObject(item.hDC, oldFont);
+    }
+
+    void PaintSettingsSurface(HWND source) const {
+        PAINTSTRUCT paint{};
+        HDC dc = BeginPaint(source, &paint);
+        RECT client{};
+        GetClientRect(source, &client);
+        const bool content = source == settingsContentWindow_;
+        const COLORREF background = content
+            ? RGB(251, 252, 253) : RGB(246, 248, 251);
+        HBRUSH brush = CreateSolidBrush(background);
+        FillRect(dc, &client, brush);
+        DeleteObject(brush);
+        if (!content) {
+            const int navigationWidth = SettingsDipToPixels(142);
+            HBRUSH navigationBrush = CreateSolidBrush(RGB(241, 245, 249));
+            RECT navigation{0, 0, navigationWidth + SettingsDipToPixels(8), client.bottom};
+            FillRect(dc, &navigation, navigationBrush);
+            DeleteObject(navigationBrush);
+            HPEN separator = CreatePen(PS_SOLID, 1, RGB(216, 223, 231));
+            HGDIOBJ oldPen = SelectObject(dc, separator);
+            MoveToEx(dc, navigation.right, SettingsDipToPixels(12), nullptr);
+            LineTo(dc, navigation.right, client.bottom - SettingsDipToPixels(12));
+            SelectObject(dc, oldPen);
+            DeleteObject(separator);
+        }
+        EndPaint(source, &paint);
     }
 
     const wchar_t* SettingsPageName(SettingsPage page) const {
@@ -8854,9 +9068,9 @@ private:
             return;
         }
         ClearSettingsPageControls();
-        CreateSettingsText(
+        CreateSettingsHeading(
             settingsContentWindow_, SettingsPageName(settingsPage_),
-            16, 14, 320, 26);
+            16, 14, 320, 30);
         switch (settingsPage_) {
         case SettingsPage::General: {
             HWND autoStart = CreateSettingsButton(
@@ -8930,23 +9144,34 @@ private:
                                  MenuImportLayout);
             break;
         case SettingsPage::CoreManagement: {
-            CreateSettingsButton(settingsContentWindow_, L"检查失效文件引用", 16, 56, 156, 30,
+            CreateSettingsText(settingsContentWindow_, L"文件引用检查", 16, 58, 220, 22);
+            CreateSettingsText(settingsContentWindow_,
+                L"检查核心中已经失效或找不到的文件引用。",
+                16, 82, 330, 24);
+            CreateSettingsButton(settingsContentWindow_, L"检查失效引用", 16, 112, 132, 30,
                                  MenuRefreshReferences);
-            CreateSettingsText(settingsContentWindow_, L"恢复归档核心", 16, 104, 220, 22);
+            CreateSettingsText(settingsContentWindow_, L"恢复归档核心", 16, 166, 220, 22);
             int row = 0;
             for (const Core& core : state_.cores) {
                 if (!core.archived || row >= 6) {
                     continue;
                 }
                 settingsArchivedCoreIds_.push_back(core.id);
-                CreateSettingsButton(settingsContentWindow_, core.name.c_str(),
-                    16, 130 + row * 34, 240, 28,
+                const int top = 194 + row * 48;
+                CreateSettingsText(settingsContentWindow_, core.name.c_str(),
+                    16, top, 222, 22);
+                const std::wstring detail = std::to_wstring(core.files.size()) +
+                    L" 个文件";
+                CreateSettingsText(settingsContentWindow_, detail.c_str(),
+                    16, top + 21, 180, 18);
+                CreateSettingsButton(settingsContentWindow_, L"恢复",
+                    258, top + 8, 72, 28,
                     kSettingsArchivedCoreCommandBase +
                         static_cast<UINT>(settingsArchivedCoreIds_.size() - 1));
                 ++row;
             }
             if (settingsArchivedCoreIds_.empty()) {
-                CreateSettingsText(settingsContentWindow_, L"没有归档核心", 16, 132, 220, 24);
+                CreateSettingsText(settingsContentWindow_, L"暂无归档核心", 16, 198, 220, 24);
             }
             break;
         }
@@ -8965,6 +9190,41 @@ private:
                                  MenuOpenDataFolder);
             break;
         }
+        LayoutSettingsWindow();
+        InvalidateRect(settingsContentWindow_, nullptr, TRUE);
+    }
+
+    int SettingsContentPreferredHeightPixels() const {
+        int height = SettingsDipToPixels(340);
+        if (settingsPage_ == SettingsPage::CoreManagement) {
+            const int archivedCount = static_cast<int>(std::count_if(
+                state_.cores.begin(), state_.cores.end(),
+                [](const Core& core) { return core.archived; }));
+            height = SettingsDipToPixels(230 + std::min(archivedCount, 6) * 48);
+        }
+        return height;
+    }
+
+    int SettingsContentMaximumScrollPixels() const {
+        if (settingsWindow_ == nullptr) {
+            return 0;
+        }
+        RECT client{};
+        GetClientRect(settingsWindow_, &client);
+        const int viewportHeight = std::max(1,
+            static_cast<int>(client.bottom) - SettingsDipToPixels(20));
+        return std::max(0, SettingsContentPreferredHeightPixels() - viewportHeight);
+    }
+
+    void ScrollSettingsContent(int deltaPixels) {
+        const int next = std::clamp(settingsContentScrollPixels_ + deltaPixels,
+            0, SettingsContentMaximumScrollPixels());
+        if (next == settingsContentScrollPixels_) {
+            return;
+        }
+        settingsContentScrollPixels_ = next;
+        LayoutSettingsWindow();
+        InvalidateRect(settingsContentWindow_, nullptr, TRUE);
     }
 
     void LayoutSettingsWindow() {
@@ -8974,16 +9234,25 @@ private:
         RECT client{};
         GetClientRect(settingsWindow_, &client);
         const int navigationWidth = SettingsDipToPixels(142);
+        const int viewportHeight = std::max(1,
+            static_cast<int>(client.bottom) - SettingsDipToPixels(20));
+        const int contentHeight = std::max(
+            viewportHeight, SettingsContentPreferredHeightPixels());
+        settingsContentScrollPixels_ = std::clamp(settingsContentScrollPixels_, 0,
+            std::max(0, contentHeight - viewportHeight));
         ::SetWindowPos(settingsContentWindow_, nullptr,
-            navigationWidth + SettingsDipToPixels(10), SettingsDipToPixels(10),
+            navigationWidth + SettingsDipToPixels(10),
+            SettingsDipToPixels(10) - settingsContentScrollPixels_,
             std::max(1, static_cast<int>(client.right) - navigationWidth - SettingsDipToPixels(20)),
-            std::max(1, static_cast<int>(client.bottom) - SettingsDipToPixels(20)),
+            contentHeight,
             SWP_NOZORDER | SWP_NOACTIVATE);
     }
 
     void SelectSettingsPage(SettingsPage page) {
         settingsPage_ = page;
+        settingsContentScrollPixels_ = 0;
         RebuildSettingsWindow();
+        InvalidateRect(settingsWindow_, nullptr, TRUE);
     }
 
     void RecordSettingsWindowPosition(bool save) {
@@ -9054,11 +9323,12 @@ private:
             SetStatus(L"无法打开设置窗口");
             return;
         }
+        CreateSettingsFonts();
         settingsContentWindow_ = CreateWindowExW(
-            0, L"STATIC", L"", WS_CHILD | WS_VISIBLE | WS_CLIPCHILDREN,
+            0, kSettingsContentWindowClass, L"",
+            WS_CHILD | WS_VISIBLE | WS_CLIPCHILDREN,
             0, 0, 1, 1, settingsWindow_, nullptr,
-            GetModuleHandleW(nullptr), nullptr);
-        ApplySettingsControlFont(settingsContentWindow_);
+            GetModuleHandleW(nullptr), this);
         static constexpr std::array<const wchar_t*, 7> pages{{
             L"常规", L"外观与动效", L"工作区", L"数据与备份",
             L"核心管理", L"帮助", L"高级"}};
@@ -9067,7 +9337,8 @@ private:
                 12, 14 + index * 38, 126, 30,
                 kSettingsPageCommandBase + static_cast<UINT>(index));
         }
-        CreateSettingsText(settingsWindow_, L"设置项即时预览", 16, 304, 120, 22);
+        CreateSettingsText(settingsWindow_, L"修改后立即预览，并自动保存。",
+            16, 304, 120, 36);
         LayoutSettingsWindow();
         RebuildSettingsWindow();
         ShowWindow(settingsWindow_, SW_SHOW);
@@ -9077,6 +9348,21 @@ private:
     LRESULT HandleSettingsWindowMessageImpl(
         HWND source, UINT message, WPARAM wParam, LPARAM lParam) {
         switch (message) {
+        case WM_ERASEBKGND:
+            return 1;
+        case WM_PAINT:
+            PaintSettingsSurface(source);
+            return 0;
+        case WM_CTLCOLORSTATIC:
+            SetTextColor(reinterpret_cast<HDC>(wParam), RGB(67, 78, 89));
+            SetBkMode(reinterpret_cast<HDC>(wParam), TRANSPARENT);
+            return reinterpret_cast<LRESULT>(GetStockObject(NULL_BRUSH));
+        case WM_DRAWITEM:
+            if (lParam != 0) {
+                DrawSettingsButton(*reinterpret_cast<const DRAWITEMSTRUCT*>(lParam));
+                return TRUE;
+            }
+            return FALSE;
         case WM_COMMAND: {
             const UINT command = LOWORD(wParam);
             if (command >= kSettingsPageCommandBase &&
@@ -9094,33 +9380,50 @@ private:
                 return 0;
             }
             if (command == MenuTrayTutorial) {
-                ShowWindow(source, SW_HIDE);
+                ShowWindow(settingsWindow_, SW_HIDE);
             }
             ExecuteMenuCommand(command);
             RebuildSettingsWindow();
             return 0;
         }
         case WM_SIZE:
-            LayoutSettingsWindow();
+            if (source == settingsWindow_) {
+                LayoutSettingsWindow();
+            }
             return 0;
+        case WM_MOUSEWHEEL:
+            if (source == settingsContentWindow_ || source == settingsWindow_) {
+                const int delta = -MulDiv(
+                    GET_WHEEL_DELTA_WPARAM(wParam), SettingsDipToPixels(38),
+                    WHEEL_DELTA);
+                ScrollSettingsContent(delta);
+                return 0;
+            }
+            break;
         case WM_EXITSIZEMOVE:
-            RecordSettingsWindowPosition(true);
+            if (source == settingsWindow_) {
+                RecordSettingsWindowPosition(true);
+            }
             return 0;
         case WM_KEYDOWN:
-            if (wParam == VK_ESCAPE) {
+            if (source == settingsWindow_ && wParam == VK_ESCAPE) {
                 ShowWindow(source, SW_HIDE);
                 return 0;
             }
             break;
         case WM_CLOSE:
-            ShowWindow(source, SW_HIDE);
-            return 0;
+            if (source == settingsWindow_) {
+                ShowWindow(source, SW_HIDE);
+                return 0;
+            }
+            break;
         case WM_NCDESTROY:
-            if (settingsContentWindow_ != nullptr) {
+            if (settingsContentWindow_ == source) {
                 settingsContentWindow_ = nullptr;
             }
             if (settingsWindow_ == source) {
                 settingsWindow_ = nullptr;
+                DestroySettingsFonts();
             }
             SetWindowLongPtrW(source, GWLP_USERDATA, 0);
             break;
@@ -20940,7 +21243,11 @@ private:
     WorkspaceState coreShortLabelEditSnapshot_;
     HWND settingsWindow_ = nullptr;
     HWND settingsContentWindow_ = nullptr;
+    HFONT settingsFont_ = nullptr;
+    HFONT settingsTitleFont_ = nullptr;
+    HFONT settingsEmphasisFont_ = nullptr;
     SettingsPage settingsPage_ = SettingsPage::General;
+    int settingsContentScrollPixels_ = 0;
     std::vector<std::uint64_t> settingsArchivedCoreIds_;
     // Only used while relation recovery protection blocks the main state
     // file. It keeps this independent visual preference writable without
@@ -21066,6 +21373,23 @@ LRESULT CALLBACK DividerHandleWindowProcedure(
 }
 
 LRESULT CALLBACK SettingsWindowProcedure(
+    HWND window, UINT message, WPARAM wParam, LPARAM lParam) {
+    GravityApp* app = reinterpret_cast<GravityApp*>(
+        GetWindowLongPtrW(window, GWLP_USERDATA));
+    if (message == WM_NCCREATE) {
+        const auto* create = reinterpret_cast<CREATESTRUCTW*>(lParam);
+        app = static_cast<GravityApp*>(create->lpCreateParams);
+        SetWindowLongPtrW(
+            window, GWLP_USERDATA, reinterpret_cast<LONG_PTR>(app));
+    }
+    if (app != nullptr) {
+        return app->HandleSettingsWindowMessage(
+            window, message, wParam, lParam);
+    }
+    return DefWindowProcW(window, message, wParam, lParam);
+}
+
+LRESULT CALLBACK SettingsContentWindowProcedure(
     HWND window, UINT message, WPARAM wParam, LPARAM lParam) {
     GravityApp* app = reinterpret_cast<GravityApp*>(
         GetWindowLongPtrW(window, GWLP_USERDATA));
@@ -23715,6 +24039,18 @@ int APIENTRY wWinMain(_In_ HINSTANCE instance, _In_opt_ HINSTANCE,
     settingsClass.lpfnWndProc = SettingsWindowProcedure;
     settingsClass.lpszClassName = kSettingsWindowClass;
     if (RegisterClassExW(&settingsClass) == 0) {
+        CloseHandle(instanceMutex);
+        OleUninitialize();
+        return 1;
+    }
+    WNDCLASSEXW settingsContentClass = settingsClass;
+    settingsContentClass.style = CS_HREDRAW | CS_VREDRAW;
+    settingsContentClass.lpfnWndProc = SettingsContentWindowProcedure;
+    settingsContentClass.hIcon = nullptr;
+    settingsContentClass.hIconSm = nullptr;
+    settingsContentClass.hCursor = LoadCursorW(nullptr, IDC_ARROW);
+    settingsContentClass.lpszClassName = kSettingsContentWindowClass;
+    if (RegisterClassExW(&settingsContentClass) == 0) {
         CloseHandle(instanceMutex);
         OleUninitialize();
         return 1;
