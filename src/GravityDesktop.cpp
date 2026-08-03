@@ -340,6 +340,7 @@ enum MenuCommand : UINT {
     MenuRestoreCore,
     MenuTrayShowHide,
     MenuTrayPauseResume,
+    MenuTraySettings,
     MenuTrayTutorial,
     MenuExportLayout,
     MenuImportLayout,
@@ -5179,32 +5180,17 @@ private:
     void ShowTrayMenu() {
         HMENU menu = CreatePopupMenu();
         if (menu == nullptr) return;
-        std::vector<std::uint64_t> archivedCoreIds;
         const bool visible =
             window_ != nullptr &&
             IsWindowVisible(window_) != FALSE;
         AppendMenuW(menu, MF_STRING, MenuTrayShowHide,
-                    visible ? L"隐藏工作区" : L"显示工作区");
+                    visible ? L"隐藏引力桌面" : L"显示引力桌面");
         AppendMenuW(menu, MF_STRING, MenuTrayPauseResume,
-                    state_.workspacePaused ? L"恢复工作区" : L"暂停工作区");
-        HMENU archivedMenu = CreatePopupMenu();
-        constexpr UINT firstRestoreCommand = 42000;
-        for (const Core& core : state_.cores) {
-            if (!core.archived) continue;
-            archivedCoreIds.push_back(core.id);
-            AppendMenuW(archivedMenu, MF_STRING,
-                        firstRestoreCommand + static_cast<UINT>(archivedCoreIds.size() - 1),
-                        core.name.c_str());
-        }
-        if (archivedCoreIds.empty()) {
-            AppendMenuW(archivedMenu, MF_STRING | MF_GRAYED, 0, L"没有归档核心");
-        }
-        AppendMenuW(menu, MF_POPUP, reinterpret_cast<UINT_PTR>(archivedMenu), L"恢复归档核心");
-        AppendMenuW(menu, MF_SEPARATOR, 0, nullptr);
-        AppendMenuW(menu, MF_STRING, MenuTrayTutorial, L"重新打开使用教程");
-        AppendMenuW(menu, MF_STRING, MenuRefreshReferences, L"检查失效文件引用");
-        AppendMenuW(menu, MF_STRING, MenuExportLayout, L"导出布局备份");
-        AppendMenuW(menu, MF_STRING, MenuImportLayout, L"导入布局备份");
+                    state_.workspacePaused
+                        ? L"恢复桌面交互"
+                        : L"暂停桌面交互");
+        AppendMenuW(menu, MF_STRING, MenuTraySettings, L"设置…");
+        AppendMenuW(menu, MF_STRING, MenuTrayTutorial, L"帮助与教程");
         AppendMenuW(menu, MF_SEPARATOR, 0, nullptr);
         AppendMenuW(menu, MF_STRING, MenuTrayExit, L"退出引力桌面");
         POINT point{};
@@ -5213,12 +5199,7 @@ private:
             TPM_RETURNCMD | TPM_RIGHTBUTTON | TPM_NONOTIFY,
             point.x, point.y);
         DestroyMenu(menu);
-        if (command >= firstRestoreCommand &&
-            command < firstRestoreCommand + archivedCoreIds.size()) {
-            RestoreCore(archivedCoreIds[command - firstRestoreCommand]);
-        } else {
-            ExecuteMenuCommand(command);
-        }
+        ExecuteMenuCommand(command);
         const HWND menuOwner = TrayOwnerWindow();
         if (menuOwner != nullptr) {
             PostMessageW(menuOwner, WM_NULL, 0, 0);
@@ -8748,6 +8729,8 @@ private:
         if (menu == nullptr) {
             return;
         }
+        std::vector<std::uint64_t> archivedCoreIds;
+        constexpr UINT firstRestoreCommand = 42000;
 
         HMENU generalMenu = CreatePopupMenu();
         const AutoStartRegistrationStatus autoStart =
@@ -8771,8 +8754,8 @@ private:
         AppendMenuW(
             menu, MF_POPUP,
             reinterpret_cast<UINT_PTR>(generalMenu), L"常规");
-        AppendMenuW(menu, MF_SEPARATOR, 0, nullptr);
 
+        HMENU appearanceMenu = CreatePopupMenu();
         HMENU densityMenu = CreatePopupMenu();
         AppendMenuW(
             densityMenu,
@@ -8793,9 +8776,9 @@ private:
                      ? MF_CHECKED : 0),
             MenuDensityClear, L"清晰");
         AppendMenuW(
-            menu, MF_POPUP,
+            appearanceMenu, MF_POPUP,
             reinterpret_cast<UINT_PTR>(densityMenu),
-            L"核心分布密度");
+            L"布局密度");
 
         HMENU animationMenu = CreatePopupMenu();
         AppendMenuW(
@@ -8823,7 +8806,7 @@ private:
                      ? MF_CHECKED : 0),
             MenuAnimationSoft, L"柔和");
         AppendMenuW(
-            menu, MF_POPUP,
+            appearanceMenu, MF_POPUP,
             reinterpret_cast<UINT_PTR>(animationMenu),
             L"全局动画强度");
 
@@ -8852,25 +8835,70 @@ private:
             MenuCoreSelectionEffectStatic,
             L"仅显示静态光环");
         AppendMenuW(
-            menu, MF_POPUP,
+            appearanceMenu, MF_POPUP,
             reinterpret_cast<UINT_PTR>(selectionMenu),
             L"核心选中效果");
-        AppendMenuW(menu, MF_SEPARATOR, 0, nullptr);
-        AppendMenuW(menu, MF_STRING, MenuResetView, L"复位视图");
         AppendMenuW(
-            menu, MF_STRING, MenuTrayTutorial,
+            menu, MF_POPUP,
+            reinterpret_cast<UINT_PTR>(appearanceMenu), L"外观与动效");
+
+        HMENU workspaceMenu = CreatePopupMenu();
+        AppendMenuW(workspaceMenu, MF_STRING, MenuResetView, L"复位视图");
+        AppendMenuW(
+            menu, MF_POPUP,
+            reinterpret_cast<UINT_PTR>(workspaceMenu), L"工作区");
+
+        HMENU dataMenu = CreatePopupMenu();
+        AppendMenuW(dataMenu, MF_STRING, MenuSaveNow, L"立即保存布局");
+        AppendMenuW(dataMenu, MF_STRING, MenuExportLayout, L"导出布局备份");
+        AppendMenuW(dataMenu, MF_STRING, MenuImportLayout, L"导入布局备份");
+        AppendMenuW(
+            menu, MF_POPUP,
+            reinterpret_cast<UINT_PTR>(dataMenu), L"数据与备份");
+
+        HMENU coreManagementMenu = CreatePopupMenu();
+        HMENU archivedMenu = CreatePopupMenu();
+        for (const Core& core : state_.cores) {
+            if (!core.archived) {
+                continue;
+            }
+            archivedCoreIds.push_back(core.id);
+            AppendMenuW(
+                archivedMenu, MF_STRING,
+                firstRestoreCommand +
+                    static_cast<UINT>(archivedCoreIds.size() - 1),
+                core.name.c_str());
+        }
+        if (archivedCoreIds.empty()) {
+            AppendMenuW(
+                archivedMenu, MF_STRING | MF_GRAYED, 0,
+                L"没有归档核心");
+        }
+        AppendMenuW(
+            coreManagementMenu, MF_POPUP,
+            reinterpret_cast<UINT_PTR>(archivedMenu), L"恢复归档核心");
+        AppendMenuW(
+            coreManagementMenu, MF_STRING, MenuRefreshReferences,
+            L"检查失效文件引用");
+        AppendMenuW(
+            menu, MF_POPUP,
+            reinterpret_cast<UINT_PTR>(coreManagementMenu), L"核心管理");
+
+        HMENU helpMenu = CreatePopupMenu();
+        AppendMenuW(
+            helpMenu, MF_STRING, MenuTrayTutorial,
             L"重新打开使用教程");
-        AppendMenuW(menu, MF_SEPARATOR, 0, nullptr);
-        AppendMenuW(menu, MF_STRING, MenuSaveNow, L"立即保存布局");
         AppendMenuW(
-            menu, MF_STRING, MenuOpenDataFolder,
-            L"打开数据目录");
+            menu, MF_POPUP,
+            reinterpret_cast<UINT_PTR>(helpMenu), L"帮助");
+
+        HMENU advancedMenu = CreatePopupMenu();
         AppendMenuW(
-            menu, MF_STRING, MenuExportLayout,
-            L"导出布局备份");
+            advancedMenu, MF_STRING, MenuOpenDataFolder,
+            L"打开程序数据文件夹");
         AppendMenuW(
-            menu, MF_STRING, MenuImportLayout,
-            L"导入布局备份");
+            menu, MF_POPUP,
+            reinterpret_cast<UINT_PTR>(advancedMenu), L"高级");
 
         const D2D1_RECT_F button =
             WorkspaceControlRectangle(ClientDipSize(), 3);
@@ -8882,7 +8910,12 @@ private:
             menu, TPM_RETURNCMD | TPM_RIGHTBUTTON,
             screen.x, screen.y);
         DestroyMenu(menu);
-        ExecuteMenuCommand(command);
+        if (command >= firstRestoreCommand &&
+            command < firstRestoreCommand + archivedCoreIds.size()) {
+            RestoreCore(archivedCoreIds[command - firstRestoreCommand]);
+        } else {
+            ExecuteMenuCommand(command);
+        }
         Invalidate();
     }
 
@@ -15929,6 +15962,9 @@ private:
             break;
         case MenuTrayPauseResume:
             ToggleWorkspacePause();
+            break;
+        case MenuTraySettings:
+            ShowGlobalSettingsMenu();
             break;
         case MenuTrayTutorial:
             StartTutorial();
