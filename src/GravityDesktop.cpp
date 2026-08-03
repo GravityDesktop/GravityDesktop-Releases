@@ -90,12 +90,14 @@ constexpr UINT_PTR kDesktopHostWatchTimer = 10;
 constexpr UINT_PTR kDesktopReconnectTimer = 11;
 constexpr UINT_PTR kInteractionLayerRepairTimer = 12;
 constexpr UINT_PTR kDesktopVisibilityRestoreTimer = 13;
+constexpr UINT_PTR kItemOpenCursorTimer = 14;
 constexpr auto kManagedCollectionConfirmationWindow =
     std::chrono::minutes(10);
 constexpr UINT kDesktopHostWatchIntervalMs = 2000;
 constexpr UINT kDesktopReconnectIntervalMs = 250;
 constexpr UINT kInteractionLayerRepairDelayMs = 600;
 constexpr UINT kDesktopVisibilityRestoreDelayMs = 180;
+constexpr UINT kItemOpenCursorFeedbackMs = 900;
 constexpr int kDesktopReconnectAttemptLimit = 40;
 constexpr std::size_t kMaxRelationTraversalNodes = 4096;
 constexpr std::size_t kMaxRelationTraversalDepth = 256;
@@ -16223,7 +16225,41 @@ private:
         Invalidate();
     }
 
+    void BeginItemOpenCursorFeedback() {
+        if (window_ == nullptr || IsWindow(window_) == FALSE) {
+            return;
+        }
+        itemOpenCursorFeedbackActive_ = true;
+        SetCursor(LoadCursorW(nullptr, IDC_APPSTARTING));
+        // ShellExecuteEx returns before the target application is ready. Keep
+        // Windows' normal app-starting cursor briefly so opening a core file
+        // has the same immediate acknowledgement as a desktop icon.
+        SetTimer(window_, kItemOpenCursorTimer,
+                 kItemOpenCursorFeedbackMs, nullptr);
+    }
+
+    void EndItemOpenCursorFeedback() {
+        if (window_ != nullptr) {
+            KillTimer(window_, kItemOpenCursorTimer);
+        }
+        itemOpenCursorFeedbackActive_ = false;
+
+        POINT cursor{};
+        if (GetCursorPos(&cursor) == FALSE) {
+            return;
+        }
+        const HWND cursorWindow = WindowFromPoint(cursor);
+        if (cursorWindow == window_ ||
+            cursorWindow == interactionWindow_) {
+            SetInteractionCursor(cursorWindow);
+        }
+    }
+
     void SetInteractionCursor(HWND source) {
+        if (itemOpenCursorFeedbackActive_) {
+            SetCursor(LoadCursorW(nullptr, IDC_APPSTARTING));
+            return;
+        }
         POINT cursor{};
         GetCursorPos(&cursor);
         ScreenToClient(source, &cursor);
@@ -19376,6 +19412,7 @@ private:
         execute.lpFile = item->path.c_str();
         execute.nShow = SW_SHOWNORMAL;
         if (ShellExecuteExW(&execute) != FALSE) {
+            BeginItemOpenCursorFeedback();
             item->missing = false;
             ++item->openCount;
             item->lastOpened = UnixTimeNow();
@@ -19844,7 +19881,9 @@ private:
     }
 
     void OnTimer(WPARAM timer) {
-        if (timer == kDesktopVisibilityRestoreTimer) {
+        if (timer == kItemOpenCursorTimer) {
+            EndItemOpenCursorFeedback();
+        } else if (timer == kDesktopVisibilityRestoreTimer) {
             RestoreDesktopVisibilityAfterShellTransition();
         } else if (timer == kSaveTimer) {
             KillTimer(window_, kSaveTimer);
@@ -21180,6 +21219,7 @@ private:
     bool hidingToTray_ = false;
     bool exitRequested_ = false;
     bool workspaceVisible_ = true;
+    bool itemOpenCursorFeedbackActive_ = false;
     bool trayIconAdded_ = false;
     bool trayRebuildPending_ = false;
     bool shellHookRegistered_ = false;
