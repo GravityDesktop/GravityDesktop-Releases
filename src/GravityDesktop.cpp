@@ -2426,8 +2426,9 @@ std::string SerializeState(const WorkspaceState& state) {
 
 // This is deliberately a compact, independent recovery index rather than a
 // second copy of the visual layout.  The state file remains authoritative;
-// the manifest exists so a future recovery flow can discover real files and
-// their logical relationships without depending on coordinates or slots.
+// the manifest exists so recovery can discover real files and their logical
+// relationships, with optional normalized core positions for a safer visual
+// restart when the primary state file is missing.
 std::string SerializeRelationshipManifest(const WorkspaceState& state) {
     std::ostringstream output;
     output.imbue(std::locale::classic());
@@ -2441,6 +2442,9 @@ std::string SerializeRelationshipManifest(const WorkspaceState& state) {
                << ", \"core_name\": " << EscapeJson(core.name)
                << ", \"archived\": "
                << (core.archived ? "true" : "false")
+               << ", \"x_ratio\": " << core.xRatio
+               << ", \"y_ratio\": " << core.yRatio
+               << ", \"monitor_id\": " << EscapeJson(core.monitorId)
                << ", \"files\": [";
         for (std::size_t itemIndex = 0;
              itemIndex < core.files.size(); ++itemIndex) {
@@ -2488,6 +2492,9 @@ struct RelationshipRecoveryCore {
     std::uint64_t stableId = 0;
     std::wstring name;
     bool archived = false;
+    float xRatio = -1.0f;
+    float yRatio = -1.0f;
+    std::wstring monitorId;
     std::vector<RelationshipRecoveryItem> files;
 };
 
@@ -2521,6 +2528,19 @@ bool DeserializeRelationshipRecoveryManifest(
             NumberMember(*coreObject, "core_id", 0.0));
         core.name = StringMember(*coreObject, "core_name", L"");
         core.archived = BoolMember(*coreObject, "archived", false);
+        core.xRatio = static_cast<float>(NumberMember(
+            *coreObject, "x_ratio", -1.0));
+        core.yRatio = static_cast<float>(NumberMember(
+            *coreObject, "y_ratio", -1.0));
+        core.monitorId = StringMember(*coreObject, "monitor_id", L"");
+        if (!std::isfinite(core.xRatio) || core.xRatio < 0.0f ||
+            core.xRatio > 1.0f) {
+            core.xRatio = -1.0f;
+        }
+        if (!std::isfinite(core.yRatio) || core.yRatio < 0.0f ||
+            core.yRatio > 1.0f) {
+            core.yRatio = -1.0f;
+        }
         if (core.stableId == 0 || core.name.empty() ||
             !coreIds.insert(core.stableId).second) {
             return false;
@@ -3896,6 +3916,14 @@ public:
                 restored.cores.push_back(std::move(core));
                 target = &restored.cores.back();
                 ++visibleCoreIndex;
+            }
+            if (source.xRatio >= 0.0f && source.yRatio >= 0.0f) {
+                // Keep recovered cores inside the logical work area.  The
+                // normal layout cache performs the final footprint clamp
+                // after the new window has acquired its current DIP size.
+                target->xRatio = std::clamp(source.xRatio, 0.04f, 0.96f);
+                target->yRatio = std::clamp(source.yRatio, 0.06f, 0.92f);
+                target->monitorId = source.monitorId;
             }
             coreIds.emplace(source.stableId, target->id);
         }
@@ -25187,7 +25215,12 @@ bool RunSelfTest() {
         parsedRecoveryManifest.cores.front().files.size() != 1 ||
         parsedRecoveryManifest.cores.front().files.front().stableId != item.id ||
         parsedRecoveryManifest.cores.front().files.front().storageMode !=
-            L"managed") {
+            L"managed" ||
+        std::abs(parsedRecoveryManifest.cores.front().xRatio - core.xRatio) >
+            0.0001f ||
+        std::abs(parsedRecoveryManifest.cores.front().yRatio - core.yRatio) >
+            0.0001f ||
+        parsedRecoveryManifest.cores.front().monitorId != core.monitorId) {
         return false;
     }
     RelationshipRecoveryCore extraRecoveryCore;
@@ -25238,6 +25271,9 @@ bool RunSelfTest() {
     RelationshipRecoveryCore recoveryCore;
     recoveryCore.stableId = 77;
     recoveryCore.name = L"recovered";
+    recoveryCore.xRatio = 0.25f;
+    recoveryCore.yRatio = 0.35f;
+    recoveryCore.monitorId = L"DISPLAY-TEST";
     RelationshipRecoveryItem recoveryItem;
     recoveryItem.stableId = 78;
     recoveryItem.originalPath = L"C:\\Desktop\\recovery-managed.txt";
@@ -25256,6 +25292,10 @@ bool RunSelfTest() {
         recoveryManifestApp.state_.cores.back().files.size() != 1 ||
         recoveryManifestApp.state_.cores.back().files.front().storageMode !=
             FileStorageMode::Managed ||
+        std::abs(recoveryManifestApp.state_.cores.back().xRatio - 0.25f) >
+            0.0001f ||
+        std::abs(recoveryManifestApp.state_.cores.back().yRatio - 0.35f) >
+            0.0001f ||
         !GravityApp::FilePathExists(
             recoveryManifestApp.stateFile_.wstring())) {
         return false;
