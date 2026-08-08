@@ -9870,14 +9870,12 @@ private:
         const D2D1_RECT_F group = WorkspaceChromeGroupRectangle(client);
         if (WorkspaceChromeIsVertical()) {
             return D2D1::RectF(
-                group.left + 5.0f, group.top + 5.0f,
-                group.left + 29.0f, group.top + 29.0f);
+                group.left + 3.0f, group.top + 3.0f,
+                group.left + 35.0f, group.top + 35.0f);
         }
         return D2D1::RectF(
-            group.left + 5.0f,
-            group.top + (group.bottom - group.top - 24.0f) * 0.5f,
-            group.left + 29.0f,
-            group.top + (group.bottom - group.top + 24.0f) * 0.5f);
+            group.left + 3.0f, group.top + 3.0f,
+            group.left + 35.0f, group.bottom - 3.0f);
     }
 
     D2D1_RECT_F WorkspaceControlRectangle(const D2D1_SIZE_F& client, int index) const {
