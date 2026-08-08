@@ -363,6 +363,7 @@ enum MenuCommand : UINT {
     MenuDissolveCore,
     MenuRestoreCore,
     MenuTrayShowHide,
+    MenuTrayCreateCore,
     MenuTrayPauseResume,
     MenuTraySettings,
     MenuTrayTutorial,
@@ -6395,6 +6396,8 @@ private:
         const bool visible =
             window_ != nullptr &&
             IsWindowVisible(window_) != FALSE;
+        AppendMenuW(menu, MF_STRING, MenuTrayCreateCore, L"创建核心");
+        AppendMenuW(menu, MF_SEPARATOR, 0, nullptr);
         AppendMenuW(menu, MF_STRING, MenuTrayShowHide,
                     visible ? L"隐藏引力桌面" : L"显示引力桌面");
         AppendMenuW(menu, MF_STRING, MenuTrayPauseResume,
@@ -9924,7 +9927,8 @@ private:
         if (state_.workspaceChromePinned || workspaceChromeHovered_ ||
             draggingWorkspaceChrome_ || workspaceChromePointerPending_ ||
             workspaceChromeMenuOpen_ || corePlacementMode_ ||
-            (settingsWindow_ != nullptr && IsWindow(settingsWindow_) != FALSE)) {
+            (settingsWindow_ != nullptr &&
+             IsWindowVisible(settingsWindow_) != FALSE)) {
             return false;
         }
         const D2D1_RECT_F group = WorkspaceChromeGroupRectangle(client);
@@ -10076,8 +10080,8 @@ private:
                 brush_->SetColor(D2D1::ColorF(
                     dark ? 0x666666 : 0xB6B6B6, 0.46f));
                 renderTarget_->DrawLine(
-                    D2D1::Point2F(button.left - 1.0f, 14.0f),
-                    D2D1::Point2F(button.left - 1.0f, 36.0f),
+                    D2D1::Point2F(button.left - 1.0f, button.top + 5.0f),
+                    D2D1::Point2F(button.left - 1.0f, button.bottom - 5.0f),
                     brush_.Get(), 1.0f);
             }
             brush_->SetColor(D2D1::ColorF(
@@ -12528,6 +12532,7 @@ private:
         workspaceChromePointerPending_ = true;
         workspaceChromePendingButton_ = -1;
         workspaceChromePointerStartDip_ = point;
+        workspaceChromeDragLastDip_ = point;
         workspaceChromeDragOffsetDip_ = D2D1::Point2F(
             point.x - group.left, point.y - group.top);
         workspaceChromeDragStartPositionValid_ =
@@ -12541,6 +12546,7 @@ private:
     }
 
     void UpdateWorkspaceChromePosition(D2D1_POINT_2F point) {
+        workspaceChromeDragLastDip_ = point;
         const D2D1_SIZE_F client = ClientDipSize();
         const D2D1_RECT_F group = WorkspaceChromeGroupRectangle(client);
         const float left = std::clamp(
@@ -12565,15 +12571,41 @@ private:
         if (!draggingWorkspaceChrome_) return;
         draggingWorkspaceChrome_ = false;
         const D2D1_SIZE_F client = ClientDipSize();
-        const float x = client.width * state_.workspaceChromeXRatio;
-        const float y = client.height * state_.workspaceChromeYRatio;
-        const float nearestHorizontal = std::min(x, client.width - x);
-        const float nearestVertical = std::min(y, client.height - y);
-        // Left and right edges use the vertical strip; top and bottom use
-        // the original horizontal strip.  A freely placed strip chooses the
-        // orientation of its nearest edge when released.
-        state_.workspaceChromeOrientation =
-            nearestHorizontal < nearestVertical ? 1 : 0;
+        // Decide from the actual release point.  Using the old-orientation
+        // rectangle first required a second drag before a side drop became
+        // vertical (or a top/bottom drop became horizontal).
+        const D2D1_POINT_2F release = workspaceChromeDragLastDip_;
+        const std::array<float, 4> distances{
+            release.y,
+            client.width - release.x,
+            client.height - release.y,
+            release.x};
+        const int edge = static_cast<int>(std::distance(
+            distances.begin(),
+            std::min_element(distances.begin(), distances.end())));
+        constexpr float kEdgeSnapDistance = 52.0f;
+        if (distances[edge] <= kEdgeSnapDistance) {
+            state_.workspaceChromeOrientation =
+                (edge == 1 || edge == 3) ? 1 : 0;
+            const D2D1_RECT_F snapped = WorkspaceChromeGroupRectangle(client);
+            const float width = snapped.right - snapped.left;
+            const float height = snapped.bottom - snapped.top;
+            constexpr float kInset = 6.0f;
+            float centerX = std::clamp(
+                release.x, width * 0.5f + kInset,
+                client.width - width * 0.5f - kInset);
+            float centerY = std::clamp(
+                release.y, height * 0.5f + kInset,
+                client.height - height * 0.5f - kInset);
+            if (edge == 0) centerY = height * 0.5f + kInset;
+            if (edge == 1) centerX = client.width - width * 0.5f - kInset;
+            if (edge == 2) centerY = client.height - height * 0.5f - kInset;
+            if (edge == 3) centerX = width * 0.5f + kInset;
+            state_.workspaceChromeXRatio = std::clamp(
+                centerX / std::max(1.0f, client.width), 0.0f, 1.0f);
+            state_.workspaceChromeYRatio = std::clamp(
+                centerY / std::max(1.0f, client.height), 0.0f, 1.0f);
+        }
         if (GetCapture() == window_) ReleaseCapture();
         ScheduleSave(false);
         Invalidate();
@@ -18420,6 +18452,10 @@ private:
         case MenuTrayShowHide:
             SetWorkspaceVisible(IsWindowVisible(window_) == FALSE);
             break;
+        case MenuTrayCreateCore:
+            SetWorkspaceVisible(true);
+            BeginCorePlacementMode();
+            break;
         case MenuTrayPauseResume:
             ToggleWorkspacePause();
             break;
@@ -23607,6 +23643,7 @@ private:
         std::chrono::steady_clock::now();
     D2D1_POINT_2F pointerStartDip_ = D2D1::Point2F();
     D2D1_POINT_2F workspaceChromePointerStartDip_ = D2D1::Point2F();
+    D2D1_POINT_2F workspaceChromeDragLastDip_ = D2D1::Point2F();
     D2D1_POINT_2F workspaceChromeDragOffsetDip_ = D2D1::Point2F();
     D2D1_POINT_2F pointerStartWorld_ = D2D1::Point2F();
     D2D1_POINT_2F coreStartPosition_ = D2D1::Point2F();
