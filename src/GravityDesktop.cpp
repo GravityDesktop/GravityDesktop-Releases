@@ -2555,6 +2555,18 @@ bool DeserializeRelationshipRecoveryManifest(
     return true;
 }
 
+RelationshipRecoveryManifest SelectRelationshipRecoveryCores(
+    const RelationshipRecoveryManifest& manifest,
+    const std::set<std::uint64_t>& selectedCoreIds) {
+    RelationshipRecoveryManifest selected;
+    for (const RelationshipRecoveryCore& core : manifest.cores) {
+        if (selectedCoreIds.contains(core.stableId)) {
+            selected.cores.push_back(core);
+        }
+    }
+    return selected;
+}
+
 int FindFreeSlot(const Core& core) {
     std::set<int> occupied;
     for (const FileItem& item : core.files) {
@@ -3976,18 +3988,97 @@ public:
             window_ == nullptr || autoStartMode_) {
             return;
         }
-        const int choice = MessageBoxW(
-            window_,
+        const RelationshipRecoveryManifest& manifest =
+            *pendingRelationshipRecovery_;
+        constexpr int kRestoreAll = 2001;
+        constexpr int kRestoreSelected = 2002;
+        constexpr int kKeepOrdinaryDesktop = 2003;
+        std::size_t fileCount = 0;
+        for (const RelationshipRecoveryCore& core : manifest.cores) {
+            fileCount += core.files.size();
+        }
+        const std::wstring message =
             L"发现以前的引力桌面工作关系。\n\n"
-            L"恢复会重新创建核心和文件引用，但不会移动、复制或删除任何真实文件。\n\n"
-            L"选择“是”恢复；选择“否”保持当前普通桌面。",
-            L"恢复以前的工作关系",
-            MB_YESNO | MB_ICONQUESTION | MB_DEFBUTTON2);
-        if (choice == IDYES) {
-            if (!RestoreRelationshipRecoveryManifest(
-                    *pendingRelationshipRecovery_)) {
+            L"可恢复 " + std::to_wstring(manifest.cores.size()) +
+            L" 个核心、" + std::to_wstring(fileCount) +
+            L" 个文件引用。恢复只创建视觉关系，不会移动、复制或删除任何真实文件。";
+
+        int choice = kKeepOrdinaryDesktop;
+        bool taskDialogShown = false;
+        const TASKDIALOG_BUTTON buttons[] = {
+            {kRestoreAll, L"恢复全部核心"},
+            {kRestoreSelected, L"选择部分核心…"},
+            {kKeepOrdinaryDesktop, L"保持当前普通桌面"},
+        };
+        TASKDIALOGCONFIG dialog{sizeof(dialog)};
+        dialog.hwndParent = window_;
+        dialog.dwFlags = TDF_ALLOW_DIALOG_CANCELLATION |
+                         TDF_SIZE_TO_CONTENT;
+        dialog.pszWindowTitle = L"恢复以前的工作关系";
+        dialog.pszContent = message.c_str();
+        dialog.pszFooter =
+            L"默认保持普通桌面；任何选择都不会操作真实文件。";
+        dialog.pszMainIcon = TD_INFORMATION_ICON;
+        dialog.cButtons = static_cast<UINT>(
+            sizeof(buttons) / sizeof(buttons[0]));
+        dialog.pButtons = buttons;
+        dialog.nDefaultButton = kKeepOrdinaryDesktop;
+        using TaskDialogIndirectProc = HRESULT (WINAPI*)(
+            const TASKDIALOGCONFIG*, int*, int*, BOOL*);
+        const HMODULE commonControls =
+            GetModuleHandleW(L"comctl32.dll");
+        const auto taskDialog = commonControls == nullptr
+            ? nullptr
+            : reinterpret_cast<TaskDialogIndirectProc>(
+                GetProcAddress(commonControls, "TaskDialogIndirect"));
+        if (taskDialog != nullptr &&
+            SUCCEEDED(taskDialog(
+                &dialog, &choice, nullptr, nullptr))) {
+            taskDialogShown = true;
+        }
+        if (!taskDialogShown) {
+            choice = MessageBoxW(
+                         window_, message.c_str(),
+                         L"恢复以前的工作关系",
+                         MB_YESNO | MB_ICONQUESTION | MB_DEFBUTTON2) == IDYES
+                ? kRestoreAll
+                : kKeepOrdinaryDesktop;
+        }
+
+        if (choice == kRestoreAll) {
+            if (!RestoreRelationshipRecoveryManifest(manifest)) {
                 MessageBoxW(
                     window_, L"恢复失败；当前普通桌面未被修改。",
+                    L"恢复以前的工作关系", MB_OK | MB_ICONWARNING);
+            }
+            return;
+        }
+        if (choice == kRestoreSelected) {
+            std::set<std::uint64_t> selectedCoreIds;
+            for (const RelationshipRecoveryCore& core : manifest.cores) {
+                const std::wstring corePrompt =
+                    L"是否恢复核心“" + core.name + L"”？\n\n"
+                    L"文件引用数量：" + std::to_wstring(core.files.size()) +
+                    L"\n不会移动任何真实文件。";
+                if (MessageBoxW(
+                        window_, corePrompt.c_str(),
+                        L"选择要恢复的核心",
+                        MB_YESNO | MB_ICONQUESTION | MB_DEFBUTTON2) == IDYES) {
+                    selectedCoreIds.insert(core.stableId);
+                }
+            }
+            if (selectedCoreIds.empty()) {
+                pendingRelationshipRecovery_.reset();
+                AppendRuntimeDiagnostic("relationship_recovery_partial_none");
+                SetStatus(L"未选择任何核心；当前普通桌面未被修改");
+                return;
+            }
+            const RelationshipRecoveryManifest selected =
+                SelectRelationshipRecoveryCores(manifest, selectedCoreIds);
+            AppendRuntimeDiagnostic("relationship_recovery_partial_selected");
+            if (!RestoreRelationshipRecoveryManifest(selected)) {
+                MessageBoxW(
+                    window_, L"部分恢复失败；当前普通桌面未被修改。",
                     L"恢复以前的工作关系", MB_OK | MB_ICONWARNING);
             }
             return;
@@ -25097,6 +25188,19 @@ bool RunSelfTest() {
         parsedRecoveryManifest.cores.front().files.front().stableId != item.id ||
         parsedRecoveryManifest.cores.front().files.front().storageMode !=
             L"managed") {
+        return false;
+    }
+    RelationshipRecoveryCore extraRecoveryCore;
+    extraRecoveryCore.stableId = 1001;
+    extraRecoveryCore.name = L"另一个核心";
+    RelationshipRecoveryManifest multiRecoveryManifest =
+        parsedRecoveryManifest;
+    multiRecoveryManifest.cores.push_back(extraRecoveryCore);
+    const RelationshipRecoveryManifest selectedRecoveryManifest =
+        SelectRelationshipRecoveryCores(
+            multiRecoveryManifest, std::set<std::uint64_t>{core.id});
+    if (selectedRecoveryManifest.cores.size() != 1 ||
+        selectedRecoveryManifest.cores.front().stableId != core.id) {
         return false;
     }
     RelationshipRecoveryManifest rejectedRecoveryManifest;
