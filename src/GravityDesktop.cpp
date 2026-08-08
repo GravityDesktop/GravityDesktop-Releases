@@ -9846,7 +9846,7 @@ private:
             ? (client.width < 680.0f ? 108.0f : 164.0f)
             : horizontalWidth;
         const float groupHeight = vertical
-            ? 6.0f + kWorkspaceControlCount * 32.0f +
+            ? 40.0f + kWorkspaceControlCount * 32.0f +
                   (kWorkspaceControlCount - 1) * gap + 6.0f
             : 38.0f;
         if (!state_.workspaceChromePositionValid) {
@@ -9868,6 +9868,13 @@ private:
     D2D1_RECT_F WorkspaceChromeDragHandleRectangle(
         const D2D1_SIZE_F& client) const {
         const D2D1_RECT_F group = WorkspaceChromeGroupRectangle(client);
+        if (WorkspaceChromeIsVertical()) {
+            const float left =
+                group.left + (group.right - group.left - 24.0f) * 0.5f;
+            return D2D1::RectF(
+                left, group.top + 5.0f,
+                left + 24.0f, group.top + 29.0f);
+        }
         return D2D1::RectF(
             group.left + 5.0f,
             group.top + (group.bottom - group.top - 24.0f) * 0.5f,
@@ -9887,8 +9894,8 @@ private:
         const int safeIndex = std::clamp(index, 0, kWorkspaceControlCount - 1);
         const D2D1_RECT_F group = WorkspaceChromeGroupRectangle(client);
         if (WorkspaceChromeIsVertical()) {
-            const float top = group.top + 3.0f + safeIndex * (32.0f + gap);
-            return D2D1::RectF(group.left + 36.0f, top,
+            const float top = group.top + 35.0f + safeIndex * (32.0f + gap);
+            return D2D1::RectF(group.left + 4.0f, top,
                                 group.right - 4.0f, top + 32.0f);
         }
         float left = group.left + 36.0f;
