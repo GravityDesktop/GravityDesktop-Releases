@@ -312,6 +312,7 @@ enum MenuCommand : UINT {
     MenuSetCoreColorGray,
     MenuDeleteCore,
     MenuOpenItem,
+    MenuStoreExistingReference,
     MenuTogglePinned,
     MenuToggleFavorite,
     MenuToggleInProgress,
@@ -17912,6 +17913,12 @@ private:
             AppendMenuW(menu, MF_STRING, MenuOpenContainingFolder, L"打开所在文件夹");
             AppendMenuW(menu, MF_STRING, MenuRevealInExplorer, L"在资源管理器中选中");
             AppendMenuW(menu, MF_STRING, MenuShowFullPath, L"查看完整路径");
+            if (item != nullptr &&
+                item->storageMode == FileStorageMode::Reference &&
+                IsEligibleDesktopManagedFile(item->path)) {
+                AppendMenuW(menu, MF_STRING, MenuStoreExistingReference,
+                            L"收纳到当前核心（移出桌面）");
+            }
             AppendMenuW(menu, MF_SEPARATOR, 0, nullptr);
             AppendMenuW(menu, MF_STRING, MenuTogglePinned,
                         item != nullptr && item->pinned ? L"取消固定" : L"固定");
@@ -18014,6 +18021,10 @@ private:
             break;
         case MenuOpenItem:
             OpenItem(selected_.coreId, selected_.itemId);
+            break;
+        case MenuStoreExistingReference:
+            StoreExistingDesktopReferenceInCore(
+                selected_.coreId, selected_.itemId);
             break;
         case MenuOpenContainingFolder:
             OpenContainingFolder(selected_.coreId, selected_.itemId);
@@ -18592,6 +18603,150 @@ private:
         return true;
     }
 
+    // Older workspaces may contain a desktop reference created before managed
+    // storage was introduced. Converting that existing node must retain its
+    // stable ID, relationship links and hand-tuned position; it is not a new
+    // file and must never create a duplicate visual node.
+    bool StoreExistingDesktopReferenceInCore(
+        std::uint64_t coreId, std::uint64_t itemId) {
+        if (stateRecoveryBlocked_) {
+            SetStatus(L"状态处于保护模式；未移动任何真实文件");
+            return false;
+        }
+        Core* core = FindCore(coreId);
+        FileItem* item = FindItem(coreId, itemId);
+        if (core == nullptr || item == nullptr ||
+            item->storageMode != FileStorageMode::Reference) {
+            SetStatus(L"收纳失败：该文件不是可转换的桌面引用");
+            return false;
+        }
+        const std::wstring coreName = core->name;
+        const std::wstring sourcePath = item->path;
+        std::wstring eligibilityError;
+        if (!IsEligibleDesktopManagedFile(sourcePath, &eligibilityError)) {
+            SetStatus(L"未收纳：" + eligibilityError + L"；原文件保持不变");
+            return false;
+        }
+        if (!ConfirmManagedCollection(sourcePath, *core)) {
+            SetStatus(L"已取消收纳；真实文件仍保留在 Windows 桌面");
+            return false;
+        }
+        ResetManagedCollectionConfirmationSession();
+        const std::filesystem::path destination =
+            AvailableManagedLibraryRootPath(FileDisplayName(sourcePath));
+        if (destination.empty()) {
+            SetStatus(L"收纳失败：无法在托管库创建安全文件名");
+            return false;
+        }
+
+        const WorkspaceState before = state_;
+        ManagedFileTransaction transaction;
+        transaction.id = itemId;
+        transaction.coreId = coreId;
+        transaction.itemId = itemId;
+        transaction.operation = ManagedTransactionOperation::Store;
+        transaction.stage = ManagedTransactionStage::Prepared;
+        transaction.sourcePath = sourcePath;
+        transaction.destinationPath = destination.wstring();
+        transaction.itemPresentAfter = true;
+        transaction.createdAt = UnixTimeNow();
+        if (!PersistManagedTransaction(transaction)) {
+            SetStatus(L"收纳失败：无法写入文件移动事务日志");
+            return false;
+        }
+        std::wstring moveError;
+        if (!MoveFileWithoutReplacement(
+                transaction.sourcePath, transaction.destinationPath,
+                &moveError)) {
+            ClearManagedTransaction();
+            SetStatus(L"收纳失败：" + moveError);
+            return false;
+        }
+        transaction.stage = ManagedTransactionStage::FileMoved;
+        if (!PersistManagedTransaction(transaction)) {
+            std::wstring rollbackError;
+            const bool rolledBack = MoveFileWithoutReplacement(
+                transaction.destinationPath, transaction.sourcePath,
+                &rollbackError);
+            if (rolledBack) ClearManagedTransaction();
+            SetStatus(L"收纳失败：事务记录未完成，已尝试回滚真实文件");
+            return false;
+        }
+
+        WorkspaceState candidate = state_;
+        FileItem* candidateItem = nullptr;
+        Core* candidateCore = nullptr;
+        for (Core& candidateValue : candidate.cores) {
+            if (candidateValue.id != coreId) continue;
+            candidateCore = &candidateValue;
+            const auto found = std::find_if(
+                candidateValue.files.begin(), candidateValue.files.end(),
+                [itemId](const FileItem& value) { return value.id == itemId; });
+            if (found != candidateValue.files.end()) candidateItem = &*found;
+            break;
+        }
+        if (candidateCore == nullptr || candidateItem == nullptr ||
+            candidateItem->storageMode != FileStorageMode::Reference) {
+            std::wstring rollbackError;
+            const bool rolledBack = MoveFileWithoutReplacement(
+                transaction.destinationPath, transaction.sourcePath,
+                &rollbackError);
+            if (rolledBack) ClearManagedTransaction();
+            SetStatus(L"收纳失败：文件节点状态已变化，已回滚真实文件");
+            return false;
+        }
+        candidateItem->path = transaction.destinationPath;
+        candidateItem->originalPath = transaction.sourcePath;
+        candidateItem->managedPath = transaction.destinationPath;
+        candidateItem->managedAt = UnixTimeNow();
+        candidateItem->storageMode = FileStorageMode::Managed;
+        candidateItem->missing = false;
+        if (candidateItem->originalName.empty()) {
+            candidateItem->originalName = FileDisplayName(transaction.sourcePath);
+        }
+        const RelationValidationResult validation = ValidateRelationState(candidate);
+        if (!validation.IsValid() ||
+            !WriteStateWithRelationshipManifest(candidate)) {
+            std::wstring rollbackError;
+            const bool rolledBack = MoveFileWithoutReplacement(
+                transaction.destinationPath, transaction.sourcePath,
+                &rollbackError);
+            if (rolledBack) ClearManagedTransaction();
+            SetStatus(validation.IsValid()
+                ? L"收纳失败：状态未能保存，真实文件已回滚"
+                : L"收纳失败：关系校验未通过，已回滚真实文件");
+            return false;
+        }
+
+        state_ = std::move(candidate);
+        dirty_ = false;
+        CreateHistoryBackup(false);
+        transaction.stage = ManagedTransactionStage::StateSaved;
+        (void)PersistManagedTransaction(transaction);
+        transaction.stage = ManagedTransactionStage::Committed;
+        (void)PersistManagedTransaction(transaction);
+        ClearManagedTransaction();
+        ManagedFileTransaction reverse;
+        reverse.id = itemId;
+        reverse.coreId = coreId;
+        reverse.itemId = itemId;
+        reverse.operation = ManagedTransactionOperation::Undo;
+        reverse.sourcePath = transaction.destinationPath;
+        reverse.destinationPath = transaction.sourcePath;
+        reverse.itemPresentAfter = true;
+        reverse.createdAt = UnixTimeNow();
+        managedUndoAction_ = ManagedUndoAction{std::move(reverse)};
+        PushUndo(before);
+        MarkManagedCollectionSuccess();
+        iconCache_.clear();
+        iconShadowCache_.clear();
+        layoutCache_.clear();
+        layoutDirty_ = true;
+        SetManagedCollectionStatus(coreName);
+        Invalidate();
+        return true;
+    }
+
     bool StoreDesktopFileInCore(
         const std::wstring& sourcePath,
         std::uint64_t targetCoreId,
@@ -18630,6 +18785,12 @@ private:
             }
         }
         if (existing != nullptr) {
+            if (existingOwner != nullptr &&
+                existingOwner->id == targetCoreId &&
+                existing->storageMode == FileStorageMode::Reference) {
+                return StoreExistingDesktopReferenceInCore(
+                    targetCoreId, existing->id);
+            }
             SetStatus(existingOwner != nullptr && existingOwner->id != targetCoreId
                 ? L"该文件已经属于其他核心；未自动跨核心移动"
                 : L"该文件已经存在于当前核心；未创建重复入口");
