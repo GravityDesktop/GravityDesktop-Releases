@@ -5691,13 +5691,57 @@ private:
         applyingWorkspaceFrame_ = false;
     }
 
+    bool AdoptExplorerDesktopHostMigration() {
+        if (!desktopChildHosted_ || window_ == nullptr ||
+            IsWindow(window_) == FALSE) {
+            return false;
+        }
+        const HWND actualHost = GetParent(window_);
+        if (actualHost == nullptr || actualHost == desktopHost_ ||
+            IsWindow(actualHost) == FALSE) {
+            return false;
+        }
+
+        wchar_t className[32]{};
+        GetClassNameW(actualHost, className,
+                      static_cast<int>(std::size(className)));
+        if (wcscmp(className, L"Progman") != 0 &&
+            wcscmp(className, L"WorkerW") != 0) {
+            return false;
+        }
+
+        const HWND shellWindow = GetShellWindow();
+        DWORD shellProcessId = 0;
+        DWORD actualHostProcessId = 0;
+        if (shellWindow != nullptr) {
+            GetWindowThreadProcessId(shellWindow, &shellProcessId);
+        }
+        GetWindowThreadProcessId(actualHost, &actualHostProcessId);
+        if (actualHostProcessId == 0 ||
+            (shellProcessId != 0 &&
+             actualHostProcessId != shellProcessId)) {
+            return false;
+        }
+
+        // Explorer moves the whole desktop child band between Progman and a
+        // WorkerW during Win+D. The visual HWND follows that move
+        // automatically; adopt its real parent and retarget only the popup
+        // interaction owner. Reparenting the visual window back starts a tug
+        // of war with Explorer and causes the multi-second disappearance.
+        desktopHost_ = actualHost;
+        desktopHostAttachmentAttempted_ = true;
+        AttachInteractionWindowToCompanionLayer();
+        AttachDividerHandleWindowToCompanionLayer();
+        AppendRuntimeDiagnostic("desktop_host_migration_adopted");
+        return true;
+    }
+
     void AttachToDesktopCompanionLayer() {
         if (window_ == nullptr) return;
-        // Once attached, retain the same Explorer host for its lifetime.
-        // During Win+D Explorer can briefly move SHELLDLL_DefView between
-        // Progman and WorkerW even though both windows remain alive. Treating
-        // that transient move as a failed host causes repeated SetParent
-        // calls, which makes the companion surface blink or disappear.
+        (void)AdoptExplorerDesktopHostMigration();
+        // Keep the current Explorer host unless Explorer itself migrated the
+        // visual child band. AdoptExplorerDesktopHostMigration handles that
+        // legitimate Progman/WorkerW transition before this fallback path.
         HWND desktopHost = DesktopHostStillUsable(desktopHost_)
             ? desktopHost_
             : FindDesktopViewHost();
@@ -5779,55 +5823,89 @@ private:
         return shellProcessId == 0 || hostProcessId == shellProcessId;
     }
 
-    bool DesktopSurfacesHealthy() const {
+    const char* DesktopSurfaceHealthFailure() const {
         if (window_ == nullptr ||
             interactionWindow_ == nullptr ||
             dividerHandleWindow_ == nullptr ||
-            desktopHost_ == nullptr ||
-            IsWindow(window_) == FALSE ||
-            IsWindow(interactionWindow_) == FALSE ||
-            IsWindow(dividerHandleWindow_) == FALSE ||
-            IsWindow(desktopHost_) == FALSE) {
-            return false;
+            desktopHost_ == nullptr) {
+            return "desktop_health_missing_handle";
         }
-        if (workspaceVisible_ && !state_.workspacePaused &&
-            !failOpenActive_) {
-            if (IsWindowVisible(window_) == FALSE ||
-                IsWindowVisible(interactionWindow_) == FALSE ||
-                (DividerEnabled() &&
-                 IsWindowVisible(dividerHandleWindow_) == FALSE)) {
-                return false;
-            }
+        if (IsWindow(window_) == FALSE) {
+            return "desktop_health_visual_destroyed";
         }
+        if (IsWindow(interactionWindow_) == FALSE) {
+            return "desktop_health_interaction_destroyed";
+        }
+        if (IsWindow(dividerHandleWindow_) == FALSE) {
+            return "desktop_health_divider_destroyed";
+        }
+        if (IsWindow(desktopHost_) == FALSE) {
+            return "desktop_health_host_destroyed";
+        }
+        // Visibility is deliberately not structural health. Win+D briefly
+        // hides desktop-band windows while preserving their HWNDs, parents and
+        // owners. Treating that transition as damage starts a full SetParent
+        // reconnect and makes the visual layer and divider blink separately.
         // Keep using the already attached host while it is still valid.
         // Explorer can expose a transient second candidate during a shell
         // transition; changing parent merely because enumeration order changed
         // is destabilizing and can orphan the visible surface.
         if (!DesktopHostStillUsable(desktopHost_)) {
-            return false;
+            return "desktop_health_host_replaced";
         }
         const bool dividerAttached =
             GetWindow(dividerHandleWindow_, GW_OWNER) ==
             interactionWindow_;
         if (desktopChildHosted_) {
-            return GetParent(window_) == desktopHost_ &&
-                   (GetWindowLongPtrW(
-                        interactionWindow_,
-                        GWL_STYLE) & WS_CHILD) == 0 &&
-                    GetWindow(
-                        interactionWindow_,
-                        GW_OWNER) == desktopHost_ &&
-                   dividerAttached;
+            if (GetParent(window_) != desktopHost_) {
+                return "desktop_health_visual_parent_changed";
+            }
+            if ((GetWindowLongPtrW(
+                     interactionWindow_, GWL_STYLE) & WS_CHILD) != 0) {
+                return "desktop_health_interaction_became_child";
+            }
+            if (GetWindow(interactionWindow_, GW_OWNER) != desktopHost_) {
+                return "desktop_health_interaction_owner_changed";
+            }
+            if (!dividerAttached) {
+                return "desktop_health_divider_owner_changed";
+            }
+            return nullptr;
         }
-        return (GetWindowLongPtrW(
-                    window_, GWL_STYLE) & WS_CHILD) == 0 &&
-               (GetWindowLongPtrW(
-                    interactionWindow_,
-                    GWL_STYLE) & WS_CHILD) == 0 &&
-               GetWindow(window_, GW_OWNER) == desktopHost_ &&
-               GetWindow(interactionWindow_, GW_OWNER) ==
-                   desktopHost_ &&
-               dividerAttached;
+        if ((GetWindowLongPtrW(window_, GWL_STYLE) & WS_CHILD) != 0) {
+            return "desktop_health_visual_became_child";
+        }
+        if ((GetWindowLongPtrW(
+                 interactionWindow_, GWL_STYLE) & WS_CHILD) != 0) {
+            return "desktop_health_interaction_became_child";
+        }
+        if (GetWindow(window_, GW_OWNER) != desktopHost_) {
+            return "desktop_health_visual_owner_changed";
+        }
+        if (GetWindow(interactionWindow_, GW_OWNER) != desktopHost_) {
+            return "desktop_health_interaction_owner_changed";
+        }
+        if (!dividerAttached) {
+            return "desktop_health_divider_owner_changed";
+        }
+        return nullptr;
+    }
+
+    bool DesktopSurfacesHealthy() const {
+        return DesktopSurfaceHealthFailure() == nullptr;
+    }
+
+    bool DesktopSurfacesVisible() const {
+        if (!workspaceVisible_ || state_.workspacePaused || failOpenActive_) {
+            return true;
+        }
+        return window_ != nullptr &&
+               interactionWindow_ != nullptr &&
+               IsWindowVisible(window_) != FALSE &&
+               IsWindowVisible(interactionWindow_) != FALSE &&
+               (!DividerEnabled() ||
+                (dividerHandleWindow_ != nullptr &&
+                 IsWindowVisible(dividerHandleWindow_) != FALSE));
     }
 
     RECT PrimaryWorkAreaPixels() const {
@@ -6092,8 +6170,13 @@ private:
             if (initialized_ && !shuttingDown_ &&
                 !exitRequested_ && !failOpenActive_ &&
                 !desktopReconnectPending_) {
-                if (!DesktopSurfacesHealthy()) {
+                (void)AdoptExplorerDesktopHostMigration();
+                if (const char* healthFailure =
+                        DesktopSurfaceHealthFailure()) {
+                    AppendRuntimeDiagnostic(healthFailure);
                     BeginDesktopReconnect(false);
+                } else if (!DesktopSurfacesVisible()) {
+                    RestoreDesktopVisibilityAfterShellTransition();
                 } else {
                     EnsureInteractionWindowPresented();
                 }
