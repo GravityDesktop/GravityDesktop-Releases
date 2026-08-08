@@ -4463,9 +4463,13 @@ public:
                         kRefreshInteractionLayerMessage,
                         0, 0);
                 }
-            } else if (wParam == FALSE) {
-                ScheduleDesktopVisibilityRestore();
             }
+            // WM_SHOWWINDOW(FALSE) is also generated while SetParent and a
+            // desktop-host frame change are in progress. Treating every such
+            // notification as Win+D repeatedly reattached the visual layer
+            // between Explorer hosts and could leave only the divider visible.
+            // A real Win+D minimization is handled above by WM_SIZE with
+            // SIZE_MINIMIZED, so no restore is scheduled here.
             break;
         case WM_WINDOWPOSCHANGED:
             if (initialized_ && workspaceVisible_ &&
