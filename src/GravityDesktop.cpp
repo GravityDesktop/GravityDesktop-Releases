@@ -97,6 +97,9 @@ constexpr UINT kDesktopReconnectIntervalMs = 250;
 constexpr UINT kInteractionLayerRepairDelayMs = 600;
 constexpr UINT kDesktopVisibilityRestoreDelayMs = 180;
 constexpr int kDesktopReconnectAttemptLimit = 40;
+constexpr std::uintmax_t kRuntimeDiagnosticLogMaximumBytes =
+    2U * 1024U * 1024U;
+constexpr int kRuntimeDiagnosticLogFileCount = 5;
 constexpr std::size_t kMaxRelationTraversalNodes = 4096;
 constexpr std::size_t kMaxRelationTraversalDepth = 256;
 constexpr std::size_t kHistoryRecentSnapshotCount = 48;
@@ -110,6 +113,7 @@ constexpr UINT kRestoreExistingInstanceMessage = WM_APP + 3;
 constexpr UINT kRefreshInteractionLayerMessage = WM_APP + 4;
 constexpr UINT kCommitCoreShortLabelMessage = WM_APP + 5;
 constexpr UINT kPreviewCoreShortLabelMessage = WM_APP + 6;
+constexpr UINT kDesktopFailOpenMessage = WM_APP + 7;
 constexpr UINT kTrayIconId = 1;
 constexpr wchar_t kAutoStartRegistrySubkey[] =
     L"Software\\Microsoft\\Windows\\CurrentVersion\\Run";
@@ -3369,6 +3373,124 @@ public:
         return initialized_;
     }
 
+    std::filesystem::path RuntimeDiagnosticLogPath() const {
+        if (stateFile_.empty()) return {};
+        return stateFile_.parent_path() / L"logs" / L"runtime.log";
+    }
+
+    void RotateRuntimeDiagnosticLogsIfNeeded(
+        const std::filesystem::path& current) const {
+        std::error_code error;
+        if (!std::filesystem::exists(current, error) || error ||
+            std::filesystem::file_size(current, error) <
+                kRuntimeDiagnosticLogMaximumBytes || error) {
+            return;
+        }
+        for (int index = kRuntimeDiagnosticLogFileCount - 1;
+             index >= 1; --index) {
+            const std::filesystem::path source =
+                index == 1
+                    ? current
+                    : current.parent_path() /
+                        (L"runtime." + std::to_wstring(index - 1) + L".log");
+            const std::filesystem::path destination =
+                current.parent_path() /
+                (L"runtime." + std::to_wstring(index) + L".log");
+            error.clear();
+            std::filesystem::remove(destination, error);
+            error.clear();
+            if (std::filesystem::exists(source, error) && !error) {
+                std::filesystem::rename(source, destination, error);
+            }
+        }
+    }
+
+    void AppendRuntimeDiagnostic(
+        const char* event, HRESULT result = S_OK,
+        DWORD win32Error = ERROR_SUCCESS) const {
+        const std::filesystem::path path = RuntimeDiagnosticLogPath();
+        if (path.empty() || event == nullptr) return;
+        std::error_code error;
+        std::filesystem::create_directories(path.parent_path(), error);
+        if (error) return;
+        RotateRuntimeDiagnosticLogsIfNeeded(path);
+        std::ofstream log(path, std::ios::app);
+        if (!log) return;
+        log.imbue(std::locale::classic());
+        const auto handleValue = [](HWND handle) {
+            return static_cast<unsigned long long>(
+                reinterpret_cast<std::uintptr_t>(handle));
+        };
+        log << UnixTimeNow() << ' ' << event
+            << " pid=" << GetCurrentProcessId()
+            << " visual=" << handleValue(window_)
+            << " input=" << handleValue(interactionWindow_)
+            << " divider=" << handleValue(dividerHandleWindow_)
+            << " lifecycle=" << handleValue(lifecycleWindow_)
+            << " desktop_host=" << handleValue(desktopHost_)
+            << " visual_visible=" <<
+                (window_ != nullptr && IsWindowVisible(window_) != FALSE ? 1 : 0)
+            << " input_visible=" <<
+                (interactionWindow_ != nullptr &&
+                 IsWindowVisible(interactionWindow_) != FALSE ? 1 : 0)
+            << " divider_visible=" <<
+                (dividerHandleWindow_ != nullptr &&
+                 IsWindowVisible(dividerHandleWindow_) != FALSE ? 1 : 0)
+            << " workspace_visible=" << (workspaceVisible_ ? 1 : 0)
+            << " workspace_paused=" << (state_.workspacePaused ? 1 : 0)
+            << " desktop_child=" << (desktopChildHosted_ ? 1 : 0)
+            << " dpi=" << static_cast<int>(std::round(dpi_))
+            << " hr=0x" << std::hex << static_cast<unsigned long>(result)
+            << " win32=" << std::dec << win32Error << '\n';
+    }
+
+    void RequestDesktopFailOpen(const char* reason,
+                                HRESULT result = S_OK,
+                                DWORD win32Error = ERROR_SUCCESS) {
+        AppendRuntimeDiagnostic(reason, result, win32Error);
+        if (failOpenActive_ || failOpenRequested_ ||
+            lifecycleWindow_ == nullptr ||
+            IsWindow(lifecycleWindow_) == FALSE) {
+            return;
+        }
+        failOpenRequested_ = true;
+        PostMessageW(lifecycleWindow_, kDesktopFailOpenMessage, 0, 0);
+    }
+
+    void EnterDesktopFailOpen() {
+        failOpenRequested_ = false;
+        if (failOpenActive_ || shuttingDown_ || exitRequested_) return;
+        failOpenActive_ = true;
+        workspaceVisible_ = false;
+        StopSelectionDismissTimer();
+        OnPointerLeave(pointerLeaveTrackingWindow_);
+        DestroyDividerTooltip();
+        if (interactionWindow_ != nullptr &&
+            IsWindow(interactionWindow_) != FALSE) {
+            SetWindowRgn(interactionWindow_, nullptr, TRUE);
+            interactionShapes_.clear();
+            interactionDividerRegionIncluded_ = false;
+            ShowWindow(interactionWindow_, SW_HIDE);
+        }
+        if (dividerHandleWindow_ != nullptr &&
+            IsWindow(dividerHandleWindow_) != FALSE) {
+            ShowWindow(dividerHandleWindow_, SW_HIDE);
+        }
+        if (window_ != nullptr && IsWindow(window_) != FALSE) {
+            ShowWindow(window_, SW_HIDE);
+        }
+        AppendRuntimeDiagnostic("desktop_fail_open");
+    }
+
+    void RecoverFromDesktopFailOpen() {
+        if (!failOpenActive_) return;
+        failOpenActive_ = false;
+        failOpenRequested_ = false;
+        DiscardDeviceResources();
+        workspaceVisible_ = true;
+        AppendRuntimeDiagnostic("desktop_fail_open_recovery_requested");
+    }
+
     bool Initialize(HWND window) {
         window_ = window;
         dpi_ = static_cast<float>(GetDpiForWindow(window_));
@@ -3503,6 +3625,9 @@ public:
             return 0;
         }
         switch (message) {
+        case kDesktopFailOpenMessage:
+            EnterDesktopFailOpen();
+            return 0;
         case WM_QUERYENDSESSION:
             (void)SaveForSessionEnd();
             // Never delay or veto Windows shutdown.
@@ -4960,6 +5085,7 @@ private:
         const HWND currentDesktopHost =
             FindDesktopViewHost();
         if (!DesktopHostReady(currentDesktopHost)) {
+            AppendRuntimeDiagnostic("desktop_reconnect_host_unavailable");
             return false;
         }
 
@@ -4969,6 +5095,9 @@ private:
         desktopChildHosted_ = false;
 
         if (!CreateVisualWindowForReconnect()) {
+            AppendRuntimeDiagnostic("desktop_reconnect_visual_create_failed",
+                                    HRESULT_FROM_WIN32(GetLastError()),
+                                    GetLastError());
             desktopReconnectInProgress_ = false;
             return false;
         }
@@ -4977,6 +5106,9 @@ private:
             !CreateInteractionWindow(false) ||
             !CreateDividerHandleWindow() ||
             !PositionDesktopSurfacesForReconnect()) {
+            AppendRuntimeDiagnostic("desktop_reconnect_surface_create_failed",
+                                    HRESULT_FROM_WIN32(GetLastError()),
+                                    GetLastError());
             desktopReconnectInProgress_ = false;
             return false;
         }
@@ -5025,12 +5157,15 @@ private:
             trayRebuildPending_ = false;
         }
         RestoreWindowTimersAfterReconnect();
+        AppendRuntimeDiagnostic("desktop_reconnect_succeeded");
         return true;
     }
 
     void BeginDesktopReconnect(bool taskbarRecreated) {
         if (taskbarRecreated) {
+            AppendRuntimeDiagnostic("taskbar_created");
             trayIconAdded_ = false;
+            trayIconOwner_ = nullptr;
             trayRebuildPending_ = true;
         }
         if (shuttingDown_ || exitRequested_ ||
@@ -5149,6 +5284,7 @@ private:
             window_ == nullptr || IsWindow(window_) == FALSE) {
             return;
         }
+        AppendRuntimeDiagnostic("desktop_reconnect_requested");
         // A short one-shot delay lets Win+D complete its minimize/hide pass
         // before restoring this desktop companion below normal application
         // windows. Repeated shell notifications simply restart the delay.
@@ -5187,6 +5323,7 @@ private:
 
     void SetWorkspaceVisible(bool visible) {
         if (visible) {
+            RecoverFromDesktopFailOpen();
             workspaceVisible_ = true;
             if (state_.workspacePaused) state_.workspacePaused = false;
             if (window_ == nullptr ||
@@ -5344,17 +5481,30 @@ private:
             GetSystemMetrics(SM_CYSMICON));
         wcsncpy_s(icon.szTip, L"引力桌面工作区", _TRUNCATE);
         trayIconAdded_ = Shell_NotifyIconW(NIM_ADD, &icon) != FALSE;
+        if (trayIconAdded_) {
+            trayIconOwner_ = owner;
+            AppendRuntimeDiagnostic("tray_icon_added");
+        } else {
+            AppendRuntimeDiagnostic("tray_icon_add_failed", S_OK,
+                                    GetLastError());
+        }
     }
 
     void RemoveTrayIcon() {
-        const HWND owner = TrayOwnerWindow();
+        const HWND owner = trayIconOwner_ != nullptr
+            ? trayIconOwner_
+            : TrayOwnerWindow();
         if (!trayIconAdded_ || owner == nullptr) return;
         NOTIFYICONDATAW icon{};
         icon.cbSize = sizeof(icon);
         icon.hWnd = owner;
         icon.uID = kTrayIconId;
-        Shell_NotifyIconW(NIM_DELETE, &icon);
+        const BOOL removed = Shell_NotifyIconW(NIM_DELETE, &icon);
+        AppendRuntimeDiagnostic(
+            removed != FALSE ? "tray_icon_removed" : "tray_icon_remove_failed",
+            S_OK, removed != FALSE ? ERROR_SUCCESS : GetLastError());
         trayIconAdded_ = false;
+        trayIconOwner_ = nullptr;
     }
 
     void ShowTrayMenu() {
@@ -5822,6 +5972,7 @@ private:
         result = factory_->CreateWicBitmapRenderTarget(
             layeredSurface_.Get(), properties, renderTarget_.ReleaseAndGetAddressOf());
         if (FAILED(result)) {
+            DiscardDeviceResources();
             return result;
         }
         BITMAPINFO bitmapInfo{};
@@ -5843,6 +5994,9 @@ private:
         layeredPixelSize_ = SIZE{static_cast<LONG>(width), static_cast<LONG>(height)};
         result = renderTarget_->CreateSolidColorBrush(
             D2D1::ColorF(0xFFFFFF), brush_.ReleaseAndGetAddressOf());
+        if (FAILED(result)) {
+            DiscardDeviceResources();
+        }
         return result;
     }
 
@@ -8661,8 +8815,11 @@ private:
     void Paint() {
         PAINTSTRUCT paint{};
         BeginPaint(window_, &paint);
-        if (SUCCEEDED(EnsureDeviceResources())) {
+        const HRESULT resources = EnsureDeviceResources();
+        if (SUCCEEDED(resources)) {
             DrawScene();
+        } else {
+            RequestDesktopFailOpen("visual_resource_create_failed", resources);
         }
         EndPaint(window_, &paint);
     }
@@ -8679,8 +8836,16 @@ private:
             const LayoutMap emptyLayouts;
             UpdateInteractionRegion(emptyLayouts);
             const HRESULT result = renderTarget_->EndDraw();
-            if (result == D2DERR_RECREATE_TARGET) DiscardDeviceResources();
-            else if (SUCCEEDED(result)) PresentLayeredSurface();
+            if (result == D2DERR_RECREATE_TARGET) {
+                AppendRuntimeDiagnostic("visual_target_recreate_requested", result);
+                DiscardDeviceResources();
+                InvalidateRect(window_, nullptr, FALSE);
+            } else if (FAILED(result)) {
+                RequestDesktopFailOpen("visual_end_draw_failed", result);
+            } else if (!PresentLayeredSurface()) {
+                RequestDesktopFailOpen("visual_present_failed", S_OK,
+                                       GetLastError());
+            }
             return;
         }
 
@@ -8727,9 +8892,16 @@ private:
 
         const HRESULT result = renderTarget_->EndDraw();
         if (result == D2DERR_RECREATE_TARGET) {
+            AppendRuntimeDiagnostic("visual_target_recreate_requested", result);
             DiscardDeviceResources();
+            InvalidateRect(window_, nullptr, FALSE);
+        } else if (FAILED(result)) {
+            RequestDesktopFailOpen("visual_end_draw_failed", result);
         } else if (SUCCEEDED(result)) {
-            PresentLayeredSurface();
+            if (!PresentLayeredSurface()) {
+                RequestDesktopFailOpen("visual_present_failed", S_OK,
+                                       GetLastError());
+            }
         }
     }
 
@@ -21265,8 +21437,11 @@ private:
     bool applyingWorkspaceFrame_ = false;
     bool hidingToTray_ = false;
     bool exitRequested_ = false;
+    bool failOpenActive_ = false;
+    bool failOpenRequested_ = false;
     bool workspaceVisible_ = true;
     bool trayIconAdded_ = false;
+    HWND trayIconOwner_ = nullptr;
     bool trayRebuildPending_ = false;
     bool shellHookRegistered_ = false;
     HWND desktopHost_ = nullptr;
