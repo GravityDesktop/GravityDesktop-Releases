@@ -1195,6 +1195,16 @@ struct ManagedUndoAction {
     ManagedFileTransaction reverseTransaction;
 };
 
+// A core dissolve can restore several managed files in one command.  Keep a
+// separate journal for the complete plan so a crash never loses track of an
+// earlier file after a later file has started moving.
+struct CoreDissolveTransaction {
+    std::uint64_t coreId = 0;
+    bool retainSystemCore = false;
+    std::int64_t createdAt = 0;
+    std::vector<ManagedFileTransaction> moves;
+};
+
 std::string SerializeManagedFileTransaction(
     const ManagedFileTransaction& transaction) {
     std::ostringstream output;
@@ -1213,38 +1223,99 @@ std::string SerializeManagedFileTransaction(
     return output.str();
 }
 
+bool DeserializeManagedFileTransactionObject(
+    const JsonValue::Object& object, ManagedFileTransaction& transaction) {
+    if (static_cast<int>(NumberMember(object, "version", 0.0)) != 1) {
+        return false;
+    }
+    transaction.id = static_cast<std::uint64_t>(
+        NumberMember(object, "id", 0.0));
+    transaction.coreId = static_cast<std::uint64_t>(
+        NumberMember(object, "core_id", 0.0));
+    transaction.itemId = static_cast<std::uint64_t>(
+        NumberMember(object, "item_id", 0.0));
+    transaction.operation = static_cast<ManagedTransactionOperation>(
+        std::clamp(static_cast<int>(NumberMember(
+            object, "operation", 0.0)), 0, 4));
+    transaction.stage = static_cast<ManagedTransactionStage>(
+        std::clamp(static_cast<int>(NumberMember(
+            object, "stage", 0.0)), 0, 4));
+    transaction.sourcePath = StringMember(object, "source_path", L"");
+    transaction.destinationPath = StringMember(
+        object, "destination_path", L"");
+    transaction.itemPresentAfter = BoolMember(
+        object, "item_present_after", false);
+    transaction.createdAt = static_cast<std::int64_t>(
+        NumberMember(object, "created_at", 0.0));
+    return transaction.id != 0 && transaction.itemId != 0 &&
+           !transaction.sourcePath.empty() &&
+           !transaction.destinationPath.empty();
+}
+
 bool DeserializeManagedFileTransaction(
     const std::string& text, ManagedFileTransaction& transaction) {
     JsonValue root;
     JsonParser parser(text);
     if (!parser.Parse(root)) return false;
     const JsonValue::Object* object = root.AsObject();
-    if (object == nullptr ||
-        static_cast<int>(NumberMember(*object, "version", 0.0)) != 1) {
+    return object != nullptr &&
+           DeserializeManagedFileTransactionObject(*object, transaction);
+}
+
+std::string SerializeCoreDissolveTransaction(
+    const CoreDissolveTransaction& transaction) {
+    std::ostringstream output;
+    output.imbue(std::locale::classic());
+    output << "{\"version\":1,\"core_id\":" << transaction.coreId
+           << ",\"retain_system_core\":"
+           << (transaction.retainSystemCore ? "true" : "false")
+           << ",\"created_at\":" << transaction.createdAt
+           << ",\"moves\":[";
+    for (std::size_t index = 0; index < transaction.moves.size(); ++index) {
+        if (index != 0) output << ',';
+        output << SerializeManagedFileTransaction(transaction.moves[index]);
+    }
+    output << "]}";
+    return output.str();
+}
+
+bool DeserializeCoreDissolveTransaction(
+    const std::string& text, CoreDissolveTransaction& transaction) {
+    JsonValue rootValue;
+    JsonParser parser(text);
+    if (!parser.Parse(rootValue)) return false;
+    const JsonValue::Object* root = rootValue.AsObject();
+    if (root == nullptr ||
+        static_cast<int>(NumberMember(*root, "version", 0.0)) != 1) {
         return false;
     }
-    transaction.id = static_cast<std::uint64_t>(
-        NumberMember(*object, "id", 0.0));
-    transaction.coreId = static_cast<std::uint64_t>(
-        NumberMember(*object, "core_id", 0.0));
-    transaction.itemId = static_cast<std::uint64_t>(
-        NumberMember(*object, "item_id", 0.0));
-    transaction.operation = static_cast<ManagedTransactionOperation>(
-        std::clamp(static_cast<int>(NumberMember(
-            *object, "operation", 0.0)), 0, 4));
-    transaction.stage = static_cast<ManagedTransactionStage>(
-        std::clamp(static_cast<int>(NumberMember(
-            *object, "stage", 0.0)), 0, 4));
-    transaction.sourcePath = StringMember(*object, "source_path", L"");
-    transaction.destinationPath = StringMember(
-        *object, "destination_path", L"");
-    transaction.itemPresentAfter = BoolMember(
-        *object, "item_present_after", false);
-    transaction.createdAt = static_cast<std::int64_t>(
-        NumberMember(*object, "created_at", 0.0));
-    return transaction.id != 0 && transaction.itemId != 0 &&
-           !transaction.sourcePath.empty() &&
-           !transaction.destinationPath.empty();
+    const JsonValue* movesValue = FindMember(*root, "moves");
+    const JsonValue::Array* moves =
+        movesValue == nullptr ? nullptr : movesValue->AsArray();
+    if (moves == nullptr) return false;
+
+    CoreDissolveTransaction parsed;
+    parsed.coreId = static_cast<std::uint64_t>(
+        NumberMember(*root, "core_id", 0.0));
+    parsed.retainSystemCore = BoolMember(
+        *root, "retain_system_core", false);
+    parsed.createdAt = static_cast<std::int64_t>(
+        NumberMember(*root, "created_at", 0.0));
+    std::set<std::uint64_t> itemIds;
+    for (const JsonValue& moveValue : *moves) {
+        const JsonValue::Object* move = moveValue.AsObject();
+        ManagedFileTransaction entry;
+        if (move == nullptr ||
+            !DeserializeManagedFileTransactionObject(*move, entry) ||
+            entry.operation != ManagedTransactionOperation::Restore ||
+            !itemIds.insert(entry.itemId).second) {
+            return false;
+        }
+        parsed.moves.push_back(std::move(entry));
+    }
+    if (parsed.coreId == 0) return false;
+    transaction = std::move(parsed);
+    return true;
 }
 
 bool IsCoreColorPreset(UINT32 color) {
@@ -4198,6 +4269,7 @@ public:
         } else {
             LoadState();
             RecoverPendingManagedTransaction();
+            RecoverPendingCoreDissolveTransaction();
             MigrateLegacyManagedLibraryItems();
             LoadCoreShortLabelOverrides();
             DiscoverRelationshipRecoveryManifest();
@@ -17792,9 +17864,13 @@ private:
                 AppendMenuW(menu, MF_STRING, MenuArchiveCore,
                             L"归档核心");
                 AppendMenuW(menu, MF_STRING, MenuDissolveCore,
-                            L"解散核心并移至未分类");
+                            L"解散核心并还原文件到桌面");
                 AppendMenuW(menu, MF_STRING, MenuDeleteCore,
                             L"移除核心及所有引用");
+            } else if (core != nullptr && !core->files.empty()) {
+                AppendMenuW(menu, MF_SEPARATOR, 0, nullptr);
+                AppendMenuW(menu, MF_STRING, MenuDissolveCore,
+                            L"还原未分类文件到桌面并清空引用");
             }
         } else {
             FileItem* item = FindItem(hit.coreId, hit.itemId);
@@ -19170,131 +19246,200 @@ private:
         if (beginRename) BeginRename(id);
     }
 
-    void DissolveCore(std::uint64_t id) {
-        if (id == kUnclassifiedCoreId) {
-            SetStatus(L"“未分类”是系统兜底核心，不能解散");
-            return;
-        }
+    void DissolveCore(std::uint64_t id, bool requireConfirmation = true) {
         const Core* source = FindCore(id);
-        const Core* unclassified = FindCore(kUnclassifiedCoreId);
-        if (source == nullptr || unclassified == nullptr) {
+        if (source == nullptr) {
             return;
         }
-        const std::size_t currentAttachedCount =
-            AttachedFileCount(*unclassified);
-        const std::size_t incomingAttachedCount =
-            AttachedFileCount(*source);
-        const std::size_t resultingAttachedCount =
-            AttachedFileCountAfterDissolve(
-                *unclassified, *source);
-        if (resultingAttachedCount >
-            static_cast<std::size_t>(
-                kCoreFileCapacity)) {
-            SetStatus(
-                L"无法解散：未分类当前 " +
-                std::to_wstring(
-                    currentAttachedCount) +
-                L" 项，转入 " +
-                std::to_wstring(
-                    incomingAttachedCount) +
-                L" 项后为 " +
-                std::to_wstring(
-                    resultingAttachedCount) +
-                L"/" +
-                std::to_wstring(
-                    kCoreFileCapacity) +
-                L"；请先整理或移除部分引用");
+        if (stateRecoveryBlocked_) {
+            SetStatus(L"状态处于保护模式；未解散核心或移动真实文件");
             return;
         }
+
+        const bool retainSystemCore = id == kUnclassifiedCoreId;
         const std::size_t referenceCount = source->files.size();
-        const std::wstring warning =
-            L"将解散核心“" + source->name + L"”。\n\n" +
-            L"其中 " + std::to_wstring(referenceCount) +
-            L" 个文件引用将转入“未分类”。\n"
-            L"真实文件不会被移动或删除。";
-        if (MessageBoxW(
-                window_, warning.c_str(), L"解散核心并移至未分类",
+        const std::size_t managedCount = static_cast<std::size_t>(
+            std::count_if(source->files.begin(), source->files.end(),
+                          [](const FileItem& item) {
+                              return item.storageMode ==
+                                  FileStorageMode::Managed;
+                          }));
+        std::optional<std::filesystem::path> desktop;
+        if (managedCount != 0) {
+            desktop = CurrentUserDesktopPath();
+            if (!desktop.has_value()) {
+                SetStatus(L"无法解散：无法读取当前 Windows 桌面路径");
+                return;
+            }
+        }
+
+        CoreDissolveTransaction transaction;
+        transaction.coreId = id;
+        transaction.retainSystemCore = retainSystemCore;
+        transaction.createdAt = UnixTimeNow();
+        std::set<std::wstring> plannedDestinations;
+        for (const FileItem& item : source->files) {
+            if (item.storageMode != FileStorageMode::Managed) {
+                continue;
+            }
+            if (item.path.empty() || !FilePathExists(item.path)) {
+                SetStatus(L"无法解散：托管文件不存在，未移动任何文件");
+                return;
+            }
+            const std::filesystem::path original(item.originalPath);
+            std::filesystem::path destination =
+                *desktop / FileDisplayName(
+                    item.originalPath.empty() ? item.path : item.originalPath);
+            if (!item.originalPath.empty() &&
+                PathEquals(
+                    NormalizePath(original.parent_path().wstring()),
+                    NormalizePath(desktop->wstring()))) {
+                destination = original;
+            }
+            const std::wstring normalizedDestination =
+                NormalizePath(destination.wstring());
+            if (!plannedDestinations.insert(normalizedDestination).second ||
+                (!PathEquals(item.path, destination.wstring()) &&
+                 FilePathExists(destination.wstring()))) {
+                SetStatus(
+                    L"无法解散：桌面已有同名文件，未移动任何文件。"
+                    L"请先处理同名文件后重试");
+                return;
+            }
+            if (PathEquals(item.path, destination.wstring())) {
+                continue;
+            }
+            ManagedFileTransaction move;
+            move.id = item.id;
+            move.coreId = id;
+            move.itemId = item.id;
+            move.operation = ManagedTransactionOperation::Restore;
+            move.stage = ManagedTransactionStage::Prepared;
+            move.sourcePath = item.path;
+            move.destinationPath = destination.wstring();
+            move.itemPresentAfter = false;
+            move.createdAt = transaction.createdAt;
+            transaction.moves.push_back(std::move(move));
+        }
+
+        const std::wstring warning = retainSystemCore
+            ? L"将清空“未分类”中的 " +
+                  std::to_wstring(referenceCount) + L" 个文件引用。\n\n" +
+                  L"其中 " + std::to_wstring(managedCount) +
+                  L" 个托管文件将还原到 Windows 桌面；"
+                  L"其他引用仅移除右侧节点。真实文件不会被删除。"
+            : L"将解散核心“" + source->name + L"”。\n\n" +
+                  L"其中 " + std::to_wstring(managedCount) +
+                  L" 个托管文件将还原到 Windows 桌面；"
+                  L"其他文件仅移除右侧引用。\n"
+                  L"真实文件不会被删除。";
+        if (requireConfirmation &&
+            MessageBoxW(
+                window_, warning.c_str(),
+                retainSystemCore
+                    ? L"还原未分类文件到桌面"
+                    : L"解散核心并还原文件到桌面",
                 MB_OKCANCEL | MB_ICONINFORMATION | MB_DEFBUTTON2) != IDOK) {
             return;
         }
 
         WorkspaceState before = state_;
-        Core* mutableSource = FindCore(id);
-        if (mutableSource == nullptr) {
+
+        WorkspaceState candidate = state_;
+        if (retainSystemCore) {
+            Core* candidateCore = FindCoreInState(candidate, id);
+            if (candidateCore == nullptr) {
+                SetStatus(L"未找到“未分类”核心，操作已取消");
+                return;
+            }
+            candidateCore->files.clear();
+            candidateCore->savedBaselineLayout.clear();
+        } else {
+            candidate.cores.erase(
+                std::remove_if(
+                    candidate.cores.begin(), candidate.cores.end(),
+                    [id](const Core& core) { return core.id == id; }),
+                candidate.cores.end());
+        }
+        candidate.families.erase(
+            std::remove_if(
+                candidate.families.begin(), candidate.families.end(),
+                [id](const FileFamily& family) {
+                    return family.coreId == id;
+                }),
+            candidate.families.end());
+        const RelationValidationResult validation =
+            ValidateRelationState(candidate);
+        if (!validation.IsValid()) {
+            SetStatus(L"无法解散：关系校验未通过，未移动任何文件");
             return;
         }
-        std::vector<FileItem> movedFiles =
-            std::move(mutableSource->files);
-        for (FileFamily& family : state_.families) {
-            if (family.coreId == id) {
-                family.coreId = kUnclassifiedCoreId;
-            }
+
+        if (!transaction.moves.empty() &&
+            !PersistCoreDissolveTransaction(transaction)) {
+            SetStatus(L"无法解散：无法写入文件恢复事务日志");
+            return;
         }
+        std::vector<const ManagedFileTransaction*> moved;
+        const auto rollbackMoves = [this, &moved]() {
+            bool restored = true;
+            for (auto iterator = moved.rbegin();
+                 iterator != moved.rend(); ++iterator) {
+                std::wstring error;
+                if (!MoveFileWithoutReplacement(
+                        (*iterator)->destinationPath,
+                        (*iterator)->sourcePath, &error)) {
+                    restored = false;
+                }
+            }
+            return restored;
+        };
+        for (const ManagedFileTransaction& move : transaction.moves) {
+            std::wstring error;
+            if (!MoveFileWithoutReplacement(
+                    move.sourcePath, move.destinationPath, &error)) {
+                const bool rolledBack = rollbackMoves();
+                if (rolledBack) {
+                    ClearCoreDissolveTransaction();
+                }
+                SetStatus(rolledBack
+                    ? L"解散失败：真实文件已回滚，核心保持不变"
+                    : L"解散失败：部分文件等待启动时自动恢复");
+                return;
+            }
+            moved.push_back(&move);
+        }
+        if (!WriteStateWithRelationshipManifest(candidate)) {
+            const bool rolledBack = rollbackMoves();
+            if (rolledBack) {
+                ClearCoreDissolveTransaction();
+            }
+            SetStatus(rolledBack
+                ? L"解散失败：状态未保存，真实文件已回滚"
+                : L"解散失败：部分文件等待启动时自动恢复");
+            return;
+        }
+
+        state_ = std::move(candidate);
+        dirty_ = false;
+        CreateHistoryBackup(false);
+        ClearCoreDissolveTransaction();
         if (focusedCoreId_ == id) {
             ResetFocusImmediately();
         }
-        state_.cores.erase(
-            std::remove_if(
-                state_.cores.begin(), state_.cores.end(),
-                [id](const Core& core) {
-                    return core.id == id;
-                }),
-            state_.cores.end());
-
-        Core* target = FindCore(kUnclassifiedCoreId);
-        if (target == nullptr) {
-            state_ = std::move(before);
-            SetStatus(L"未找到“未分类”核心，解散操作已取消");
-            return;
+        managedUndoAction_.reset();
+        if (transaction.moves.empty()) {
+            PushUndo(std::move(before));
         }
-        const std::size_t committedAttachedCount =
-            AttachedFileCount(*target) +
-            static_cast<std::size_t>(std::count_if(
-                movedFiles.begin(), movedFiles.end(),
-                [](const FileItem& item) {
-                    return !item.detachedFromUpper;
-                }));
-        if (committedAttachedCount > 15) {
-            target->layoutTemplate =
-                LayoutTemplate::HighCapacityDouble;
-        }
-        // Dissolving a core must not silently turn into an automatic arrange.
-        // Keep every moved file's saved slot, angle, radius and manual offset.
-        // Only a genuine slot conflict with an existing unclassified root is
-        // assigned a new safe slot; attached descendants keep their local
-        // relationship geometry unchanged.
-        std::set<int> occupiedSlots;
-        for (const FileItem& existing : target->files) {
-            if (!existing.detachedFromUpper &&
-                existing.parentFileId == 0 && existing.slot >= 0) {
-                occupiedSlots.insert(existing.slot);
-            }
-        }
-        for (FileItem& item : movedFiles) {
-            if (!item.detachedFromUpper && item.parentFileId == 0) {
-                if (item.slot < 0 || occupiedSlots.contains(item.slot)) {
-                    item.slot = -1;
-                    item.ring = -1;
-                    item.ringSlot = -1;
-                    AssignNewItemLayout(*target, item);
-                }
-                if (item.slot >= 0) {
-                    occupiedSlots.insert(item.slot);
-                }
-            }
-            target->files.push_back(std::move(item));
-        }
-        target->expanded = true;
-        // Do not select the system fallback core after the source disappears.
-        // Selecting it made the next context menu appear to belong to the
-        // dissolved core while correctly hiding lifecycle commands for the
-        // non-dissolvable "未分类" core.
         ClearSelection();
+        hover_ = {};
+        iconCache_.clear();
+        iconShadowCache_.clear();
+        layoutCache_.clear();
         layoutDirty_ = true;
-        PushUndo(std::move(before));
-        ScheduleSave();
-        SetStatus(
-            L"核心已解散；所有文件引用已移至“未分类”，真实文件未受影响");
+        SetStatus(retainSystemCore
+            ? L"未分类引用已清空；托管文件已还原到 Windows 桌面"
+            : L"核心已解散；托管文件已还原到 Windows 桌面");
         Invalidate();
     }
 
@@ -19315,9 +19460,9 @@ private:
         if (containsManagedFiles) {
             const std::wstring warning =
                 L"此核心包含已收纳的真实文件。\n\n"
-                L"直接移除会让托管库中的真实文件失去核心入口，因此已被阻止。\n"
-                L"选择“确定”将解散核心并把全部文件引用移至“未分类”；\n"
-                L"选择“取消”后可逐个从核心移除并还原到桌面。";
+                L"为保证文件始终有正常桌面入口，不能直接丢弃这些引用。\n"
+                L"选择“确定”将解散核心，并把全部托管文件还原到 Windows 桌面；\n"
+                L"选择“取消”则保留当前核心。";
             if (MessageBoxW(
                     window_, warning.c_str(), L"托管文件保护",
                     MB_OKCANCEL | MB_ICONWARNING | MB_DEFBUTTON2) == IDOK) {
@@ -21282,6 +21427,12 @@ private:
             stateFile_.wstring() + L".managed-file-transaction.json");
     }
 
+    std::filesystem::path CoreDissolveTransactionPath() const {
+        if (stateFile_.empty()) return {};
+        return std::filesystem::path(
+            stateFile_.wstring() + L".core-dissolve-transaction.json");
+    }
+
     std::filesystem::path DefaultManagedLibraryPath() const {
         PWSTR documents = nullptr;
         if (SUCCEEDED(SHGetKnownFolderPath(
@@ -21627,6 +21778,20 @@ private:
         }
     }
 
+    bool PersistCoreDissolveTransaction(
+        const CoreDissolveTransaction& transaction) const {
+        const std::filesystem::path path = CoreDissolveTransactionPath();
+        return !path.empty() && WriteUtf8Atomic(
+            path, SerializeCoreDissolveTransaction(transaction));
+    }
+
+    void ClearCoreDissolveTransaction() const {
+        const std::filesystem::path path = CoreDissolveTransactionPath();
+        if (!path.empty()) {
+            (void)DeleteFileW(path.c_str());
+        }
+    }
+
     static bool FilePathExists(const std::wstring& path) {
         return !path.empty() &&
                GetFileAttributesW(path.c_str()) !=
@@ -21953,6 +22118,82 @@ private:
         return item != nullptr && owner != nullptr &&
                item->storageMode == FileStorageMode::Managed &&
                PathEquals(item->path, transaction.destinationPath);
+    }
+
+    void RecoverPendingCoreDissolveTransaction() {
+        const std::filesystem::path journalPath =
+            CoreDissolveTransactionPath();
+        if (journalPath.empty()) return;
+        const std::optional<std::string> text = ReadUtf8File(journalPath);
+        if (!text.has_value()) return;
+        CoreDissolveTransaction transaction;
+        if (!DeserializeCoreDissolveTransaction(*text, transaction)) {
+            SetStatus(L"检测到无效的核心解散事务日志；未移动任何真实文件");
+            return;
+        }
+        if (stateRecoveryBlocked_) {
+            SetStatus(L"状态处于保护模式；核心解散事务等待人工恢复");
+            return;
+        }
+
+        const bool coreStillPresent = FindCore(transaction.coreId) != nullptr;
+        const bool allReferencesRemoved = std::all_of(
+            transaction.moves.begin(), transaction.moves.end(),
+            [this](const ManagedFileTransaction& move) {
+                return FindItemAnywhere(move.itemId) == nullptr;
+            });
+        bool allAtSource = true;
+        bool allAtDestination = true;
+        for (const ManagedFileTransaction& move : transaction.moves) {
+            const bool sourceExists = FilePathExists(move.sourcePath);
+            const bool destinationExists = FilePathExists(move.destinationPath);
+            allAtSource = allAtSource && sourceExists && !destinationExists;
+            allAtDestination = allAtDestination &&
+                destinationExists && !sourceExists;
+        }
+
+        const bool stateCommitted = transaction.retainSystemCore
+            ? allReferencesRemoved
+            : !coreStillPresent;
+        if (stateCommitted && allAtDestination) {
+            ClearCoreDissolveTransaction();
+            SetStatus(L"已完成上次中断的核心解散");
+            return;
+        }
+
+        if (!stateCommitted) {
+            bool restored = true;
+            for (auto iterator = transaction.moves.rbegin();
+                 iterator != transaction.moves.rend(); ++iterator) {
+                const bool sourceExists = FilePathExists(iterator->sourcePath);
+                const bool destinationExists =
+                    FilePathExists(iterator->destinationPath);
+                if (sourceExists && !destinationExists) {
+                    continue;
+                }
+                if (!destinationExists || sourceExists) {
+                    restored = false;
+                    break;
+                }
+                std::wstring error;
+                if (!MoveFileWithoutReplacement(
+                        iterator->destinationPath, iterator->sourcePath,
+                        &error)) {
+                    restored = false;
+                    break;
+                }
+            }
+            if (restored) {
+                ClearCoreDissolveTransaction();
+                SetStatus(L"已回滚未完成的核心解散；文件仍保留在原核心");
+            } else {
+                SetStatus(L"核心解散事务需要人工恢复；真实文件未被删除");
+            }
+            return;
+        }
+
+        (void)allAtSource;
+        SetStatus(L"核心解散事务需要人工恢复；请通过文件库检查真实文件");
     }
 
     void RecoverPendingManagedTransaction() {
@@ -24905,51 +25146,61 @@ bool RunSelfTest() {
             }
             return core;
         };
-    Core dissolveTargetAtLimit =
-        makeDissolveCapacityCore(
-            kUnclassifiedCoreId, 800, 10);
-    Core dissolveSourceAtLimit =
-        makeDissolveCapacityCore(
-            2, 900, 8);
-    if (AttachedFileCountAfterDissolve(
-            dissolveTargetAtLimit,
-            dissolveSourceAtLimit) !=
-        static_cast<std::size_t>(
-            kCoreFileCapacity)) {
+    CoreDissolveTransaction dissolveJournal;
+    dissolveJournal.coreId = 2;
+    dissolveJournal.createdAt = 123;
+    ManagedFileTransaction dissolveMove;
+    dissolveMove.id = 901;
+    dissolveMove.coreId = 2;
+    dissolveMove.itemId = 901;
+    dissolveMove.operation = ManagedTransactionOperation::Restore;
+    dissolveMove.sourcePath = L"C:\\GravityDesktopSelfTest\\library\\a.txt";
+    dissolveMove.destinationPath = L"C:\\GravityDesktopSelfTest\\desktop\\a.txt";
+    dissolveMove.createdAt = 123;
+    dissolveJournal.moves.push_back(dissolveMove);
+    CoreDissolveTransaction restoredDissolveJournal;
+    if (!DeserializeCoreDissolveTransaction(
+            SerializeCoreDissolveTransaction(dissolveJournal),
+            restoredDissolveJournal) ||
+        restoredDissolveJournal.coreId != 2 ||
+        restoredDissolveJournal.moves.size() != 1 ||
+        !PathEquals(restoredDissolveJournal.moves.front().sourcePath,
+                    dissolveMove.sourcePath) ||
+        !PathEquals(restoredDissolveJournal.moves.front().destinationPath,
+                    dissolveMove.destinationPath)) {
         return false;
     }
 
-    Core dissolveSourceOverLimit =
-        makeDissolveCapacityCore(
-            2, 900, 9);
-    FileItem detachedDissolveItem;
-    detachedDissolveItem.id = 999;
-    detachedDissolveItem.path =
-        L"C:\\GravityDesktopSelfTest\\detached.txt";
-    detachedDissolveItem.detachedFromUpper = true;
-    dissolveSourceOverLimit.files.push_back(
-        std::move(detachedDissolveItem));
-    if (AttachedFileCountAfterDissolve(
-            dissolveTargetAtLimit,
-            dissolveSourceOverLimit) != 19) {
+    GravityApp referenceDissolveApp;
+    referenceDissolveApp.stateFile_ =
+        relationTestDirectory / L"reference-dissolve.json";
+    Core referenceUnclassified;
+    referenceUnclassified.id = kUnclassifiedCoreId;
+    referenceUnclassified.name = L"未分类";
+    Core referenceSource = makeDissolveCapacityCore(2, 900, 1);
+    referenceDissolveApp.state_.cores.push_back(
+        std::move(referenceUnclassified));
+    referenceDissolveApp.state_.cores.push_back(
+        std::move(referenceSource));
+    referenceDissolveApp.DissolveCore(2, false);
+    if (referenceDissolveApp.FindCore(2) != nullptr ||
+        referenceDissolveApp.FindCore(kUnclassifiedCoreId) == nullptr ||
+        !referenceDissolveApp.FindCore(kUnclassifiedCoreId)->files.empty()) {
         return false;
     }
-    GravityApp dissolveOverCapacityApp;
-    dissolveOverCapacityApp.state_.cores.push_back(
-        dissolveTargetAtLimit);
-    dissolveOverCapacityApp.state_.cores.push_back(
-        dissolveSourceOverLimit);
-    const std::string dissolveOverCapacityBefore =
-        SerializeState(
-            dissolveOverCapacityApp.state_);
-    dissolveOverCapacityApp.DissolveCore(2);
-    if (SerializeState(
-            dissolveOverCapacityApp.state_) !=
-            dissolveOverCapacityBefore ||
-        !dissolveOverCapacityApp.undoStack_.empty() ||
-        dissolveOverCapacityApp.status_.find(
-            L"19/18") ==
-            std::wstring::npos) {
+
+    GravityApp unclassifiedDissolveApp;
+    unclassifiedDissolveApp.stateFile_ =
+        relationTestDirectory / L"unclassified-dissolve.json";
+    Core pendingUnclassified = makeDissolveCapacityCore(
+        kUnclassifiedCoreId, 950, 1);
+    unclassifiedDissolveApp.state_.cores.push_back(
+        std::move(pendingUnclassified));
+    unclassifiedDissolveApp.DissolveCore(kUnclassifiedCoreId, false);
+    const Core* clearedUnclassified =
+        unclassifiedDissolveApp.FindCore(kUnclassifiedCoreId);
+    if (clearedUnclassified == nullptr ||
+        !clearedUnclassified->files.empty()) {
         return false;
     }
 
@@ -25599,6 +25850,65 @@ bool RunSelfTest() {
         GravityApp::FilePathExists(managedRecoveryDestination.wstring()) ||
         GravityApp::FilePathExists(
             managedRecoveryApp.ManagedTransactionPath().wstring())) {
+        return false;
+    }
+
+    // A multi-file core dissolve keeps an independent plan.  If the process
+    // stops after moving a file but before replacing state, startup must put
+    // it back in the managed library and leave the core intact.
+    const std::filesystem::path dissolveRecoverySource =
+        relationTestDirectory / L"dissolve-recovery-library" /
+        L"dissolve-recovery.txt";
+    const std::filesystem::path dissolveRecoveryDestination =
+        relationTestDirectory / L"dissolve-recovery-desktop" /
+        L"dissolve-recovery.txt";
+    if (!WriteUtf8Atomic(dissolveRecoverySource, "dissolve recovery")) {
+        return false;
+    }
+    GravityApp dissolveRecoveryApp;
+    dissolveRecoveryApp.stateFile_ =
+        relationTestDirectory / L"dissolve-recovery-state.json";
+    Core dissolveRecoveryCore;
+    dissolveRecoveryCore.id = 993;
+    dissolveRecoveryCore.name = L"dissolve recovery";
+    FileItem dissolveRecoveryItem;
+    dissolveRecoveryItem.id = 994;
+    dissolveRecoveryItem.path = dissolveRecoverySource.wstring();
+    dissolveRecoveryItem.managedPath = dissolveRecoverySource.wstring();
+    dissolveRecoveryItem.originalPath =
+        dissolveRecoveryDestination.wstring();
+    dissolveRecoveryItem.storageMode = FileStorageMode::Managed;
+    dissolveRecoveryCore.files.push_back(dissolveRecoveryItem);
+    dissolveRecoveryApp.state_.cores.push_back(
+        std::move(dissolveRecoveryCore));
+    CoreDissolveTransaction interruptedDissolve;
+    interruptedDissolve.coreId = 993;
+    interruptedDissolve.createdAt = UnixTimeNow();
+    ManagedFileTransaction interruptedDissolveMove;
+    interruptedDissolveMove.id = 994;
+    interruptedDissolveMove.coreId = 993;
+    interruptedDissolveMove.itemId = 994;
+    interruptedDissolveMove.operation =
+        ManagedTransactionOperation::Restore;
+    interruptedDissolveMove.sourcePath =
+        dissolveRecoverySource.wstring();
+    interruptedDissolveMove.destinationPath =
+        dissolveRecoveryDestination.wstring();
+    interruptedDissolve.moves.push_back(interruptedDissolveMove);
+    if (!dissolveRecoveryApp.PersistCoreDissolveTransaction(
+            interruptedDissolve) ||
+        !dissolveRecoveryApp.MoveFileWithoutReplacement(
+            interruptedDissolveMove.sourcePath,
+            interruptedDissolveMove.destinationPath,
+            &managedMoveError)) {
+        return false;
+    }
+    dissolveRecoveryApp.RecoverPendingCoreDissolveTransaction();
+    if (!GravityApp::FilePathExists(dissolveRecoverySource.wstring()) ||
+        GravityApp::FilePathExists(dissolveRecoveryDestination.wstring()) ||
+        GravityApp::FilePathExists(
+            dissolveRecoveryApp.CoreDissolveTransactionPath().wstring()) ||
+        dissolveRecoveryApp.FindCore(993) == nullptr) {
         return false;
     }
 
