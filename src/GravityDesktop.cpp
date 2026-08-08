@@ -145,6 +145,7 @@ enum class ManagedTransactionOperation : int {
     Restore = 1,
     Undo = 2,
     Rename = 3,
+    ReorganizeLibrary = 4,
 };
 
 enum class RenameTargetKind : int {
@@ -1212,7 +1213,7 @@ bool DeserializeManagedFileTransaction(
         NumberMember(*object, "item_id", 0.0));
     transaction.operation = static_cast<ManagedTransactionOperation>(
         std::clamp(static_cast<int>(NumberMember(
-            *object, "operation", 0.0)), 0, 3));
+            *object, "operation", 0.0)), 0, 4));
     transaction.stage = static_cast<ManagedTransactionStage>(
         std::clamp(static_cast<int>(NumberMember(
             *object, "stage", 0.0)), 0, 4));
@@ -3698,6 +3699,7 @@ public:
         } else {
             LoadState();
             RecoverPendingManagedTransaction();
+            MigrateLegacyManagedLibraryItems();
             LoadCoreShortLabelOverrides();
         }
         NormalizeStateModel();
@@ -17959,12 +17961,11 @@ private:
 
         const WorkspaceState before = state_;
         const std::uint64_t itemId = state_.nextId;
-        const std::filesystem::path library = ManagedLibraryPath();
         const std::wstring fileName = FileDisplayName(sourcePath);
         const std::filesystem::path destination =
-            library / (L"managed-" + std::to_wstring(itemId)) / fileName;
-        if (FilePathExists(destination.wstring())) {
-            SetStatus(L"收纳失败：托管库目标已存在同名文件");
+            AvailableManagedLibraryRootPath(fileName);
+        if (destination.empty()) {
+            SetStatus(L"收纳失败：无法在托管库根目录创建安全文件名");
             return false;
         }
 
@@ -20696,6 +20697,230 @@ private:
             : std::filesystem::path(state_.managedLibraryPath);
     }
 
+    std::filesystem::path AvailableManagedLibraryRootPath(
+        const std::wstring& preferredName) const {
+        const std::filesystem::path library = ManagedLibraryPath();
+        const std::filesystem::path requested = library / preferredName;
+        if (!FilePathExists(requested.wstring())) {
+            return requested;
+        }
+        const std::filesystem::path namePath(preferredName);
+        const std::wstring stem = namePath.stem().wstring();
+        const std::wstring extension = namePath.extension().wstring();
+        for (int index = 2; index <= 9'999; ++index) {
+            const std::filesystem::path candidate = library /
+                (stem + L" (" + std::to_wstring(index) + L")" + extension);
+            if (!FilePathExists(candidate.wstring())) {
+                return candidate;
+            }
+        }
+        return {};
+    }
+
+    bool IsLegacyManagedLibraryItem(const FileItem& item) const {
+        if (item.storageMode != FileStorageMode::Managed ||
+            item.managedPath.empty() ||
+            !PathEquals(item.path, item.managedPath)) {
+            return false;
+        }
+        const std::filesystem::path path(item.managedPath);
+        const std::filesystem::path parent = path.parent_path();
+        const std::wstring parentName = parent.filename().wstring();
+        return parentName.rfind(L"managed-", 0) == 0 &&
+               PathEquals(
+                   NormalizePath(parent.parent_path().wstring()),
+                   NormalizePath(ManagedLibraryPath().wstring()));
+    }
+
+    bool MoveLegacyManagedItemToLibraryRoot(
+        std::uint64_t coreId, std::uint64_t itemId) {
+        if (stateRecoveryBlocked_) return false;
+        Core* core = FindCore(coreId);
+        FileItem* item = FindItem(coreId, itemId);
+        if (core == nullptr || item == nullptr ||
+            !IsLegacyManagedLibraryItem(*item)) {
+            return false;
+        }
+        const std::wstring source = item->managedPath;
+        const std::wstring preferredName = FileDisplayName(
+            item->originalPath.empty() ? source : item->originalPath);
+        const std::filesystem::path destination =
+            AvailableManagedLibraryRootPath(preferredName);
+        if (destination.empty()) {
+            AppendRuntimeDiagnostic("managed_library_reorganize_no_target");
+            return false;
+        }
+        ManagedFileTransaction transaction;
+        transaction.id = itemId;
+        transaction.coreId = coreId;
+        transaction.itemId = itemId;
+        transaction.operation =
+            ManagedTransactionOperation::ReorganizeLibrary;
+        transaction.stage = ManagedTransactionStage::Prepared;
+        transaction.sourcePath = source;
+        transaction.destinationPath = destination.wstring();
+        transaction.itemPresentAfter = true;
+        transaction.createdAt = UnixTimeNow();
+        if (!PersistManagedTransaction(transaction)) {
+            AppendRuntimeDiagnostic("managed_library_reorganize_journal_failed",
+                                    E_FAIL, GetLastError());
+            return false;
+        }
+        std::wstring moveError;
+        if (!MoveFileWithoutReplacement(
+                transaction.sourcePath, transaction.destinationPath,
+                &moveError)) {
+            ClearManagedTransaction();
+            AppendRuntimeDiagnostic("managed_library_reorganize_move_failed",
+                                    E_FAIL, GetLastError());
+            return false;
+        }
+        transaction.stage = ManagedTransactionStage::FileMoved;
+        if (!PersistManagedTransaction(transaction)) {
+            std::wstring rollbackError;
+            const bool rolledBack = MoveFileWithoutReplacement(
+                transaction.destinationPath, transaction.sourcePath,
+                &rollbackError);
+            if (rolledBack) {
+                transaction.stage = ManagedTransactionStage::RolledBack;
+                (void)PersistManagedTransaction(transaction);
+                ClearManagedTransaction();
+            }
+            AppendRuntimeDiagnostic("managed_library_reorganize_journal_update_failed",
+                                    E_FAIL, GetLastError());
+            return false;
+        }
+
+        WorkspaceState candidate = state_;
+        FileItem* candidateItem = nullptr;
+        for (Core& candidateCore : candidate.cores) {
+            if (candidateCore.id != coreId) continue;
+            const auto found = std::find_if(
+                candidateCore.files.begin(), candidateCore.files.end(),
+                [itemId](const FileItem& value) {
+                    return value.id == itemId;
+                });
+            if (found != candidateCore.files.end()) {
+                candidateItem = &*found;
+                break;
+            }
+        }
+        if (candidateItem == nullptr) {
+            std::wstring rollbackError;
+            const bool rolledBack = MoveFileWithoutReplacement(
+                transaction.destinationPath, transaction.sourcePath,
+                &rollbackError);
+            if (rolledBack) {
+                transaction.stage = ManagedTransactionStage::RolledBack;
+                (void)PersistManagedTransaction(transaction);
+                ClearManagedTransaction();
+            }
+            AppendRuntimeDiagnostic("managed_library_reorganize_item_missing");
+            return false;
+        }
+        candidateItem->path = transaction.destinationPath;
+        candidateItem->managedPath = transaction.destinationPath;
+        candidateItem->missing = false;
+        if (!WriteStateWithRelationshipManifest(candidate)) {
+            std::wstring rollbackError;
+            const bool rolledBack = MoveFileWithoutReplacement(
+                transaction.destinationPath, transaction.sourcePath,
+                &rollbackError);
+            if (rolledBack) {
+                transaction.stage = ManagedTransactionStage::RolledBack;
+                (void)PersistManagedTransaction(transaction);
+                ClearManagedTransaction();
+            }
+            AppendRuntimeDiagnostic("managed_library_reorganize_state_failed",
+                                    E_FAIL, GetLastError());
+            return false;
+        }
+
+        state_ = std::move(candidate);
+        dirty_ = false;
+        CreateHistoryBackup(false);
+        transaction.stage = ManagedTransactionStage::StateSaved;
+        (void)PersistManagedTransaction(transaction);
+        transaction.stage = ManagedTransactionStage::Committed;
+        (void)PersistManagedTransaction(transaction);
+        ClearManagedTransaction();
+        std::error_code error;
+        std::filesystem::remove(
+            std::filesystem::path(source).parent_path(), error);
+        AppendRuntimeDiagnostic("managed_library_reorganized");
+        return true;
+    }
+
+    void MigrateLegacyManagedLibraryItems() {
+        if (stateRecoveryBlocked_) return;
+        std::vector<std::pair<std::uint64_t, std::uint64_t>> pending;
+        for (const Core& core : state_.cores) {
+            for (const FileItem& item : core.files) {
+                if (IsLegacyManagedLibraryItem(item)) {
+                    pending.emplace_back(core.id, item.id);
+                }
+            }
+        }
+        int migrated = 0;
+        for (const auto& [coreId, itemId] : pending) {
+            if (MoveLegacyManagedItemToLibraryRoot(coreId, itemId)) {
+                ++migrated;
+            }
+        }
+        if (migrated > 0) {
+            SetStatus(L"已将 " + std::to_wstring(migrated) +
+                      L" 个托管文件整理到文件库根目录");
+        }
+        PruneEmptyLegacyManagedLibraryDirectories();
+    }
+
+    void PruneEmptyLegacyManagedLibraryDirectories() const {
+        if (!HasManagedFiles()) return;
+        const std::filesystem::path library = ManagedLibraryPath();
+        std::error_code error;
+        std::filesystem::directory_iterator iterator(library, error);
+        const std::filesystem::directory_iterator end;
+        std::vector<std::filesystem::path> removable;
+        while (!error && iterator != end) {
+            const std::filesystem::directory_entry entry = *iterator;
+            error.clear();
+            const bool isDirectory = entry.is_directory(error);
+            if (error || !isDirectory) {
+                error.clear();
+                iterator.increment(error);
+                continue;
+            }
+            const std::wstring name = entry.path().filename().wstring();
+            const bool generatedName = name.size() > 8 &&
+                name.rfind(L"managed-", 0) == 0 &&
+                std::all_of(
+                    name.begin() + 8, name.end(),
+                    [](wchar_t value) { return iswdigit(value) != 0; });
+            const DWORD attributes = GetFileAttributesW(
+                entry.path().c_str());
+            if (!generatedName ||
+                attributes == INVALID_FILE_ATTRIBUTES ||
+                (attributes & FILE_ATTRIBUTE_REPARSE_POINT) != 0 ||
+                !std::filesystem::is_empty(entry.path(), error) || error) {
+                error.clear();
+                iterator.increment(error);
+                continue;
+            }
+            removable.push_back(entry.path());
+            iterator.increment(error);
+        }
+        int removed = 0;
+        for (const std::filesystem::path& path : removable) {
+            error.clear();
+            if (std::filesystem::remove(path, error) && !error) {
+                ++removed;
+            }
+        }
+        if (removed > 0) {
+            AppendRuntimeDiagnostic("managed_library_empty_directories_pruned");
+        }
+    }
+
     std::optional<std::filesystem::path>
     ManagedLibraryDesktopShortcutPath() const {
         const std::optional<std::filesystem::path> desktop =
@@ -21116,7 +21341,9 @@ private:
         if (!transaction.itemPresentAfter) {
             return item == nullptr;
         }
-        if (transaction.operation == ManagedTransactionOperation::Rename) {
+        if (transaction.operation == ManagedTransactionOperation::Rename ||
+            transaction.operation ==
+                ManagedTransactionOperation::ReorganizeLibrary) {
             return item != nullptr && owner != nullptr &&
                    PathEquals(item->path, transaction.destinationPath);
         }
@@ -24357,6 +24584,71 @@ bool RunSelfTest() {
         !manifestFailureApp.WriteStateWithRelationshipManifest(source) ||
         !GravityApp::FilePathExists(
             manifestFailureApp.stateFile_.wstring())) {
+        return false;
+    }
+
+    // Legacy managed-ID folders must migrate into the visible library root
+    // without overwriting a same-named file already there.
+    const std::filesystem::path flatLibrary =
+        relationTestDirectory / L"flat-managed-library";
+    const std::filesystem::path legacyFlatSource =
+        flatLibrary / L"managed-901" / L"report.txt";
+    if (!WriteUtf8Atomic(legacyFlatSource, "legacy root migration")) {
+        return false;
+    }
+    GravityApp flatLibraryApp;
+    flatLibraryApp.stateFile_ =
+        relationTestDirectory / L"flat-managed-library-state.json";
+    flatLibraryApp.state_.managedLibraryPath = flatLibrary.wstring();
+    Core flatCore;
+    flatCore.id = 900;
+    flatCore.name = L"flat library test";
+    FileItem flatItem;
+    flatItem.id = 901;
+    flatItem.path = legacyFlatSource.wstring();
+    flatItem.managedPath = legacyFlatSource.wstring();
+    flatItem.originalPath = L"C:\\Desktop\\report.txt";
+    flatItem.originalName = L"report.txt";
+    flatItem.storageMode = FileStorageMode::Managed;
+    flatCore.files.push_back(flatItem);
+    flatLibraryApp.state_.cores.push_back(std::move(flatCore));
+    flatLibraryApp.MigrateLegacyManagedLibraryItems();
+    const std::filesystem::path flatDestination = flatLibrary / L"report.txt";
+    const FileItem* migratedFlatItem = flatLibraryApp.FindItem(900, 901);
+    if (!GravityApp::FilePathExists(flatDestination.wstring()) ||
+        GravityApp::FilePathExists(legacyFlatSource.wstring()) ||
+        std::filesystem::exists(flatLibrary / L"managed-901") ||
+        migratedFlatItem == nullptr ||
+        !PathEquals(migratedFlatItem->path, flatDestination.wstring()) ||
+        !PathEquals(migratedFlatItem->managedPath, flatDestination.wstring())) {
+        return false;
+    }
+    const std::filesystem::path legacyCollisionSource =
+        flatLibrary / L"managed-903" / L"report.txt";
+    if (!WriteUtf8Atomic(legacyCollisionSource, "collision migration")) {
+        return false;
+    }
+    FileItem collisionItem;
+    collisionItem.id = 903;
+    collisionItem.path = legacyCollisionSource.wstring();
+    collisionItem.managedPath = legacyCollisionSource.wstring();
+    collisionItem.originalPath = L"C:\\Desktop\\report.txt";
+    collisionItem.originalName = L"report.txt";
+    collisionItem.storageMode = FileStorageMode::Managed;
+    flatLibraryApp.FindCore(900)->files.push_back(collisionItem);
+    flatLibraryApp.MigrateLegacyManagedLibraryItems();
+    const std::filesystem::path collisionDestination =
+        flatLibrary / L"report (2).txt";
+    const FileItem* migratedCollisionItem =
+        flatLibraryApp.FindItem(900, 903);
+    if (!GravityApp::FilePathExists(collisionDestination.wstring()) ||
+        !GravityApp::FilePathExists(flatDestination.wstring()) ||
+        GravityApp::FilePathExists(legacyCollisionSource.wstring()) ||
+        std::filesystem::exists(flatLibrary / L"managed-903") ||
+        migratedCollisionItem == nullptr ||
+        !PathEquals(
+            migratedCollisionItem->path,
+            collisionDestination.wstring())) {
         return false;
     }
 
