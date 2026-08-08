@@ -414,7 +414,7 @@ BOOL CALLBACK FindDesktopViewHostCallback(HWND window, LPARAM parameter) {
     if (result == nullptr || *result != nullptr) {
         return FALSE;
     }
-    if (FindWindowExW(
+    if (IsWindowVisible(window) != FALSE && FindWindowExW(
             window, nullptr, L"SHELLDLL_DefView", nullptr) != nullptr) {
         *result = window;
         return FALSE;
@@ -423,6 +423,16 @@ BOOL CALLBACK FindDesktopViewHostCallback(HWND window, LPARAM parameter) {
 }
 
 HWND FindDesktopViewHost() {
+    // Prefer Progman when it currently hosts the desktop view.  Enumeration
+    // order is not stable across Explorer transitions, so selecting the first
+    // candidate on every health tick can make a companion surface repeatedly
+    // reparent between otherwise valid desktop hosts.
+    const HWND progman = FindWindowW(L"Progman", nullptr);
+    if (progman != nullptr && IsWindowVisible(progman) != FALSE &&
+        FindWindowExW(progman, nullptr, L"SHELLDLL_DefView", nullptr) !=
+            nullptr) {
+        return progman;
+    }
     HWND result = nullptr;
     EnumWindows(
         FindDesktopViewHostCallback,
@@ -430,7 +440,7 @@ HWND FindDesktopViewHost() {
     if (result != nullptr) {
         return result;
     }
-    return FindWindowW(L"Progman", nullptr);
+    return progman;
 }
 
 UINT TaskbarCreatedMessage() {
@@ -3463,6 +3473,12 @@ public:
         if (failOpenActive_ || shuttingDown_ || exitRequested_) return;
         failOpenActive_ = true;
         workspaceVisible_ = false;
+        desktopReconnectPending_ = false;
+        desktopReconnectAttempts_ = 0;
+        if (lifecycleWindow_ != nullptr) {
+            KillTimer(lifecycleWindow_, kDesktopReconnectTimer);
+            KillTimer(lifecycleWindow_, kInteractionLayerRepairTimer);
+        }
         StopSelectionDismissTimer();
         OnPointerLeave(pointerLeaveTrackingWindow_);
         DestroyDividerTooltip();
@@ -3612,10 +3628,12 @@ public:
         if (message == ShellHookMessage()) {
             const UINT shellEvent =
                 static_cast<UINT>(wParam) & 0x7FFFU;
-            if (shellEvent == HSHELL_ACTIVATESHELLWINDOW ||
-                shellEvent == HSHELL_WINDOWACTIVATED ||
-                shellEvent == HSHELL_WINDOWCREATED ||
-                shellEvent == HSHELL_WINDOWDESTROYED) {
+            // Ordinary application activation is extremely frequent.  It does
+            // not change the desktop host, so using it to reorder our popup
+            // needlessly touches Explorer while users operate the taskbar.
+            // TaskbarCreated and the 2-second health watch cover real shell
+            // replacement; this hook remains only for a shell activation.
+            if (shellEvent == HSHELL_ACTIVATESHELLWINDOW) {
                 PostMessageW(
                     source, kRefreshInteractionLayerMessage,
                     0, 0);
@@ -3656,6 +3674,7 @@ public:
             EnsureInteractionWindowPresented();
             return 0;
         case WM_NCDESTROY:
+            AppendRuntimeDiagnostic("lifecycle_window_destroyed");
             if (shellHookRegistered_) {
                 DeregisterShellHookWindow(source);
                 shellHookRegistered_ = false;
@@ -3773,6 +3792,7 @@ public:
             break;
         case WM_NCDESTROY:
             if (interactionWindow_ == source) {
+                AppendRuntimeDiagnostic("interaction_window_destroyed");
                 DestroyDividerTooltip();
                 ClearInteractionWindowRuntime(source);
                 interactionWindow_ = nullptr;
@@ -3840,6 +3860,7 @@ public:
             return 0;
         case WM_NCDESTROY:
             if (dividerHandleWindow_ == source) {
+                AppendRuntimeDiagnostic("divider_window_destroyed");
                 DestroyDividerTooltip();
                 dividerHandleWindow_ = nullptr;
             }
@@ -4023,6 +4044,10 @@ public:
         }
         case WM_DESTROY:
             if (window_ == source) {
+                AppendRuntimeDiagnostic(
+                    exitRequested_ || shuttingDown_
+                        ? "visual_window_destroyed_for_exit"
+                        : "visual_window_destroyed_unexpected");
                 window_ = nullptr;
             }
             if (exitRequested_ || shuttingDown_) {
@@ -4718,7 +4743,7 @@ private:
     }
 
     void EnsureInteractionWindowPresented() {
-        if (state_.workspacePaused ||
+        if (failOpenActive_ || state_.workspacePaused ||
             window_ == nullptr ||
             interactionWindow_ == nullptr ||
             desktopHost_ == nullptr ||
@@ -4842,7 +4867,9 @@ private:
 
     void AttachToDesktopCompanionLayer() {
         if (window_ == nullptr) return;
-        HWND desktopHost = FindDesktopViewHost();
+        HWND desktopHost = DesktopHostReady(desktopHost_)
+            ? desktopHost_
+            : FindDesktopViewHost();
         if (desktopHost == nullptr) return;
         if (desktopHost == desktopHost_ && desktopChildHosted_ &&
             GetParent(window_) == desktopHost) {
@@ -4915,10 +4942,20 @@ private:
             IsWindow(desktopHost_) == FALSE) {
             return false;
         }
-        const HWND currentDesktopHost =
-            FindDesktopViewHost();
-        if (!DesktopHostReady(currentDesktopHost) ||
-            currentDesktopHost != desktopHost_) {
+        if (workspaceVisible_ && !state_.workspacePaused &&
+            !failOpenActive_) {
+            if (IsWindowVisible(window_) == FALSE ||
+                IsWindowVisible(interactionWindow_) == FALSE ||
+                (DividerEnabled() &&
+                 IsWindowVisible(dividerHandleWindow_) == FALSE)) {
+                return false;
+            }
+        }
+        // Keep using the already attached host while it is still valid.
+        // Explorer can expose a transient second candidate during a shell
+        // transition; changing parent merely because enumeration order changed
+        // is destabilizing and can orphan the visible surface.
+        if (!DesktopHostReady(desktopHost_)) {
             return false;
         }
         const bool dividerAttached =
@@ -5081,7 +5118,7 @@ private:
     }
 
     bool TryReconnectDesktopSurfaces() {
-        if (shuttingDown_ || exitRequested_ ||
+        if (failOpenActive_ || shuttingDown_ || exitRequested_ ||
             !initialized_) {
             return false;
         }
@@ -5172,7 +5209,7 @@ private:
             trayIconOwner_ = nullptr;
             trayRebuildPending_ = true;
         }
-        if (shuttingDown_ || exitRequested_ ||
+        if (failOpenActive_ || shuttingDown_ || exitRequested_ ||
             lifecycleWindow_ == nullptr) {
             return;
         }
@@ -5205,7 +5242,7 @@ private:
         }
         if (timer == kDesktopHostWatchTimer) {
             if (initialized_ && !shuttingDown_ &&
-                !exitRequested_ &&
+                !exitRequested_ && !failOpenActive_ &&
                 !desktopReconnectPending_) {
                 if (!DesktopSurfacesHealthy()) {
                     BeginDesktopReconnect(false);
@@ -5498,7 +5535,16 @@ private:
         const HWND owner = trayIconOwner_ != nullptr
             ? trayIconOwner_
             : TrayOwnerWindow();
-        if (!trayIconAdded_ || owner == nullptr) return;
+        if (!trayIconAdded_) return;
+        if (owner == nullptr) {
+            // The shell may already have discarded the icon after an Explorer
+            // restart. Clear local state so a later recovery can add exactly
+            // one replacement instead of keeping a stale "added" flag.
+            AppendRuntimeDiagnostic("tray_icon_remove_owner_missing");
+            trayIconAdded_ = false;
+            trayIconOwner_ = nullptr;
+            return;
+        }
         NOTIFYICONDATAW icon{};
         icon.cbSize = sizeof(icon);
         icon.hWnd = owner;
@@ -21253,7 +21299,7 @@ private:
             sizeof(controls), ICC_WIN95_CLASSES};
         InitCommonControlsEx(&controls);
         dividerTooltipWindow_ = CreateWindowExW(
-            WS_EX_TOPMOST | WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE,
+            WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE,
             TOOLTIPS_CLASSW, nullptr,
             WS_POPUP | TTS_NOPREFIX | TTS_ALWAYSTIP,
             CW_USEDEFAULT, CW_USEDEFAULT,
