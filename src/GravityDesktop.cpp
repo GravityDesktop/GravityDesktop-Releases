@@ -9922,7 +9922,9 @@ private:
 
     bool WorkspaceChromeCollapsed(const D2D1_SIZE_F& client) const {
         if (state_.workspaceChromePinned || workspaceChromeHovered_ ||
-            draggingWorkspaceChrome_ || workspaceChromePointerPending_) {
+            draggingWorkspaceChrome_ || workspaceChromePointerPending_ ||
+            workspaceChromeMenuOpen_ || corePlacementMode_ ||
+            (settingsWindow_ != nullptr && IsWindow(settingsWindow_) != FALSE)) {
             return false;
         }
         const D2D1_RECT_F group = WorkspaceChromeGroupRectangle(client);
@@ -10132,14 +10134,18 @@ private:
             menu, MF_STRING, MenuArrangeAll,
             L"重新排列全部内容…（核心＋文件）");
         const D2D1_RECT_F button =
-            WorkspaceControlRectangle(ClientDipSize(), 2);
+            WorkspaceControlRectangle(ClientDipSize(), 3);
         POINT screen{
             static_cast<LONG>(std::lround(button.left)),
             static_cast<LONG>(std::lround(button.bottom + 3.0f))};
         ClientToScreen(window_, &screen);
+        workspaceChromeMenuOpen_ = true;
+        Invalidate();
+        UpdateWindow(window_);
         const UINT command = TrackPopupMenuPreservingSelection(
             menu, TPM_RETURNCMD | TPM_RIGHTBUTTON,
             screen.x, screen.y);
+        workspaceChromeMenuOpen_ = false;
         DestroyMenu(menu);
         ExecuteMenuCommand(command);
         Invalidate();
@@ -10998,9 +11004,13 @@ private:
             static_cast<LONG>(std::lround(button.left)),
             static_cast<LONG>(std::lround(button.bottom + 3.0f))};
         ClientToScreen(window_, &screen);
+        workspaceChromeMenuOpen_ = true;
+        Invalidate();
+        UpdateWindow(window_);
         const UINT command = TrackPopupMenuPreservingSelection(
             menu, TPM_RETURNCMD | TPM_RIGHTBUTTON,
             screen.x, screen.y);
+        workspaceChromeMenuOpen_ = false;
         DestroyMenu(menu);
         if (command >= firstRestoreCommand &&
             command < firstRestoreCommand + archivedCoreIds.size()) {
@@ -23561,6 +23571,7 @@ private:
     bool workspaceChromePointerPending_ = false;
     bool draggingWorkspaceChrome_ = false;
     bool workspaceChromeHovered_ = false;
+    bool workspaceChromeMenuOpen_ = false;
     bool coreDistanceSliderActive_ = false;
     bool draggingCoreDistancePanel_ = false;
     bool draggingCoreDistanceSlider_ = false;
