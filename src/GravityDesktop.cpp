@@ -17349,41 +17349,16 @@ private:
                 SetCursor(LoadCursorW(nullptr, IDC_ARROW));
                 return;
             }
-            cursor.x = InteractionClientXToVisual(source, cursor.x);
         }
-        const D2D1_POINT_2F dip =
-            PixelToDip(cursor.x, cursor.y);
-        const bool onDistancePanel =
-            CoreDistanceSliderOpen() &&
-            PointInside(
-                dip,
-                CoreDistanceSliderCardRectangle(ClientDipSize()));
-        const bool onAppearancePanel =
-            CoreAppearancePanelOpen() &&
-            PointInside(
-                dip,
-                CoreAppearancePanelRectangle(ClientDipSize()));
-        bool onControl = false;
-        for (int index = 0;
-             index < kWorkspaceControlCount;
-             ++index) {
-            onControl = onControl ||
-                PointInside(
-                    dip,
-                    WorkspaceControlRectangle(ClientDipSize(), index));
-        }
-        const HitResult hit = HitTest(ScreenToWorld(dip));
         if (corePlacementMode_) {
             SetCursor(LoadCursorW(nullptr, IDC_CROSS));
         } else if (draggingDivider_) {
             SetCursor(LoadCursorW(nullptr, IDC_ARROW));
         } else {
-            SetCursor(LoadCursorW(
-                nullptr,
-                onDistancePanel || onAppearancePanel || onControl ||
-                        hit.kind != HitKind::None
-                    ? IDC_HAND
-                    : IDC_ARROW));
+            // Core and file nodes are desktop objects, not web links.  Keep
+            // the native Windows arrow over the entire companion workspace;
+            // edit controls still provide their own I-beam cursor.
+            SetCursor(LoadCursorW(nullptr, IDC_ARROW));
         }
     }
 
