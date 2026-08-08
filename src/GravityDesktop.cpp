@@ -3432,6 +3432,13 @@ public:
             return static_cast<unsigned long long>(
                 reinterpret_cast<std::uintptr_t>(handle));
         };
+        DWORD desktopProcessId = 0;
+        if (desktopHost_ != nullptr) {
+            GetWindowThreadProcessId(desktopHost_, &desktopProcessId);
+        }
+        RECT visualRect{};
+        const bool hasVisualRect = window_ != nullptr &&
+            GetWindowRect(window_, &visualRect) != FALSE;
         log << UnixTimeNow() << ' ' << event
             << " pid=" << GetCurrentProcessId()
             << " visual=" << handleValue(window_)
@@ -3439,6 +3446,11 @@ public:
             << " divider=" << handleValue(dividerHandleWindow_)
             << " lifecycle=" << handleValue(lifecycleWindow_)
             << " desktop_host=" << handleValue(desktopHost_)
+            << " explorer_pid=" << desktopProcessId
+            << " visual_parent=" << handleValue(
+                window_ == nullptr ? nullptr : GetParent(window_))
+            << " visual_owner=" << handleValue(
+                window_ == nullptr ? nullptr : GetWindow(window_, GW_OWNER))
             << " visual_visible=" <<
                 (window_ != nullptr && IsWindowVisible(window_) != FALSE ? 1 : 0)
             << " input_visible=" <<
@@ -3451,6 +3463,13 @@ public:
             << " workspace_paused=" << (state_.workspacePaused ? 1 : 0)
             << " desktop_child=" << (desktopChildHosted_ ? 1 : 0)
             << " dpi=" << static_cast<int>(std::round(dpi_))
+            << " visual_rect=" <<
+                (hasVisualRect
+                    ? std::to_string(visualRect.left) + "," +
+                        std::to_string(visualRect.top) + "," +
+                        std::to_string(visualRect.right) + "," +
+                        std::to_string(visualRect.bottom)
+                    : std::string("none"))
             << " hr=0x" << std::hex << static_cast<unsigned long>(result)
             << " win32=" << std::dec << win32Error << '\n';
     }
@@ -3564,12 +3583,14 @@ public:
             workspaceVisible_ =
                 IsWindowVisible(window_) != FALSE;
             EnsureInteractionWindowPresented();
+            AppendRuntimeDiagnostic("startup_initialized");
         }
         return SUCCEEDED(textResult);
     }
 
     void Shutdown() {
         shuttingDown_ = true;
+        AppendRuntimeDiagnostic("shutdown_started");
         if (lifecycleWindow_ != nullptr) {
             KillTimer(
                 lifecycleWindow_, kDesktopHostWatchTimer);
@@ -3925,6 +3946,7 @@ public:
             }
             break;
         case WM_DISPLAYCHANGE:
+            AppendRuntimeDiagnostic("display_change");
             ApplyCompanionWorkspaceFrame();
             Resize();
             return 0;
@@ -3934,8 +3956,17 @@ public:
         case WM_NCHITTEST:
             return HitTestCompanionFrame(lParam);
         case WM_DPICHANGED:
+            AppendRuntimeDiagnostic("dpi_change");
             OnDpiChanged(wParam, lParam);
             return 0;
+        case WM_POWERBROADCAST:
+            if (wParam == PBT_APMSUSPEND) {
+                AppendRuntimeDiagnostic("power_suspend");
+            } else if (wParam == PBT_APMRESUMEAUTOMATIC ||
+                       wParam == PBT_APMRESUMESUSPEND) {
+                AppendRuntimeDiagnostic("power_resume");
+            }
+            return TRUE;
         case WM_SETTINGCHANGE:
         case WM_THEMECHANGED:
         case WM_SYSCOLORCHANGE:
@@ -5307,6 +5338,10 @@ private:
         ApplyCompanionWorkspaceFrame();
         RefreshResponsiveMetrics(true);
         ScheduleSave();
+        AppendRuntimeDiagnostic(
+            state_.fullScreenWorkMode
+                ? "workspace_fullscreen_enabled"
+                : "workspace_fullscreen_disabled");
     }
 
     void SetWorkspaceCollapsed(bool collapsed) {
@@ -5386,6 +5421,7 @@ private:
             SyncSelectionDismissTimer();
             SyncCoreSelectionRippleTimer();
             Invalidate();
+            AppendRuntimeDiagnostic("workspace_shown");
         } else {
             if (window_ == nullptr ||
                 IsWindow(window_) == FALSE) {
@@ -5407,6 +5443,7 @@ private:
                 ShowWindow(window_, SW_HIDE);
                 hidingToTray_ = false;
                 KillTimer(window_, kCoreSelectionHaloTimer);
+                AppendRuntimeDiagnostic("workspace_hidden_to_tray");
             }
         }
     }
@@ -5503,6 +5540,10 @@ private:
         ScheduleSave();
         SyncSelectionDismissTimer();
         SyncCoreSelectionRippleTimer();
+        AppendRuntimeDiagnostic(
+            state_.workspacePaused
+                ? "workspace_interaction_paused"
+                : "workspace_interaction_resumed");
     }
 
     HWND TrayOwnerWindow() const {
