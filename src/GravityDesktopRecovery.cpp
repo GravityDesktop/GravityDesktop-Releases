@@ -7,6 +7,7 @@
 #include <cwctype>
 #include <filesystem>
 #include <fstream>
+#include <map>
 #include <optional>
 #include <set>
 #include <sstream>
@@ -37,6 +38,11 @@ struct RecoveryResult {
     int missing = 0;
     int failed = 0;
     bool cancelled = false;
+};
+
+struct PreviousRecoveryEntry {
+    std::filesystem::path destination;
+    std::wstring state;
 };
 
 std::optional<std::string> ReadUtf8File(const std::filesystem::path& path) {
@@ -356,6 +362,33 @@ bool ReadManagedEntries(const std::filesystem::path& manifest,
     return true;
 }
 
+std::map<std::wstring, PreviousRecoveryEntry> ReadPreviousRecoveryJournal(
+    const std::filesystem::path& journalPath) {
+    std::map<std::wstring, PreviousRecoveryEntry> previous;
+    const auto text = ReadUtf8File(journalPath);
+    if (!text) return previous;
+    for (const std::string& object : JsonObjects(*text)) {
+        const auto source = ReadStringMember(object, "source_path");
+        const auto destination = ReadStringMember(object, "destination_path");
+        const auto state = ReadStringMember(object, "state");
+        if (!source || !destination || !state || source->empty() ||
+            destination->empty()) {
+            continue;
+        }
+        const std::wstring sourcePath = Utf8ToWide(*source);
+        const std::wstring destinationPath = Utf8ToWide(*destination);
+        const std::wstring stateValue = Utf8ToWide(*state);
+        if (!sourcePath.empty() && !destinationPath.empty() &&
+            !stateValue.empty()) {
+            previous.emplace(NormalizePath(sourcePath),
+                             PreviousRecoveryEntry{
+                                 std::filesystem::path(destinationPath),
+                                 stateValue});
+        }
+    }
+    return previous;
+}
+
 std::filesystem::path AvailableRestoreDestination(
     const std::filesystem::path& desktop, const std::filesystem::path& name) {
     const std::filesystem::path requested = desktop / name.filename();
@@ -446,7 +479,8 @@ bool RunRecovery(const std::filesystem::path& library, bool interactive,
 
     std::vector<std::tuple<ManagedEntry, std::filesystem::path, std::wstring>> journal;
     journal.reserve(entries.size());
-    const std::filesystem::path managedFolder = library / L"已托管文件";
+    const std::filesystem::path journalPath = library / L"恢复事务.json";
+    const auto previous = ReadPreviousRecoveryJournal(journalPath);
     for (const ManagedEntry& entry : entries) {
         const std::filesystem::path source(entry.source);
         if (!IsPathInside(source, library)) {
@@ -454,9 +488,23 @@ bool RunRecovery(const std::filesystem::path& library, bool interactive,
             journal.emplace_back(entry, std::filesystem::path{}, L"rejected");
             continue;
         }
+        if (const auto found = previous.find(NormalizePath(source));
+            found != previous.end() && FileExists(found->second.destination)) {
+            // A prior recovery reached the destination before a crash.  Do not
+            // manufacture a second desktop copy when the tool is restarted.
+            journal.emplace_back(entry, found->second.destination, L"restored");
+            ++result.restored;
+            continue;
+        }
         const std::filesystem::path original(entry.originalPath);
-        const std::filesystem::path destination = AvailableRestoreDestination(
-            *desktop, original.empty() ? source.filename() : original.filename());
+        std::filesystem::path destination;
+        if (const auto found = previous.find(NormalizePath(source));
+            found != previous.end() && !FileExists(found->second.destination)) {
+            destination = found->second.destination;
+        } else {
+            destination = AvailableRestoreDestination(
+                *desktop, original.empty() ? source.filename() : original.filename());
+        }
         if (destination.empty()) {
             ++result.conflicts;
             journal.emplace_back(entry, std::filesystem::path{}, L"conflict");
@@ -465,7 +513,6 @@ bool RunRecovery(const std::filesystem::path& library, bool interactive,
         journal.emplace_back(entry, destination, L"pending");
     }
 
-    const std::filesystem::path journalPath = library / L"恢复事务.json";
     if (!WriteUtf8Atomic(journalPath, BuildJournal(journal))) {
         if (interactive) MessageBoxW(nullptr, L"无法写入恢复事务日志；未移动任何文件。",
                                      kTitle, MB_OK | MB_ICONERROR);
@@ -519,8 +566,19 @@ bool RunSelfTest() {
         ",\"storage_mode\":\"managed\"}]}]}";
     const bool written = WriteUtf8Atomic(root / L"恢复清单.json", manifest);
     std::vector<ManagedEntry> entries;
-    const bool parsed = written && ReadManagedEntries(root / L"恢复清单.json", entries) &&
-        entries.size() == 1 && entries.front().id == 1;
+    const std::filesystem::path restored = desktop / L"sample.txt";
+    const std::vector<std::tuple<ManagedEntry, std::filesystem::path,
+                                 std::wstring>> journal{
+        {ManagedEntry{1, source.wstring(), restored.wstring()}, restored,
+         L"restored"}};
+    const bool journalWritten = WriteUtf8Atomic(
+        root / L"恢复事务.json", BuildJournal(journal));
+    const auto previous = ReadPreviousRecoveryJournal(root / L"恢复事务.json");
+    const bool parsed = written && journalWritten &&
+        ReadManagedEntries(root / L"恢复清单.json", entries) &&
+        entries.size() == 1 && entries.front().id == 1 &&
+        previous.size() == 1 && previous.begin()->second.destination == restored &&
+        previous.begin()->second.state == L"restored";
     std::filesystem::remove_all(root, error);
     return parsed;
 }

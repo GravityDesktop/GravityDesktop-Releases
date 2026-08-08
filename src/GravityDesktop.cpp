@@ -21755,10 +21755,16 @@ private:
         if (FilePathExists(sourceRecovery.wstring())) {
             std::filesystem::create_directories(
                 durableRecovery.parent_path(), error);
-            bool recoveryAvailable = FilePathExists(durableRecovery.wstring());
-            if (!error && !recoveryAvailable) {
+            bool recoveryAvailable = false;
+            if (!error) {
                 recoveryAvailable = CopyFileW(
                     sourceRecovery.c_str(), durableRecovery.c_str(), FALSE) != FALSE;
+            }
+            // A currently running recovery tool can temporarily prevent an
+            // upgrade. Keep its already verified copy rather than breaking the
+            // emergency entry while the main app is starting.
+            if (!recoveryAvailable) {
+                recoveryAvailable = FilePathExists(durableRecovery.wstring());
             }
             if (recoveryAvailable) {
                 AppendRuntimeDiagnostic("recovery_tool_available");
