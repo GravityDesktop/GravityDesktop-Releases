@@ -1158,6 +1158,23 @@ struct WorkspaceState {
     std::vector<FileFamily> families;
 };
 
+Core* FindCoreInState(WorkspaceState& state, std::uint64_t id) {
+    const auto found = std::find_if(
+        state.cores.begin(), state.cores.end(),
+        [id](const Core& core) { return core.id == id; });
+    return found == state.cores.end() ? nullptr : &*found;
+}
+
+FileItem* FindItemInState(WorkspaceState& state, std::uint64_t coreId,
+                          std::uint64_t itemId) {
+    Core* core = FindCoreInState(state, coreId);
+    if (core == nullptr) return nullptr;
+    const auto found = std::find_if(
+        core->files.begin(), core->files.end(),
+        [itemId](const FileItem& item) { return item.id == itemId; });
+    return found == core->files.end() ? nullptr : &*found;
+}
+
 // A journal is intentionally external to state.json. It survives a process
 // crash between moving the real file and atomically replacing state.json.
 struct ManagedFileTransaction {
@@ -2348,6 +2365,90 @@ std::string SerializeRelationshipManifest(const WorkspaceState& state) {
     }
     output << "  ]\n}\n";
     return output.str();
+}
+
+// This is intentionally a logical recovery record, not a second layout
+// format.  It is only consumed when the primary state file is absent.  A
+// recovery can therefore recreate safe references without guessing any old
+// coordinates or moving real files.
+struct RelationshipRecoveryItem {
+    std::uint64_t stableId = 0;
+    std::wstring originalPath;
+    std::wstring managedPath;
+    std::wstring currentPath;
+    std::wstring storageMode;
+    std::uint64_t parentStableId = 0;
+};
+
+struct RelationshipRecoveryCore {
+    std::uint64_t stableId = 0;
+    std::wstring name;
+    bool archived = false;
+    std::vector<RelationshipRecoveryItem> files;
+};
+
+struct RelationshipRecoveryManifest {
+    std::vector<RelationshipRecoveryCore> cores;
+};
+
+bool DeserializeRelationshipRecoveryManifest(
+    const std::string& json, RelationshipRecoveryManifest& manifest) {
+    JsonValue rootValue;
+    JsonParser parser(json);
+    if (!parser.Parse(rootValue)) return false;
+    const JsonValue::Object* root = rootValue.AsObject();
+    if (root == nullptr ||
+        static_cast<int>(NumberMember(*root, "schema_version", 0.0)) != 1) {
+        return false;
+    }
+    const JsonValue* coresValue = FindMember(*root, "cores");
+    const JsonValue::Array* cores =
+        coresValue == nullptr ? nullptr : coresValue->AsArray();
+    if (cores == nullptr) return false;
+
+    RelationshipRecoveryManifest parsed;
+    std::unordered_set<std::uint64_t> coreIds;
+    std::unordered_set<std::uint64_t> fileIds;
+    for (const JsonValue& coreValue : *cores) {
+        const JsonValue::Object* coreObject = coreValue.AsObject();
+        if (coreObject == nullptr) return false;
+        RelationshipRecoveryCore core;
+        core.stableId = static_cast<std::uint64_t>(
+            NumberMember(*coreObject, "core_id", 0.0));
+        core.name = StringMember(*coreObject, "core_name", L"");
+        core.archived = BoolMember(*coreObject, "archived", false);
+        if (core.stableId == 0 || core.name.empty() ||
+            !coreIds.insert(core.stableId).second) {
+            return false;
+        }
+        const JsonValue* filesValue = FindMember(*coreObject, "files");
+        const JsonValue::Array* files =
+            filesValue == nullptr ? nullptr : filesValue->AsArray();
+        if (files == nullptr) return false;
+        for (const JsonValue& fileValue : *files) {
+            const JsonValue::Object* fileObject = fileValue.AsObject();
+            if (fileObject == nullptr) return false;
+            RelationshipRecoveryItem item;
+            item.stableId = static_cast<std::uint64_t>(
+                NumberMember(*fileObject, "file_stable_id", 0.0));
+            item.originalPath = StringMember(*fileObject, "original_path", L"");
+            item.managedPath = StringMember(*fileObject, "managed_path", L"");
+            item.currentPath = StringMember(*fileObject, "current_path", L"");
+            item.storageMode = StringMember(*fileObject, "storage_mode", L"");
+            item.parentStableId = static_cast<std::uint64_t>(
+                NumberMember(*fileObject, "parent_relationship", 0.0));
+            if (item.stableId == 0 ||
+                (item.storageMode != L"managed" &&
+                 item.storageMode != L"reference") ||
+                !fileIds.insert(item.stableId).second) {
+                return false;
+            }
+            core.files.push_back(std::move(item));
+        }
+        parsed.cores.push_back(std::move(core));
+    }
+    manifest = std::move(parsed);
+    return true;
 }
 
 int FindFreeSlot(const Core& core) {
@@ -3619,6 +3720,181 @@ public:
         return true;
     }
 
+    void DiscoverRelationshipRecoveryManifest() {
+        if (!freshWorkspaceWithoutState_ || stateRecoveryBlocked_) {
+            return;
+        }
+        const std::filesystem::path manifestPath =
+            RelationshipManifestPath();
+        const std::optional<std::string> text =
+            manifestPath.empty() ? std::nullopt : ReadUtf8File(manifestPath);
+        RelationshipRecoveryManifest manifest;
+        if (!text || !DeserializeRelationshipRecoveryManifest(*text, manifest) ||
+            manifest.cores.empty()) {
+            return;
+        }
+        pendingRelationshipRecovery_ = std::move(manifest);
+        preserveExistingRelationshipManifest_ = true;
+        AppendRuntimeDiagnostic("relationship_recovery_manifest_discovered");
+    }
+
+    bool RestoreRelationshipRecoveryManifest(
+        const RelationshipRecoveryManifest& manifest) {
+        WorkspaceState restored;
+        restored.nextId = 2;
+        restored.tutorialCompleted = true;
+        restored.firstRunCompleted = true;
+        restored.workspacePaused = false;
+
+        Core unclassified;
+        unclassified.id = kUnclassifiedCoreId;
+        unclassified.name = L"未分类";
+        unclassified.position = D2D1::Point2F(360.0f, 300.0f);
+        unclassified.expanded = true;
+        unclassified.themeColor = ChooseNewCoreColor(restored);
+        restored.cores.push_back(std::move(unclassified));
+
+        std::unordered_map<std::uint64_t, std::uint64_t> coreIds;
+        std::unordered_map<std::uint64_t, std::uint64_t> fileIds;
+        std::unordered_map<std::uint64_t, std::uint64_t> fileCoreIds;
+        int visibleCoreIndex = 0;
+        for (const RelationshipRecoveryCore& source : manifest.cores) {
+            Core* target = nullptr;
+            if (source.stableId == kUnclassifiedCoreId) {
+                target = &restored.cores.front();
+                target->name = source.name;
+                target->archived = source.archived;
+            } else {
+                Core core;
+                core.id = restored.nextId++;
+                core.name = source.name;
+                core.archived = source.archived;
+                core.expanded = !core.archived;
+                core.themeColor = ChooseNewCoreColor(restored);
+                core.themeColorCustomized = true;
+                const int column = visibleCoreIndex % 3;
+                const int row = visibleCoreIndex / 3;
+                core.position = D2D1::Point2F(
+                    260.0f + static_cast<float>(column) * 260.0f,
+                    220.0f + static_cast<float>(row) * 230.0f);
+                restored.cores.push_back(std::move(core));
+                target = &restored.cores.back();
+                ++visibleCoreIndex;
+            }
+            coreIds.emplace(source.stableId, target->id);
+        }
+
+        int restoredFiles = 0;
+        int skippedFiles = 0;
+        for (const RelationshipRecoveryCore& source : manifest.cores) {
+            const auto targetId = coreIds.find(source.stableId);
+            Core* target = targetId == coreIds.end()
+                ? nullptr : FindCoreInState(restored, targetId->second);
+            if (target == nullptr) continue;
+            for (const RelationshipRecoveryItem& sourceItem : source.files) {
+                const bool managed = sourceItem.storageMode == L"managed";
+                const std::wstring currentPath = managed
+                    ? (!sourceItem.managedPath.empty()
+                        ? sourceItem.managedPath : sourceItem.currentPath)
+                    : sourceItem.currentPath;
+                if (currentPath.empty() || !FilePathExists(currentPath)) {
+                    ++skippedFiles;
+                    continue;
+                }
+                FileItem item;
+                item.id = restored.nextId++;
+                item.path = currentPath;
+                item.originalPath = sourceItem.originalPath;
+                item.managedPath = managed
+                    ? currentPath : sourceItem.managedPath;
+                item.storageMode = managed
+                    ? FileStorageMode::Managed : FileStorageMode::Reference;
+                item.originalName = FileDisplayName(
+                    item.originalPath.empty() ? item.path : item.originalPath);
+                item.displayName = item.originalName;
+                item.missing = false;
+                AssignNewItemLayout(*target, item);
+                fileIds.emplace(sourceItem.stableId, item.id);
+                fileCoreIds.emplace(sourceItem.stableId, target->id);
+                target->files.push_back(std::move(item));
+                ++restoredFiles;
+            }
+        }
+        for (const RelationshipRecoveryCore& source : manifest.cores) {
+            const auto targetId = coreIds.find(source.stableId);
+            if (targetId == coreIds.end()) continue;
+            for (const RelationshipRecoveryItem& sourceItem : source.files) {
+                const auto itemId = fileIds.find(sourceItem.stableId);
+                const auto parentId = fileIds.find(sourceItem.parentStableId);
+                const auto parentCore = fileCoreIds.find(sourceItem.parentStableId);
+                if (itemId == fileIds.end() || parentId == fileIds.end() ||
+                    parentCore == fileCoreIds.end() ||
+                    parentCore->second != targetId->second) {
+                    continue;
+                }
+                if (FileItem* item = FindItemInState(
+                        restored, targetId->second, itemId->second)) {
+                    item->parentFileId = parentId->second;
+                }
+            }
+        }
+
+        const RelationValidationResult validation =
+            ValidateRelationState(restored);
+        if (!validation.IsValid() ||
+            !WriteStateWithRelationshipManifest(restored)) {
+            AppendRuntimeDiagnostic("relationship_recovery_restore_failed");
+            return false;
+        }
+        state_ = std::move(restored);
+        dirty_ = false;
+        stateRecoveryBlocked_ = false;
+        preserveExistingRelationshipManifest_ = false;
+        pendingRelationshipRecovery_.reset();
+        ApplyCoreRatiosToWorkspace();
+        RefreshResponsiveMetrics(true);
+        iconCache_.clear();
+        iconShadowCache_.clear();
+        layoutDirty_ = true;
+        SetStatus(
+            L"已恢复 " + std::to_wstring(restoredFiles) +
+            L" 个文件引用" +
+            (skippedFiles == 0
+                ? L"；未移动任何真实文件"
+                : L"；跳过 " + std::to_wstring(skippedFiles) +
+                    L" 个找不到的文件"));
+        AppendRuntimeDiagnostic("relationship_recovery_restored");
+        return true;
+    }
+
+    void PromptRelationshipRecoveryIfNeeded() {
+        if (!pendingRelationshipRecovery_.has_value() ||
+            window_ == nullptr || autoStartMode_) {
+            return;
+        }
+        const int choice = MessageBoxW(
+            window_,
+            L"发现以前的引力桌面工作关系。\n\n"
+            L"恢复会重新创建核心和文件引用，但不会移动、复制或删除任何真实文件。\n\n"
+            L"选择“是”恢复；选择“否”保持当前普通桌面。",
+            L"恢复以前的工作关系",
+            MB_YESNO | MB_ICONQUESTION | MB_DEFBUTTON2);
+        if (choice == IDYES) {
+            if (!RestoreRelationshipRecoveryManifest(
+                    *pendingRelationshipRecovery_)) {
+                MessageBoxW(
+                    window_, L"恢复失败；当前普通桌面未被修改。",
+                    L"恢复以前的工作关系", MB_OK | MB_ICONWARNING);
+            }
+            return;
+        }
+        // The user explicitly keeps the ordinary desktop.  Do not create a
+        // blank state on shutdown and overwrite the only recovery record.
+        pendingRelationshipRecovery_.reset();
+        dirty_ = false;
+        AppendRuntimeDiagnostic("relationship_recovery_declined");
+    }
+
     void RequestDesktopFailOpen(const char* reason,
                                 HRESULT result = S_OK,
                                 DWORD win32Error = ERROR_SUCCESS) {
@@ -3701,11 +3977,14 @@ public:
             RecoverPendingManagedTransaction();
             MigrateLegacyManagedLibraryItems();
             LoadCoreShortLabelOverrides();
+            DiscoverRelationshipRecoveryManifest();
+            PromptRelationshipRecoveryIfNeeded();
         }
         NormalizeStateModel();
         if (!benchmarkMode_) {
             EnsureManagedLibraryDesktopShortcut();
-            if (!stateRecoveryBlocked_) {
+            if (!stateRecoveryBlocked_ &&
+                !preserveExistingRelationshipManifest_) {
                 (void)WriteRelationshipManifest(state_);
             }
         }
@@ -21873,6 +22152,7 @@ private:
             }
         }
         const bool existingStateWasUnreadable = stateText.has_value() || backup.has_value();
+        freshWorkspaceWithoutState_ = !existingStateWasUnreadable;
         Core unclassified;
         unclassified.id = kUnclassifiedCoreId;
         unclassified.name = L"未分类";
@@ -22014,6 +22294,10 @@ private:
     bool sessionEndSaveFailed_ = false;
     bool sessionEndRecoveryWritten_ = false;
     bool stateRecoveryBlocked_ = false;
+    bool freshWorkspaceWithoutState_ = false;
+    bool preserveExistingRelationshipManifest_ = false;
+    std::optional<RelationshipRecoveryManifest>
+        pendingRelationshipRecovery_;
     bool applyingWorkspaceFrame_ = false;
     bool hidingToTray_ = false;
     bool exitRequested_ = false;
@@ -24567,6 +24851,58 @@ bool RunSelfTest() {
             (manifestPath.wstring() + L".bak")) ||
         !std::filesystem::exists(
             relationTestDirectory / L"backups")) {
+        return false;
+    }
+    RelationshipRecoveryManifest parsedRecoveryManifest;
+    if (!DeserializeRelationshipRecoveryManifest(
+            *manifestText, parsedRecoveryManifest) ||
+        parsedRecoveryManifest.cores.size() != 1 ||
+        parsedRecoveryManifest.cores.front().stableId != core.id ||
+        parsedRecoveryManifest.cores.front().files.size() != 1 ||
+        parsedRecoveryManifest.cores.front().files.front().stableId != item.id ||
+        parsedRecoveryManifest.cores.front().files.front().storageMode !=
+            L"managed") {
+        return false;
+    }
+    RelationshipRecoveryManifest rejectedRecoveryManifest;
+    if (DeserializeRelationshipRecoveryManifest(
+            "{\"schema_version\":1,\"cores\":[{\"core_id\":1,"
+            "\"core_name\":\"invalid\",\"files\":[{\"file_stable_id\":2,"
+            "\"storage_mode\":\"invalid\"}]}]}",
+            rejectedRecoveryManifest)) {
+        return false;
+    }
+    // Reinstallation recovery rebuilds only logical references.  It must not
+    // move the durable managed file while it reconstructs a fresh state file.
+    const std::filesystem::path recoveryFile =
+        relationTestDirectory / L"recovery-managed.txt";
+    if (!WriteUtf8Atomic(recoveryFile, "recovery file")) {
+        return false;
+    }
+    RelationshipRecoveryManifest recoveryManifest;
+    RelationshipRecoveryCore recoveryCore;
+    recoveryCore.stableId = 77;
+    recoveryCore.name = L"recovered";
+    RelationshipRecoveryItem recoveryItem;
+    recoveryItem.stableId = 78;
+    recoveryItem.originalPath = L"C:\\Desktop\\recovery-managed.txt";
+    recoveryItem.managedPath = recoveryFile.wstring();
+    recoveryItem.currentPath = recoveryFile.wstring();
+    recoveryItem.storageMode = L"managed";
+    recoveryCore.files.push_back(recoveryItem);
+    recoveryManifest.cores.push_back(std::move(recoveryCore));
+    GravityApp recoveryManifestApp;
+    recoveryManifestApp.stateFile_ =
+        relationTestDirectory / L"recovery-manifest-state.json";
+    if (!recoveryManifestApp.RestoreRelationshipRecoveryManifest(
+            recoveryManifest) ||
+        !GravityApp::FilePathExists(recoveryFile.wstring()) ||
+        recoveryManifestApp.state_.cores.size() != 2 ||
+        recoveryManifestApp.state_.cores.back().files.size() != 1 ||
+        recoveryManifestApp.state_.cores.back().files.front().storageMode !=
+            FileStorageMode::Managed ||
+        !GravityApp::FilePathExists(
+            recoveryManifestApp.stateFile_.wstring())) {
         return false;
     }
     // A stale recovery index must never undo a successful primary state write.
