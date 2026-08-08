@@ -9847,7 +9847,7 @@ private:
             : horizontalWidth;
         const float groupHeight = vertical
             ? 40.0f + (kWorkspaceControlCount - 1) * 32.0f +
-                  (kWorkspaceControlCount - 2) * gap + 6.0f
+                  (kWorkspaceControlCount - 2) * gap + 44.0f
             : 38.0f;
         if (!state_.workspaceChromePositionValid) {
             return D2D1::RectF(
@@ -9871,7 +9871,7 @@ private:
         if (WorkspaceChromeIsVertical()) {
             return D2D1::RectF(
                 group.left + 3.0f, group.top + 3.0f,
-                group.left + 35.0f, group.top + 35.0f);
+                group.right - 3.0f, group.top + 35.0f);
         }
         return D2D1::RectF(
             group.left + 3.0f, group.top + 3.0f,
@@ -9892,8 +9892,8 @@ private:
         if (WorkspaceChromeIsVertical()) {
             if (safeIndex == 0) {
                 return D2D1::RectF(
-                    group.right - 36.0f, group.top + 3.0f,
-                    group.right - 4.0f, group.top + 35.0f);
+                    group.left + 4.0f, group.bottom - 36.0f,
+                    group.right - 4.0f, group.bottom - 4.0f);
             }
             const float top = group.top + 40.0f +
                 (safeIndex - 1) * (32.0f + gap);
@@ -10026,11 +10026,13 @@ private:
             dark ? 0xFFFFFF : 0x16324A,
             stripHovered ? 0.82f : 0.52f));
         const float gripCenter = (dragHandle.top + dragHandle.bottom) * 0.5f;
+        const float gripXCenter = (dragHandle.left + dragHandle.right) * 0.5f;
+        const float gripHalfWidth = WorkspaceChromeIsVertical() ? 16.0f : 10.0f;
         for (int line = -1; line <= 1; ++line) {
             const float y = gripCenter + line * 4.0f;
             renderTarget_->DrawLine(
-                D2D1::Point2F(dragHandle.left + 2.0f, y),
-                D2D1::Point2F(dragHandle.right - 2.0f, y),
+                D2D1::Point2F(gripXCenter - gripHalfWidth, y),
+                D2D1::Point2F(gripXCenter + gripHalfWidth, y),
                 brush_.Get(), 1.0f);
         }
 
