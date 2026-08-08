@@ -39,6 +39,7 @@
 #include <set>
 #include <sstream>
 #include <string>
+#include <string_view>
 #include <unordered_map>
 #include <unordered_set>
 #include <utility>
@@ -1957,6 +1958,27 @@ bool IsGeneratedHistorySnapshotName(
     return true;
 }
 
+bool IsGeneratedRelationshipManifestSnapshotName(
+    const std::filesystem::path& path) {
+    const std::wstring name = path.filename().wstring();
+    constexpr std::wstring_view kPrefix = L"relationships-";
+    if (name.size() != kPrefix.size() + 19 + 5 ||
+        name.compare(0, kPrefix.size(), kPrefix) != 0 ||
+        name.compare(name.size() - 5, 5, L".json") != 0) {
+        return false;
+    }
+    const std::wstring_view timestamp(
+        name.data() + kPrefix.size(), 19);
+    if (timestamp[8] != L'-' || timestamp[15] != L'-') {
+        return false;
+    }
+    for (std::size_t index = 0; index < timestamp.size(); ++index) {
+        if (index == 8 || index == 15) continue;
+        if (!iswdigit(timestamp[index])) return false;
+    }
+    return true;
+}
+
 bool PruneGeneratedHistorySnapshots(
     const std::filesystem::path& folder) {
     std::error_code error;
@@ -2006,6 +2028,51 @@ bool PruneGeneratedHistorySnapshots(
         if (error) {
             return false;
         }
+    }
+    return true;
+}
+
+bool PruneGeneratedRelationshipManifestSnapshots(
+    const std::filesystem::path& folder) {
+    std::error_code error;
+    if (!std::filesystem::exists(folder, error)) {
+        return !error;
+    }
+    std::vector<std::filesystem::path> snapshots;
+    std::filesystem::directory_iterator iterator(folder, error);
+    const std::filesystem::directory_iterator end;
+    while (!error && iterator != end) {
+        const std::filesystem::directory_entry& entry = *iterator;
+        const std::filesystem::file_status status =
+            entry.symlink_status(error);
+        if (error) break;
+        if (std::filesystem::is_regular_file(status) &&
+            IsGeneratedRelationshipManifestSnapshotName(entry.path())) {
+            snapshots.push_back(entry.path());
+        }
+        iterator.increment(error);
+    }
+    if (error) return false;
+    std::sort(
+        snapshots.begin(), snapshots.end(),
+        [](const std::filesystem::path& first,
+           const std::filesystem::path& second) {
+            return first.filename().wstring() >
+                   second.filename().wstring();
+        });
+    std::set<std::wstring> retainedDailyDates;
+    constexpr std::size_t kPrefixLength = 14; // "relationships-"
+    for (std::size_t index = kHistoryRecentSnapshotCount;
+         index < snapshots.size(); ++index) {
+        const std::wstring name = snapshots[index].filename().wstring();
+        const std::wstring date = name.substr(kPrefixLength, 8);
+        if (retainedDailyDates.size() < kHistoryDailySnapshotCount &&
+            retainedDailyDates.insert(date).second) {
+            continue;
+        }
+        error.clear();
+        std::filesystem::remove(snapshots[index], error);
+        if (error) return false;
     }
     return true;
 }
@@ -2232,6 +2299,53 @@ std::string SerializeState(const WorkspaceState& state) {
         if (index + 1 < state.families.size()) output << ", ";
     }
     output << "]\n}\n";
+    return output.str();
+}
+
+// This is deliberately a compact, independent recovery index rather than a
+// second copy of the visual layout.  The state file remains authoritative;
+// the manifest exists so a future recovery flow can discover real files and
+// their logical relationships without depending on coordinates or slots.
+std::string SerializeRelationshipManifest(const WorkspaceState& state) {
+    std::ostringstream output;
+    output.imbue(std::locale::classic());
+    output << "{\n"
+           << "  \"schema_version\": 1,\n"
+           << "  \"generated_at\": " << UnixTimeNow() << ",\n"
+           << "  \"cores\": [\n";
+    for (std::size_t coreIndex = 0; coreIndex < state.cores.size(); ++coreIndex) {
+        const Core& core = state.cores[coreIndex];
+        output << "    {\"core_id\": " << core.id
+               << ", \"core_name\": " << EscapeJson(core.name)
+               << ", \"archived\": "
+               << (core.archived ? "true" : "false")
+               << ", \"files\": [";
+        for (std::size_t itemIndex = 0;
+             itemIndex < core.files.size(); ++itemIndex) {
+            const FileItem& item = core.files[itemIndex];
+            const bool managed = item.storageMode == FileStorageMode::Managed;
+            const std::int64_t lastConfirmed =
+                managed && item.managedAt > 0
+                    ? item.managedAt
+                    : item.lastOpened;
+            output << "{\"file_stable_id\": " << item.id
+                   << ", \"original_path\": " << EscapeJson(item.originalPath)
+                   << ", \"managed_path\": " << EscapeJson(item.managedPath)
+                   << ", \"current_path\": " << EscapeJson(item.path)
+                   << ", \"core_relationship\": \"member\""
+                   << ", \"parent_relationship\": " << item.parentFileId
+                   << ", \"family_id\": " << item.familyId
+                   << ", \"storage_mode\": \""
+                   << (managed ? "managed" : "reference") << "\""
+                   << ", \"last_confirmed\": " << lastConfirmed
+                   << "}";
+            if (itemIndex + 1 < core.files.size()) output << ", ";
+        }
+        output << "]}";
+        if (coreIndex + 1 < state.cores.size()) output << ',';
+        output << '\n';
+    }
+    output << "  ]\n}\n";
     return output.str();
 }
 
@@ -3389,6 +3503,11 @@ public:
         return stateFile_.parent_path() / L"logs" / L"runtime.log";
     }
 
+    std::filesystem::path RelationshipManifestPath() const {
+        if (stateFile_.empty()) return {};
+        return stateFile_.parent_path() / L"relationships.json";
+    }
+
     void RotateRuntimeDiagnosticLogsIfNeeded(
         const std::filesystem::path& current) const {
         std::error_code error;
@@ -3472,6 +3591,31 @@ public:
                     : std::string("none"))
             << " hr=0x" << std::hex << static_cast<unsigned long>(result)
             << " win32=" << std::dec << win32Error << '\n';
+    }
+
+    bool WriteRelationshipManifest(const WorkspaceState& snapshot) const {
+        const std::filesystem::path manifest = RelationshipManifestPath();
+        if (manifest.empty()) return false;
+        if (WriteUtf8Atomic(
+                manifest, SerializeRelationshipManifest(snapshot))) {
+            return true;
+        }
+        AppendRuntimeDiagnostic(
+            "relationship_manifest_write_failed", E_FAIL, GetLastError());
+        return false;
+    }
+
+    // The state file is authoritative.  A manifest write failure is logged but
+    // must never turn a successfully committed state/file transaction into a
+    // rollback: that would reduce real-file safety rather than improve it.
+    bool WriteStateWithRelationshipManifest(
+        const WorkspaceState& snapshot) const {
+        if (stateFile_.empty() ||
+            !WriteUtf8Atomic(stateFile_, SerializeState(snapshot))) {
+            return false;
+        }
+        (void)WriteRelationshipManifest(snapshot);
+        return true;
     }
 
     void RequestDesktopFailOpen(const char* reason,
@@ -3559,6 +3703,9 @@ public:
         NormalizeStateModel();
         if (!benchmarkMode_) {
             EnsureManagedLibraryDesktopShortcut();
+            if (!stateRecoveryBlocked_) {
+                (void)WriteRelationshipManifest(state_);
+            }
         }
         // Pause is a runtime tray state. An explicit process launch must not
         // show a fully rendered workspace whose input path immediately exits.
@@ -17947,8 +18094,8 @@ private:
             candidate, sourcePath);
         const RelationValidationResult validation =
             ValidateRelationState(candidate);
-        if (!validation.IsValid() || !WriteUtf8Atomic(
-                stateFile_, SerializeState(candidate))) {
+        if (!validation.IsValid() ||
+            !WriteStateWithRelationshipManifest(candidate)) {
             std::wstring rollbackError;
             const bool rolledBack = MoveFileWithoutReplacement(
                 transaction.destinationPath, transaction.sourcePath,
@@ -18614,6 +18761,26 @@ private:
         Invalidate();
     }
 
+    bool CreateRelationshipManifestHistoryBackup() const {
+        const std::filesystem::path manifest = RelationshipManifestPath();
+        if (manifest.empty() ||
+            GetFileAttributesW(manifest.c_str()) ==
+                INVALID_FILE_ATTRIBUTES) {
+            return false;
+        }
+        const std::filesystem::path folder =
+            manifest.parent_path() / L"backups";
+        std::error_code error;
+        std::filesystem::create_directories(folder, error);
+        if (error) return false;
+        const std::filesystem::path target =
+            folder / (L"relationships-" + BackupTimestamp() + L".json");
+        std::filesystem::copy_file(
+            manifest, target, std::filesystem::copy_options::none, error);
+        if (error) return false;
+        return PruneGeneratedRelationshipManifestSnapshots(folder);
+    }
+
     bool CreateHistoryBackup(bool force) {
         if (stateFile_.empty() ||
             GetFileAttributesW(stateFile_.c_str()) == INVALID_FILE_ATTRIBUTES) {
@@ -18634,6 +18801,11 @@ private:
             // Retention only touches snapshots created by this function.
             // A pruning failure does not invalidate the backup just written.
             PruneGeneratedHistorySnapshots(folder);
+            if (!CreateRelationshipManifestHistoryBackup()) {
+                AppendRuntimeDiagnostic(
+                    "relationship_manifest_history_backup_failed",
+                    E_FAIL, GetLastError());
+            }
         }
         return !error;
     }
@@ -18830,7 +19002,7 @@ private:
         if (!CommitImportedStateWrite(
                 stateRecoveryBlocked_,
                 [&]() {
-                    return WriteUtf8Atomic(stateFile_, SerializeState(state_));
+                    return WriteStateWithRelationshipManifest(state_);
                 })) {
             state_ = std::move(before);
             NormalizeStateModel();
@@ -19495,9 +19667,7 @@ private:
             return false;
         }
         if (stateFile_.empty() ||
-            !WriteUtf8Atomic(
-                stateFile_,
-                SerializeState(candidate))) {
+            !WriteStateWithRelationshipManifest(candidate)) {
             SetStatus(
                 L"移除操作保存失败；原状态保持不变");
             return false;
@@ -20119,7 +20289,7 @@ private:
         ManagedFileTransaction updated = reverse;
         updated.stage = ManagedTransactionStage::FileMoved;
         if (!PersistManagedTransaction(updated) ||
-            !WriteUtf8Atomic(stateFile_, SerializeState(restoredState))) {
+            !WriteStateWithRelationshipManifest(restoredState)) {
             std::wstring rollbackError;
             (void)MoveFileWithoutReplacement(
                 reverse.destinationPath, reverse.sourcePath, &rollbackError);
@@ -20852,7 +21022,7 @@ private:
         }
         const RelationValidationResult validation = ValidateRelationState(candidate);
         if (candidateItem == nullptr || !validation.IsValid() ||
-            !WriteUtf8Atomic(stateFile_, SerializeState(candidate))) {
+            !WriteStateWithRelationshipManifest(candidate)) {
             std::wstring rollbackError;
             const bool rolledBack = MoveFileWithoutReplacement(
                 transaction.destinationPath, transaction.sourcePath,
@@ -21536,7 +21706,7 @@ private:
             return false;
         }
         UpdateCoreRatios();
-        if (WriteUtf8Atomic(stateFile_, SerializeState(state_))) {
+        if (WriteStateWithRelationshipManifest(state_)) {
             dirty_ = false;
             CreateHistoryBackup(false);
             return true;
@@ -24139,6 +24309,56 @@ bool RunSelfTest() {
     testFamily.rootFileId = item.id;
     testFamily.currentFileId = item.id;
     source.families.push_back(testFamily);
+
+    // The recovery manifest intentionally excludes visual layout but must keep
+    // all real-file and parent/core relationship data.  Exercise its primary,
+    // .bak, and history-copy paths without touching user state.
+    const std::filesystem::path manifestStatePath =
+        relationTestDirectory / L"relationship-manifest-state.json";
+    GravityApp manifestApp;
+    manifestApp.stateFile_ = manifestStatePath;
+    manifestApp.state_ = source;
+    if (!manifestApp.WriteStateWithRelationshipManifest(source) ||
+        !manifestApp.WriteRelationshipManifest(source) ||
+        !manifestApp.CreateHistoryBackup(true)) {
+        return false;
+    }
+    const std::filesystem::path manifestPath =
+        relationTestDirectory / L"relationships.json";
+    const std::optional<std::string> manifestText =
+        ReadUtf8File(manifestPath);
+    JsonValue manifestRoot;
+    if (!manifestText ||
+        !JsonParser(*manifestText).Parse(manifestRoot) ||
+        manifestText->find("\"core_id\": 1") == std::string::npos ||
+        manifestText->find("\"file_stable_id\": 3") == std::string::npos ||
+        manifestText->find("\"storage_mode\": \"managed\"") ==
+            std::string::npos ||
+        manifestText->find("\"parent_relationship\": 0") ==
+            std::string::npos ||
+        !GravityApp::FilePathExists(
+            (manifestPath.wstring() + L".bak")) ||
+        !std::filesystem::exists(
+            relationTestDirectory / L"backups")) {
+        return false;
+    }
+    // A stale recovery index must never undo a successful primary state write.
+    // This injects a manifest-only failure by reserving its target as a folder.
+    const std::filesystem::path manifestFailureDirectory =
+        relationTestDirectory / L"relationship-manifest-failure";
+    std::error_code manifestFailureError;
+    std::filesystem::create_directories(
+        manifestFailureDirectory / L"relationships.json",
+        manifestFailureError);
+    GravityApp manifestFailureApp;
+    manifestFailureApp.stateFile_ =
+        manifestFailureDirectory / L"state.json";
+    if (manifestFailureError ||
+        !manifestFailureApp.WriteStateWithRelationshipManifest(source) ||
+        !GravityApp::FilePathExists(
+            manifestFailureApp.stateFile_.wstring())) {
+        return false;
+    }
 
     WorkspaceState restored;
     if (!DeserializeState(SerializeState(source), restored)) {
