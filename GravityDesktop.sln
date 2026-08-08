@@ -4,6 +4,8 @@ VisualStudioVersion = 17.14.37203.1
 MinimumVisualStudioVersion = 10.0.40219.1
 Project("{BC8A1FFA-BEE3-4634-8014-F334798102B3}") = "GravityDesktop", "GravityDesktop.vcxproj", "{7EC2BFF8-B359-4B2E-9787-2B9919A95A72}"
 EndProject
+Project("{BC8A1FFA-BEE3-4634-8014-F334798102B3}") = "GravityDesktopRecovery", "GravityDesktopRecovery.vcxproj", "{E0C0972E-0D9F-4A31-B837-0C2E6A8F3F11}"
+EndProject
 Global
 	GlobalSection(SolutionConfigurationPlatforms) = preSolution
 		Debug|x64 = Debug|x64
@@ -14,9 +16,12 @@ Global
 		{7EC2BFF8-B359-4B2E-9787-2B9919A95A72}.Debug|x64.Build.0 = Debug|x64
 		{7EC2BFF8-B359-4B2E-9787-2B9919A95A72}.Release|x64.ActiveCfg = Release|x64
 		{7EC2BFF8-B359-4B2E-9787-2B9919A95A72}.Release|x64.Build.0 = Release|x64
+		{E0C0972E-0D9F-4A31-B837-0C2E6A8F3F11}.Debug|x64.ActiveCfg = Debug|x64
+		{E0C0972E-0D9F-4A31-B837-0C2E6A8F3F11}.Debug|x64.Build.0 = Debug|x64
+		{E0C0972E-0D9F-4A31-B837-0C2E6A8F3F11}.Release|x64.ActiveCfg = Release|x64
+		{E0C0972E-0D9F-4A31-B837-0C2E6A8F3F11}.Release|x64.Build.0 = Release|x64
 	EndGlobalSection
 	GlobalSection(SolutionProperties) = preSolution
 		HideSolutionNode = FALSE
 	EndGlobalSection
 EndGlobal
-

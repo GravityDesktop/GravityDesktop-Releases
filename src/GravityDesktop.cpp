@@ -3905,13 +3905,23 @@ public:
     bool WriteRelationshipManifest(const WorkspaceState& snapshot) const {
         const std::filesystem::path manifest = RelationshipManifestPath();
         if (manifest.empty()) return false;
-        if (WriteUtf8Atomic(
-                manifest, SerializeRelationshipManifest(snapshot))) {
-            return true;
+        const std::string serialized = SerializeRelationshipManifest(snapshot);
+        const bool localSaved = WriteUtf8Atomic(manifest, serialized);
+        if (!localSaved) {
+            AppendRuntimeDiagnostic(
+                "relationship_manifest_write_failed", E_FAIL, GetLastError());
         }
-        AppendRuntimeDiagnostic(
-            "relationship_manifest_write_failed", E_FAIL, GetLastError());
-        return false;
+
+        // This second copy is deliberately outside LocalAppData.  The recovery
+        // executable can work when the main program or its state directory is
+        // unavailable, and it never needs to guess which files are managed.
+        const std::filesystem::path recoveryManifest =
+            ManagedLibraryPath() / L"恢复清单.json";
+        if (!WriteUtf8Atomic(recoveryManifest, serialized)) {
+            AppendRuntimeDiagnostic(
+                "recovery_manifest_write_failed", E_FAIL, GetLastError());
+        }
+        return localSaved;
     }
 
     // The state file is authoritative.  A manifest write failure is logged but
@@ -4277,7 +4287,7 @@ public:
         }
         NormalizeStateModel();
         if (!benchmarkMode_) {
-            EnsureManagedLibraryDesktopShortcut();
+            EnsureManagedLibrarySafetyCenter();
             if (!stateRecoveryBlocked_ &&
                 !preserveExistingRelationshipManifest_) {
                 (void)WriteRelationshipManifest(state_);
@@ -21451,9 +21461,15 @@ private:
             : std::filesystem::path(state_.managedLibraryPath);
     }
 
+    // Keep the visible library root calm: recovery is the only direct action
+    // there, while managed files remain one level below for fast browsing.
+    std::filesystem::path ManagedFilesPath() const {
+        return ManagedLibraryPath() / L"已托管文件";
+    }
+
     std::filesystem::path AvailableManagedLibraryRootPath(
         const std::wstring& preferredName) const {
-        const std::filesystem::path library = ManagedLibraryPath();
+        const std::filesystem::path library = ManagedFilesPath();
         const std::filesystem::path requested = library / preferredName;
         if (!FilePathExists(requested.wstring())) {
             return requested;
@@ -21480,10 +21496,13 @@ private:
         const std::filesystem::path path(item.managedPath);
         const std::filesystem::path parent = path.parent_path();
         const std::wstring parentName = parent.filename().wstring();
-        return parentName.rfind(L"managed-", 0) == 0 &&
-               PathEquals(
-                   NormalizePath(parent.parent_path().wstring()),
-                   NormalizePath(ManagedLibraryPath().wstring()));
+        const std::filesystem::path library = ManagedLibraryPath();
+        return (parentName.rfind(L"managed-", 0) == 0 &&
+                PathEquals(
+                    NormalizePath(parent.parent_path().wstring()),
+                    NormalizePath(library.wstring()))) ||
+               PathEquals(NormalizePath(parent.wstring()),
+                          NormalizePath(library.wstring()));
     }
 
     bool MoveLegacyManagedItemToLibraryRoot(
@@ -21623,7 +21642,7 @@ private:
         }
         if (migrated > 0) {
             SetStatus(L"已将 " + std::to_wstring(migrated) +
-                      L" 个托管文件整理到文件库根目录");
+                      L" 个托管文件整理到“已托管文件”");
         }
         PruneEmptyLegacyManagedLibraryDirectories();
     }
@@ -21683,6 +21702,23 @@ private:
         return *desktop / L"引力桌面文件库.lnk";
     }
 
+    std::optional<std::filesystem::path>
+    ManagedLibrarySafetyCenterShortcutPath() const {
+        const std::optional<std::filesystem::path> desktop =
+            CurrentUserDesktopPath();
+        if (!desktop.has_value()) return std::nullopt;
+        return *desktop / L"引力桌面安全中心.lnk";
+    }
+
+    std::filesystem::path RecoveryToolPath() const {
+        return ManagedLibraryPath() / L"恢复工具" /
+            L"GravityDesktopRecovery.exe";
+    }
+
+    std::filesystem::path RecoveryShortcutPath() const {
+        return ManagedLibraryPath() / L"恢复全部文件到桌面.lnk";
+    }
+
     bool HasManagedFiles() const {
         return std::any_of(
             state_.cores.begin(), state_.cores.end(),
@@ -21695,62 +21731,86 @@ private:
             });
     }
 
-    void EnsureManagedLibraryDesktopShortcut() {
-        if (!HasManagedFiles()) return;
+    void EnsureManagedLibrarySafetyCenter() {
         const std::optional<std::filesystem::path> shortcutPath =
-            ManagedLibraryDesktopShortcutPath();
+            ManagedLibrarySafetyCenterShortcutPath();
         if (!shortcutPath.has_value()) {
-            AppendRuntimeDiagnostic("managed_library_shortcut_desktop_unavailable");
+            AppendRuntimeDiagnostic("managed_safety_center_desktop_unavailable");
             return;
         }
         const std::filesystem::path library = ManagedLibraryPath();
         std::error_code error;
         std::filesystem::create_directories(library, error);
         if (error) {
-            AppendRuntimeDiagnostic("managed_library_shortcut_library_unavailable",
+            AppendRuntimeDiagnostic("managed_safety_center_library_unavailable",
                                     S_OK,
                                     static_cast<DWORD>(error.value()));
             return;
         }
-        if (std::filesystem::exists(*shortcutPath, error) && !error) {
-            // Never overwrite a file a user may have placed on the desktop.
-            AppendRuntimeDiagnostic("managed_library_shortcut_existing");
-            return;
-        }
-        ComPtr<IShellLinkW> shellLink;
-        HRESULT result = CoCreateInstance(
-            CLSID_ShellLink, nullptr, CLSCTX_INPROC_SERVER,
-            IID_PPV_ARGS(shellLink.ReleaseAndGetAddressOf()));
-        if (FAILED(result)) {
-            AppendRuntimeDiagnostic("managed_library_shortcut_create_failed",
-                                    result);
-            return;
-        }
-        result = shellLink->SetPath(library.c_str());
-        if (SUCCEEDED(result)) {
-            result = shellLink->SetDescription(
-                L"引力桌面托管文件库（程序故障时仍可直接访问）");
-        }
-        if (SUCCEEDED(result)) {
-            wchar_t executable[MAX_PATH]{};
-            if (GetModuleFileNameW(
-                    nullptr, executable,
-                    static_cast<DWORD>(std::size(executable))) > 0) {
-                (void)shellLink->SetIconLocation(executable, 0);
+
+        const std::filesystem::path sourceRecovery =
+            std::filesystem::path(CurrentExecutablePath()).parent_path() /
+            L"GravityDesktopRecovery.exe";
+        const std::filesystem::path durableRecovery = RecoveryToolPath();
+        if (FilePathExists(sourceRecovery.wstring())) {
+            std::filesystem::create_directories(
+                durableRecovery.parent_path(), error);
+            bool recoveryAvailable = FilePathExists(durableRecovery.wstring());
+            if (!error && !recoveryAvailable) {
+                recoveryAvailable = CopyFileW(
+                    sourceRecovery.c_str(), durableRecovery.c_str(), FALSE) != FALSE;
             }
+            if (recoveryAvailable) {
+                AppendRuntimeDiagnostic("recovery_tool_available");
+            } else if (error) {
+                AppendRuntimeDiagnostic("recovery_tool_folder_failed", S_OK,
+                                        static_cast<DWORD>(error.value()));
+            } else {
+                AppendRuntimeDiagnostic("recovery_tool_copy_failed", E_FAIL,
+                                        GetLastError());
+            }
+        } else {
+            AppendRuntimeDiagnostic("recovery_tool_source_missing");
         }
-        ComPtr<IPersistFile> persist;
-        if (SUCCEEDED(result)) {
-            result = shellLink.As(&persist);
+
+        const auto createShortcut = [this](
+            const std::filesystem::path& target,
+            const std::filesystem::path& destination,
+            const wchar_t* description) {
+            std::error_code existsError;
+            if (std::filesystem::exists(destination, existsError) &&
+                !existsError) {
+                return true; // Never overwrite a user-created shortcut.
+            }
+            ComPtr<IShellLinkW> shellLink;
+            HRESULT result = CoCreateInstance(
+                CLSID_ShellLink, nullptr, CLSCTX_INPROC_SERVER,
+                IID_PPV_ARGS(shellLink.ReleaseAndGetAddressOf()));
+            if (SUCCEEDED(result)) result = shellLink->SetPath(target.c_str());
+            if (SUCCEEDED(result)) result = shellLink->SetDescription(description);
+            if (SUCCEEDED(result)) {
+                const std::wstring executable = CurrentExecutablePath();
+                if (!executable.empty()) {
+                    (void)shellLink->SetIconLocation(executable.c_str(), 0);
+                }
+            }
+            ComPtr<IPersistFile> persist;
+            if (SUCCEEDED(result)) result = shellLink.As(&persist);
+            if (SUCCEEDED(result)) result = persist->Save(destination.c_str(), TRUE);
+            return SUCCEEDED(result);
+        };
+
+        if (!createShortcut(library, *shortcutPath,
+                            L"打开引力桌面文件库和紧急恢复入口")) {
+            AppendRuntimeDiagnostic("managed_safety_center_shortcut_failed",
+                                    E_FAIL, GetLastError());
         }
-        if (SUCCEEDED(result)) {
-            result = persist->Save(shortcutPath->c_str(), TRUE);
+        if (FilePathExists(durableRecovery.wstring()) &&
+            !createShortcut(durableRecovery, RecoveryShortcutPath(),
+                            L"将所有引力桌面托管文件安全恢复到 Windows 桌面")) {
+            AppendRuntimeDiagnostic("recovery_shortcut_create_failed", E_FAIL,
+                                    GetLastError());
         }
-        AppendRuntimeDiagnostic(
-            SUCCEEDED(result)
-                ? "managed_library_shortcut_created"
-                : "managed_library_shortcut_save_failed",
-            result);
     }
 
     std::optional<std::filesystem::path> CurrentUserDesktopPath() const {
@@ -22071,12 +22131,19 @@ private:
             return false;
         }
         const std::wstring normalized = NormalizePath(path);
-        if (const std::optional<std::filesystem::path> shortcut =
-                ManagedLibraryDesktopShortcutPath();
-            shortcut.has_value() &&
-            PathEquals(normalized, NormalizePath(shortcut->wstring()))) {
+        const bool isLegacyLibraryShortcut = [&]() {
+            const auto shortcut = ManagedLibraryDesktopShortcutPath();
+            return shortcut.has_value() &&
+                PathEquals(normalized, NormalizePath(shortcut->wstring()));
+        }();
+        const bool isSafetyCenterShortcut = [&]() {
+            const auto shortcut = ManagedLibrarySafetyCenterShortcutPath();
+            return shortcut.has_value() &&
+                PathEquals(normalized, NormalizePath(shortcut->wstring()));
+        }();
+        if (isLegacyLibraryShortcut || isSafetyCenterShortcut) {
             if (reason != nullptr) {
-                *reason = L"“引力桌面文件库”是受保护的恢复入口";
+                *reason = L"“引力桌面安全中心”是受保护的恢复入口";
             }
             return false;
         }
@@ -25548,7 +25615,7 @@ bool RunSelfTest() {
         return false;
     }
 
-    // Legacy managed-ID folders must migrate into the visible library root
+    // Legacy managed-ID folders must migrate into the visible files folder
     // without overwriting a same-named file already there.
     const std::filesystem::path flatLibrary =
         relationTestDirectory / L"flat-managed-library";
@@ -25574,7 +25641,8 @@ bool RunSelfTest() {
     flatCore.files.push_back(flatItem);
     flatLibraryApp.state_.cores.push_back(std::move(flatCore));
     flatLibraryApp.MigrateLegacyManagedLibraryItems();
-    const std::filesystem::path flatDestination = flatLibrary / L"report.txt";
+    const std::filesystem::path flatDestination =
+        flatLibrary / L"已托管文件" / L"report.txt";
     const FileItem* migratedFlatItem = flatLibraryApp.FindItem(900, 901);
     if (!GravityApp::FilePathExists(flatDestination.wstring()) ||
         GravityApp::FilePathExists(legacyFlatSource.wstring()) ||
@@ -25599,7 +25667,7 @@ bool RunSelfTest() {
     flatLibraryApp.FindCore(900)->files.push_back(collisionItem);
     flatLibraryApp.MigrateLegacyManagedLibraryItems();
     const std::filesystem::path collisionDestination =
-        flatLibrary / L"report (2).txt";
+        flatLibrary / L"已托管文件" / L"report (2).txt";
     const FileItem* migratedCollisionItem =
         flatLibraryApp.FindItem(900, 903);
     if (!GravityApp::FilePathExists(collisionDestination.wstring()) ||

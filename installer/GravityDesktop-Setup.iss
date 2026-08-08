@@ -53,9 +53,11 @@ Name: "autostart"; Description: "开机时自动启动引力桌面"; GroupDescri
 
 [Files]
 Source: "..\out\Release\{#MyAppExeName}"; DestDir: "{app}"; Flags: ignoreversion
+Source: "..\out\Release\GravityDesktopRecovery.exe"; DestDir: "{app}"; Flags: ignoreversion
 
 [Icons]
 Name: "{userprograms}\{#MyAppName}"; Filename: "{app}\{#MyAppExeName}"; WorkingDir: "{app}"; IconFilename: "{app}\{#MyAppExeName}"
+Name: "{userprograms}\{#MyAppName}\紧急恢复文件"; Filename: "{app}\GravityDesktopRecovery.exe"; WorkingDir: "{app}"; IconFilename: "{app}\{#MyAppExeName}"
 Name: "{userdesktop}\{#MyAppName}"; Filename: "{app}\{#MyAppExeName}"; WorkingDir: "{app}"; IconFilename: "{app}\{#MyAppExeName}"; Tasks: desktopicon
 
 [Registry]
