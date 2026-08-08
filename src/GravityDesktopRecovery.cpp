@@ -88,6 +88,15 @@ bool WriteUtf8Atomic(const std::filesystem::path& target,
     return false;
 }
 
+void HideRecoveryMetadata(const std::filesystem::path& path) {
+    const DWORD attributes = GetFileAttributesW(path.c_str());
+    if (attributes != INVALID_FILE_ATTRIBUTES) {
+        (void)SetFileAttributesW(path.c_str(), attributes |
+                                 FILE_ATTRIBUTE_HIDDEN |
+                                 FILE_ATTRIBUTE_SYSTEM);
+    }
+}
+
 std::wstring Utf8ToWide(const std::string& input) {
     if (input.empty()) return {};
     const int length = MultiByteToWideChar(CP_UTF8, MB_ERR_INVALID_CHARS,
@@ -518,6 +527,8 @@ bool RunRecovery(const std::filesystem::path& library, bool interactive,
                                      kTitle, MB_OK | MB_ICONERROR);
         return false;
     }
+    HideRecoveryMetadata(journalPath);
+    HideRecoveryMetadata(journalPath.wstring() + L".bak");
 
     for (auto& [entry, destination, status] : journal) {
         if (status != L"pending") continue;
@@ -532,12 +543,15 @@ bool RunRecovery(const std::filesystem::path& library, bool interactive,
             status = L"failed";
             ++result.failed;
         }
-        (void)WriteUtf8Atomic(journalPath, BuildJournal(journal));
+        if (WriteUtf8Atomic(journalPath, BuildJournal(journal))) {
+            HideRecoveryMetadata(journalPath);
+            HideRecoveryMetadata(journalPath.wstring() + L".bak");
+        }
     }
 
     const auto now = std::chrono::system_clock::to_time_t(
         std::chrono::system_clock::now());
-    const std::filesystem::path report = library /
+    const std::filesystem::path report = library / L"恢复报告" /
         (L"恢复结果-" + std::to_wstring(static_cast<long long>(now)) + L".txt");
     (void)WriteUtf8Atomic(report, WideToUtf8(ResultText(result)));
     if (interactive) MessageBoxW(nullptr, ResultText(result).c_str(), kTitle,

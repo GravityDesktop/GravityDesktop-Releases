@@ -3920,6 +3920,17 @@ public:
         if (!WriteUtf8Atomic(recoveryManifest, serialized)) {
             AppendRuntimeDiagnostic(
                 "recovery_manifest_write_failed", E_FAIL, GetLastError());
+        } else {
+            const auto hideRecoveryMetadata = [](const std::filesystem::path& path) {
+                const DWORD attributes = GetFileAttributesW(path.c_str());
+                if (attributes != INVALID_FILE_ATTRIBUTES) {
+                    (void)SetFileAttributesW(
+                        path.c_str(), attributes | FILE_ATTRIBUTE_HIDDEN |
+                                          FILE_ATTRIBUTE_SYSTEM);
+                }
+            };
+            hideRecoveryMetadata(recoveryManifest);
+            hideRecoveryMetadata(recoveryManifest.wstring() + L".bak");
         }
         return localSaved;
     }
@@ -21755,6 +21766,14 @@ private:
         if (FilePathExists(sourceRecovery.wstring())) {
             std::filesystem::create_directories(
                 durableRecovery.parent_path(), error);
+            const DWORD toolFolderAttributes = GetFileAttributesW(
+                durableRecovery.parent_path().c_str());
+            if (toolFolderAttributes != INVALID_FILE_ATTRIBUTES) {
+                (void)SetFileAttributesW(
+                    durableRecovery.parent_path().c_str(),
+                    toolFolderAttributes | FILE_ATTRIBUTE_HIDDEN |
+                        FILE_ATTRIBUTE_SYSTEM);
+            }
             bool recoveryAvailable = false;
             if (!error) {
                 recoveryAvailable = CopyFileW(
