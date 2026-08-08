@@ -1147,6 +1147,13 @@ struct WorkspaceState {
     float dividerPosition = 0.50f;
     bool dividerVisible = true;
     int dividerStyle = 0;
+    // The workspace control strip is a visual preference.  Its center is
+    // stored in logical client-space ratios so it remains usable after DPI or
+    // work-area changes.  Orientation 0 is horizontal, 1 is vertical.
+    bool workspaceChromePositionValid = false;
+    float workspaceChromeXRatio = 0.75f;
+    float workspaceChromeYRatio = 0.04f;
+    int workspaceChromeOrientation = 0;
     bool settingsWindowPositionValid = false;
     float settingsWindowXRatio = 0.5f;
     float settingsWindowYRatio = 0.5f;
@@ -2296,6 +2303,14 @@ std::string SerializeState(const WorkspaceState& state) {
            << ", \"divider_visible\": "
            << (state.dividerVisible ? "true" : "false")
            << ", \"divider_style\": " << state.dividerStyle
+           << ", \"workspace_chrome_position_valid\": "
+           << (state.workspaceChromePositionValid ? "true" : "false")
+           << ", \"workspace_chrome_x_ratio\": "
+           << state.workspaceChromeXRatio
+           << ", \"workspace_chrome_y_ratio\": "
+           << state.workspaceChromeYRatio
+           << ", \"workspace_chrome_orientation\": "
+           << state.workspaceChromeOrientation
            << ", \"settings_window_position_valid\": "
            << (state.settingsWindowPositionValid ? "true" : "false")
            << ", \"settings_window_x_ratio\": "
@@ -2741,6 +2756,18 @@ bool DeserializeState(const std::string& json, WorkspaceState& state) {
             loaded.dividerVisible = BoolMember(*settings, "divider_visible", true);
             loaded.dividerStyle = std::clamp(static_cast<int>(
                 NumberMember(*settings, "divider_style", 0.0)), 0, 1);
+            loaded.workspaceChromePositionValid = BoolMember(
+                *settings, "workspace_chrome_position_valid", false);
+            loaded.workspaceChromeXRatio = std::clamp(static_cast<float>(
+                NumberMember(*settings, "workspace_chrome_x_ratio", 0.75)),
+                0.0f, 1.0f);
+            loaded.workspaceChromeYRatio = std::clamp(static_cast<float>(
+                NumberMember(*settings, "workspace_chrome_y_ratio", 0.04)),
+                0.0f, 1.0f);
+            loaded.workspaceChromeOrientation = std::clamp(
+                static_cast<int>(NumberMember(
+                    *settings, "workspace_chrome_orientation", 0.0)),
+                0, 1);
             loaded.settingsWindowPositionValid = BoolMember(
                 *settings, "settings_window_position_valid", false);
             loaded.settingsWindowXRatio = std::clamp(static_cast<float>(
@@ -9558,14 +9585,11 @@ private:
                 }
             }
 
-            for (int index = 0;
-                 index < kWorkspaceControlCount;
-                 ++index) {
-                AddInteractionShape(
-                    shapes,
-                    WorkspaceControlRectangle(client, index),
-                    2.0f);
-            }
+            // The whole strip is interactive so users can drag it by any
+            // non-button area; individual buttons still retain their normal
+            // hit targets.
+            AddInteractionShape(
+                shapes, WorkspaceChromeGroupRectangle(client), 2.0f);
             if (CoreDistanceSliderOpen()) {
                 AddInteractionShape(
                     shapes,
@@ -9791,7 +9815,12 @@ private:
                                  D2D1_DRAW_TEXT_OPTIONS_CLIP);
     }
 
-    D2D1_RECT_F WorkspaceControlRectangle(const D2D1_SIZE_F& client, int index) const {
+    bool WorkspaceChromeIsVertical() const {
+        return state_.workspaceChromeOrientation == 1;
+    }
+
+    D2D1_RECT_F WorkspaceChromeGroupRectangle(
+        const D2D1_SIZE_F& client) const {
         static constexpr std::array<float, kWorkspaceControlCount> regularWidths{
             102.0f, 66.0f, 104.0f, 68.0f,
             92.0f, 112.0f, 52.0f};
@@ -9803,16 +9832,56 @@ private:
                 ? compactWidths
                 : regularWidths;
         constexpr float gap = 2.0f;
-        const int safeIndex =
-            std::clamp(index, 0, kWorkspaceControlCount - 1);
-        float right = client.width - 10.0f;
-        for (int current = kWorkspaceControlCount - 1;
-             current > safeIndex;
-             --current) {
-            right -= widths[current] + gap;
+        float horizontalWidth = 10.0f + gap * (kWorkspaceControlCount - 1);
+        for (const float width : widths) {
+            horizontalWidth += width;
         }
-        return D2D1::RectF(
-            right - widths[safeIndex], 9.0f, right, 41.0f);
+        const bool vertical = WorkspaceChromeIsVertical();
+        const float groupWidth = vertical
+            ? (client.width < 680.0f ? 76.0f : 132.0f)
+            : horizontalWidth;
+        const float groupHeight = vertical
+            ? 6.0f + kWorkspaceControlCount * 32.0f +
+                  (kWorkspaceControlCount - 1) * gap + 6.0f
+            : 38.0f;
+        if (!state_.workspaceChromePositionValid) {
+            return D2D1::RectF(
+                std::max(6.0f, client.width - groupWidth - 10.0f),
+                6.0f,
+                std::max(6.0f, client.width - 10.0f),
+                6.0f + groupHeight);
+        }
+        const float left = std::clamp(
+            client.width * state_.workspaceChromeXRatio - groupWidth * 0.5f,
+            6.0f, std::max(6.0f, client.width - groupWidth - 6.0f));
+        const float top = std::clamp(
+            client.height * state_.workspaceChromeYRatio - groupHeight * 0.5f,
+            6.0f, std::max(6.0f, client.height - groupHeight - 6.0f));
+        return D2D1::RectF(left, top, left + groupWidth, top + groupHeight);
+    }
+
+    D2D1_RECT_F WorkspaceControlRectangle(const D2D1_SIZE_F& client, int index) const {
+        static constexpr std::array<float, kWorkspaceControlCount> regularWidths{
+            102.0f, 66.0f, 104.0f, 68.0f,
+            92.0f, 112.0f, 52.0f};
+        static constexpr std::array<float, kWorkspaceControlCount> compactWidths{
+            46.0f, 54.0f, 58.0f, 54.0f,
+            54.0f, 62.0f, 46.0f};
+        const auto& widths = client.width < 680.0f ? compactWidths : regularWidths;
+        constexpr float gap = 2.0f;
+        const int safeIndex = std::clamp(index, 0, kWorkspaceControlCount - 1);
+        const D2D1_RECT_F group = WorkspaceChromeGroupRectangle(client);
+        if (WorkspaceChromeIsVertical()) {
+            const float top = group.top + 3.0f + safeIndex * (32.0f + gap);
+            return D2D1::RectF(group.left + 4.0f, top,
+                                group.right - 4.0f, top + 32.0f);
+        }
+        float left = group.left + 5.0f;
+        for (int current = 0; current < safeIndex; ++current) {
+            left += widths[current] + gap;
+        }
+        return D2D1::RectF(left, group.top + 3.0f,
+                            left + widths[safeIndex], group.bottom - 3.0f);
     }
 
     void DrawWorkspaceChrome(const D2D1_SIZE_F& client) {
@@ -9825,30 +9894,28 @@ private:
         const D2D1_POINT_2F cursor =
             PixelToDip(cursorPixels.x, cursorPixels.y);
 
-        const D2D1_RECT_F first =
-            WorkspaceControlRectangle(client, 0);
-        const D2D1_RECT_F last =
-            WorkspaceControlRectangle(
-                client, kWorkspaceControlCount - 1);
-        const D2D1_RECT_F group = D2D1::RectF(
-            first.left - 5.0f, 6.0f,
-            last.right + 5.0f, 44.0f);
+        const D2D1_RECT_F group = WorkspaceChromeGroupRectangle(client);
+        const bool stripHovered = PointInside(cursor, group);
+        const bool stripActive = stripHovered || draggingWorkspaceChrome_;
+        const float stripAlpha = draggingWorkspaceChrome_
+            ? 0.98f : (stripHovered ? 0.92f : 0.52f);
         const D2D1_RECT_F shadow = D2D1::RectF(
             group.left + 2.0f, group.top + 3.0f,
             group.right + 2.0f, group.bottom + 3.0f);
         brush_->SetColor(D2D1::ColorF(
-            0x000000, dark ? 0.20f : 0.10f));
+            0x000000, stripActive ? (dark ? 0.20f : 0.10f) : 0.04f));
         renderTarget_->FillRoundedRectangle(
             D2D1::RoundedRect(shadow, 9.0f, 9.0f),
             brush_.Get());
         brush_->SetColor(D2D1::ColorF(
             dark ? 0x242424 : 0xF7F7F7,
-            0.88f));
+            stripAlpha));
         renderTarget_->FillRoundedRectangle(
             D2D1::RoundedRect(group, 8.0f, 8.0f),
             brush_.Get());
         brush_->SetColor(D2D1::ColorF(
-            dark ? 0x666666 : 0xB6B6B6, 0.50f));
+            dark ? 0x666666 : 0xB6B6B6,
+            stripActive ? 0.50f : 0.28f));
         renderTarget_->DrawRoundedRectangle(
             D2D1::RoundedRect(group, 8.0f, 8.0f),
             brush_.Get(), 1.0f);
@@ -9883,7 +9950,7 @@ private:
                     D2D1::RoundedRect(button, 5.0f, 5.0f),
                     brush_.Get());
             }
-            if (index == 4 || index == 6) {
+            if (!WorkspaceChromeIsVertical() && (index == 4 || index == 6)) {
                 brush_->SetColor(D2D1::ColorF(
                     dark ? 0x666666 : 0xB6B6B6, 0.46f));
                 renderTarget_->DrawLine(
@@ -9897,7 +9964,7 @@ private:
                     : (index == 0
                            ? (dark ? 0xFFFFFF : 0x155A8A)
                            : (dark ? 0xF5F5F5 : 0x242424)),
-                disabled ? 0.38f : 0.98f));
+                disabled ? 0.38f : (stripActive ? 0.98f : 0.62f)));
             renderTarget_->DrawTextW(labels[index], static_cast<UINT32>(wcslen(labels[index])),
                                      hudFormat_.Get(), button, brush_.Get(),
                                      D2D1_DRAW_TEXT_OPTIONS_CLIP);
@@ -12241,39 +12308,125 @@ private:
         Invalidate();
     }
 
-    bool HandleWorkspaceChromePointer(D2D1_POINT_2F point) {
+    int WorkspaceControlIndexAt(D2D1_POINT_2F point) const {
         const D2D1_SIZE_F client = ClientDipSize();
-        if (PointInside(point, WorkspaceControlRectangle(client, 0))) {
-            BeginCorePlacementMode();
-            return true;
+        for (int index = 0; index < kWorkspaceControlCount; ++index) {
+            if (PointInside(point, WorkspaceControlRectangle(client, index))) {
+                return index;
+            }
         }
-        if (PointInside(point, WorkspaceControlRectangle(client, 1))) {
+        return -1;
+    }
+
+    void ActivateWorkspaceControl(int index) {
+        switch (index) {
+        case 0:
+            BeginCorePlacementMode();
+            break;
+        case 1:
             if (!undoStack_.empty()) {
                 Undo();
             }
-            return true;
-        }
-        if (PointInside(point, WorkspaceControlRectangle(client, 2))) {
+            break;
+        case 2:
             ShowGlobalArrangeMenu();
-            return true;
-        }
-        if (PointInside(point, WorkspaceControlRectangle(client, 3))) {
+            break;
+        case 3:
             ShowSettingsWindow();
-            return true;
-        }
-        if (PointInside(point, WorkspaceControlRectangle(client, 4))) {
+            break;
+        case 4:
             SetWorkspaceVisible(false);
-            return true;
-        }
-        if (PointInside(point, WorkspaceControlRectangle(client, 5))) {
+            break;
+        case 5:
             ToggleFullScreenWorkMode();
-            return true;
-        }
-        if (PointInside(point, WorkspaceControlRectangle(client, 6))) {
+            break;
+        case 6:
             RequestExit();
-            return true;
+            break;
+        default:
+            break;
         }
-        return false;
+    }
+
+    bool HandleWorkspaceChromePointer(D2D1_POINT_2F point) {
+        const int index = WorkspaceControlIndexAt(point);
+        if (index < 0) return false;
+        ActivateWorkspaceControl(index);
+        return true;
+    }
+
+    bool BeginWorkspaceChromePointer(D2D1_POINT_2F point) {
+        const D2D1_RECT_F group =
+            WorkspaceChromeGroupRectangle(ClientDipSize());
+        if (!PointInside(point, group)) return false;
+        workspaceChromePointerPending_ = true;
+        workspaceChromePendingButton_ = WorkspaceControlIndexAt(point);
+        workspaceChromePointerStartDip_ = point;
+        workspaceChromeDragOffsetDip_ = D2D1::Point2F(
+            point.x - group.left, point.y - group.top);
+        workspaceChromeDragStartPositionValid_ =
+            state_.workspaceChromePositionValid;
+        workspaceChromeDragStartXRatio_ = state_.workspaceChromeXRatio;
+        workspaceChromeDragStartYRatio_ = state_.workspaceChromeYRatio;
+        workspaceChromeDragStartOrientation_ =
+            state_.workspaceChromeOrientation;
+        SetCapture(window_);
+        return true;
+    }
+
+    void UpdateWorkspaceChromePosition(D2D1_POINT_2F point) {
+        const D2D1_SIZE_F client = ClientDipSize();
+        const D2D1_RECT_F group = WorkspaceChromeGroupRectangle(client);
+        const float left = std::clamp(
+            point.x - workspaceChromeDragOffsetDip_.x,
+            6.0f, std::max(6.0f, client.width - (group.right - group.left) - 6.0f));
+        const float top = std::clamp(
+            point.y - workspaceChromeDragOffsetDip_.y,
+            6.0f, std::max(6.0f, client.height - (group.bottom - group.top) - 6.0f));
+        state_.workspaceChromePositionValid = true;
+        state_.workspaceChromeXRatio = std::clamp(
+            (left + (group.right - group.left) * 0.5f) /
+                std::max(1.0f, client.width),
+            0.0f, 1.0f);
+        state_.workspaceChromeYRatio = std::clamp(
+            (top + (group.bottom - group.top) * 0.5f) /
+                std::max(1.0f, client.height),
+            0.0f, 1.0f);
+        Invalidate();
+    }
+
+    void FinishWorkspaceChromeDrag() {
+        if (!draggingWorkspaceChrome_) return;
+        draggingWorkspaceChrome_ = false;
+        const D2D1_SIZE_F client = ClientDipSize();
+        const float x = client.width * state_.workspaceChromeXRatio;
+        const float y = client.height * state_.workspaceChromeYRatio;
+        const float nearestHorizontal = std::min(x, client.width - x);
+        const float nearestVertical = std::min(y, client.height - y);
+        // Left and right edges use the vertical strip; top and bottom use
+        // the original horizontal strip.  A freely placed strip chooses the
+        // orientation of its nearest edge when released.
+        state_.workspaceChromeOrientation =
+            nearestHorizontal < nearestVertical ? 1 : 0;
+        if (GetCapture() == window_) ReleaseCapture();
+        ScheduleSave(false);
+        Invalidate();
+    }
+
+    void CancelWorkspaceChromePointer() {
+        if (!workspaceChromePointerPending_ && !draggingWorkspaceChrome_) {
+            return;
+        }
+        state_.workspaceChromePositionValid =
+            workspaceChromeDragStartPositionValid_;
+        state_.workspaceChromeXRatio = workspaceChromeDragStartXRatio_;
+        state_.workspaceChromeYRatio = workspaceChromeDragStartYRatio_;
+        state_.workspaceChromeOrientation = workspaceChromeDragStartOrientation_;
+        workspaceChromePointerPending_ = false;
+        draggingWorkspaceChrome_ = false;
+        workspaceChromePendingButton_ = -1;
+        if (GetCapture() == window_) ReleaseCapture();
+        Invalidate();
     }
 
     bool DividerEnabled() const {
@@ -16871,6 +17024,9 @@ private:
             Undo();
             return;
         }
+        if (BeginWorkspaceChromePointer(dip)) {
+            return;
+        }
         if (corePlacementMode_) {
             for (int index = 0;
                  index < kWorkspaceControlCount;
@@ -17022,6 +17178,23 @@ private:
     }
 
     void OnLeftButtonUp(int x, int y) {
+        if (workspaceChromePointerPending_ || draggingWorkspaceChrome_) {
+            const int pendingButton = workspaceChromePendingButton_;
+            const bool dragged = draggingWorkspaceChrome_;
+            workspaceChromePointerPending_ = false;
+            workspaceChromePendingButton_ = -1;
+            if (dragged) {
+                UpdateWorkspaceChromePosition(PixelToDip(x, y));
+                FinishWorkspaceChromeDrag();
+            } else {
+                if (GetCapture() == window_) ReleaseCapture();
+                if (pendingButton >= 0) {
+                    ActivateWorkspaceControl(pendingButton);
+                }
+                Invalidate();
+            }
+            return;
+        }
         if (draggingCoreAppearancePanel_) {
             draggingCoreAppearancePanel_ = false;
             if (GetCapture() == window_) ReleaseCapture();
@@ -17301,6 +17474,20 @@ private:
 
     void OnDoubleClick(int x, int y) {
         const D2D1_POINT_2F dip = PixelToDip(x, y);
+        if (workspaceChromePointerPending_) {
+            if (DistanceSquared(dip, workspaceChromePointerStartDip_) > 9.0f) {
+                workspaceChromePointerPending_ = false;
+                draggingWorkspaceChrome_ = true;
+            }
+            if (draggingWorkspaceChrome_) {
+                UpdateWorkspaceChromePosition(dip);
+            }
+            return;
+        }
+        if (draggingWorkspaceChrome_) {
+            UpdateWorkspaceChromePosition(dip);
+            return;
+        }
         if (corePlacementMode_) {
             return;
         }
@@ -17583,6 +17770,9 @@ private:
     }
 
     void CancelPointerOperation() {
+        if (workspaceChromePointerPending_ || draggingWorkspaceChrome_) {
+            CancelWorkspaceChromePointer();
+        }
         if (draggingCoreAppearancePanel_ &&
             GetCapture() == window_) {
             ReleaseCapture();
@@ -23202,6 +23392,8 @@ private:
     bool draggingCore_ = false;
     bool draggingItem_ = false;
     bool draggingDivider_ = false;
+    bool workspaceChromePointerPending_ = false;
+    bool draggingWorkspaceChrome_ = false;
     bool coreDistanceSliderActive_ = false;
     bool draggingCoreDistancePanel_ = false;
     bool draggingCoreDistanceSlider_ = false;
@@ -23224,6 +23416,11 @@ private:
     std::uint64_t dragTargetCoreId_ = 0;
     float dividerDragStartRatio_ = 0.50f;
     int dividerDragPointerOffsetPixels_ = 0;
+    int workspaceChromePendingButton_ = -1;
+    bool workspaceChromeDragStartPositionValid_ = false;
+    float workspaceChromeDragStartXRatio_ = 0.75f;
+    float workspaceChromeDragStartYRatio_ = 0.04f;
+    int workspaceChromeDragStartOrientation_ = 0;
     std::uint64_t externalDropCoreId_ = 0;
     std::uint64_t externalDropItemId_ = 0;
     std::uint64_t relationTargetItemId_ = 0;
@@ -23231,6 +23428,8 @@ private:
     std::chrono::steady_clock::time_point relationHoverStarted_ =
         std::chrono::steady_clock::now();
     D2D1_POINT_2F pointerStartDip_ = D2D1::Point2F();
+    D2D1_POINT_2F workspaceChromePointerStartDip_ = D2D1::Point2F();
+    D2D1_POINT_2F workspaceChromeDragOffsetDip_ = D2D1::Point2F();
     D2D1_POINT_2F pointerStartWorld_ = D2D1::Point2F();
     D2D1_POINT_2F coreStartPosition_ = D2D1::Point2F();
     D2D1_POINT_2F panStartOffset_ = D2D1::Point2F();
