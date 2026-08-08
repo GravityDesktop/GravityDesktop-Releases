@@ -9846,8 +9846,8 @@ private:
             ? (client.width < 680.0f ? 108.0f : 164.0f)
             : horizontalWidth;
         const float groupHeight = vertical
-            ? 40.0f + kWorkspaceControlCount * 32.0f +
-                  (kWorkspaceControlCount - 1) * gap + 6.0f
+            ? 40.0f + (kWorkspaceControlCount - 1) * 32.0f +
+                  (kWorkspaceControlCount - 2) * gap + 6.0f
             : 38.0f;
         if (!state_.workspaceChromePositionValid) {
             return D2D1::RectF(
@@ -9869,11 +9869,9 @@ private:
         const D2D1_SIZE_F& client) const {
         const D2D1_RECT_F group = WorkspaceChromeGroupRectangle(client);
         if (WorkspaceChromeIsVertical()) {
-            const float left =
-                group.left + (group.right - group.left - 24.0f) * 0.5f;
             return D2D1::RectF(
-                left, group.top + 5.0f,
-                left + 24.0f, group.top + 29.0f);
+                group.left + 5.0f, group.top + 5.0f,
+                group.left + 29.0f, group.top + 29.0f);
         }
         return D2D1::RectF(
             group.left + 5.0f,
@@ -9894,7 +9892,13 @@ private:
         const int safeIndex = std::clamp(index, 0, kWorkspaceControlCount - 1);
         const D2D1_RECT_F group = WorkspaceChromeGroupRectangle(client);
         if (WorkspaceChromeIsVertical()) {
-            const float top = group.top + 35.0f + safeIndex * (32.0f + gap);
+            if (safeIndex == 0) {
+                return D2D1::RectF(
+                    group.right - 36.0f, group.top + 3.0f,
+                    group.right - 4.0f, group.top + 35.0f);
+            }
+            const float top = group.top + 40.0f +
+                (safeIndex - 1) * (32.0f + gap);
             return D2D1::RectF(group.left + 4.0f, top,
                                 group.right - 4.0f, top + 32.0f);
         }
@@ -9993,8 +9997,7 @@ private:
         const bool stripHovered = workspaceChromeHovered_ ||
             PointInside(cursor, group);
         const bool stripActive = stripHovered || draggingWorkspaceChrome_;
-        const float stripAlpha = draggingWorkspaceChrome_
-            ? 0.98f : (stripHovered ? 0.92f : 0.52f);
+        constexpr float stripAlpha = 1.0f;
         const D2D1_RECT_F shadow = D2D1::RectF(
             group.left + 2.0f, group.top + 3.0f,
             group.right + 2.0f, group.bottom + 3.0f);
@@ -10010,8 +10013,7 @@ private:
             D2D1::RoundedRect(group, 8.0f, 8.0f),
             brush_.Get());
         brush_->SetColor(D2D1::ColorF(
-            dark ? 0x666666 : 0xB6B6B6,
-            stripActive ? 0.50f : 0.28f));
+            dark ? 0x666666 : 0xB6B6B6, 0.58f));
         renderTarget_->DrawRoundedRectangle(
             D2D1::RoundedRect(group, 8.0f, 8.0f),
             brush_.Get(), 1.0f);
@@ -10082,7 +10084,7 @@ private:
                     : (index == 1 || (index == 0 && state_.workspaceChromePinned)
                            ? (dark ? 0xFFFFFF : 0x155A8A)
                            : (dark ? 0xF5F5F5 : 0x242424)),
-                disabled ? 0.38f : (stripActive ? 0.98f : 0.62f)));
+                disabled ? 0.38f : 0.98f));
             if (index == 0) {
                 // A compact pushpin rather than a text label: its filled
                 // background is the selected/fixed state.
