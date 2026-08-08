@@ -19225,19 +19225,6 @@ private:
         }
         std::vector<FileItem> movedFiles =
             std::move(mutableSource->files);
-        std::vector<std::uint64_t> movedRootIds;
-        movedRootIds.reserve(movedFiles.size());
-        for (FileItem& item : movedFiles) {
-            if (!item.detachedFromUpper && item.parentFileId == 0) {
-                movedRootIds.push_back(item.id);
-                item.slot = -1;
-                item.ring = -1;
-                item.ringSlot = -1;
-                item.manualOffset = D2D1::Point2F();
-                item.manuallyMoved = false;
-                item.lockedPosition = false;
-            }
-        }
         for (FileFamily& family : state_.families) {
             if (family.coreId == id) {
                 family.coreId = kUnclassifiedCoreId;
@@ -19271,21 +19258,38 @@ private:
             target->layoutTemplate =
                 LayoutTemplate::HighCapacityDouble;
         }
+        // Dissolving a core must not silently turn into an automatic arrange.
+        // Keep every moved file's saved slot, angle, radius and manual offset.
+        // Only a genuine slot conflict with an existing unclassified root is
+        // assigned a new safe slot; attached descendants keep their local
+        // relationship geometry unchanged.
+        std::set<int> occupiedSlots;
+        for (const FileItem& existing : target->files) {
+            if (!existing.detachedFromUpper &&
+                existing.parentFileId == 0 && existing.slot >= 0) {
+                occupiedSlots.insert(existing.slot);
+            }
+        }
         for (FileItem& item : movedFiles) {
             if (!item.detachedFromUpper && item.parentFileId == 0) {
-                AssignNewItemLayout(*target, item);
-            } else {
-                item.slot = -1;
-                item.ring = -1;
-                item.ringSlot = -1;
+                if (item.slot < 0 || occupiedSlots.contains(item.slot)) {
+                    item.slot = -1;
+                    item.ring = -1;
+                    item.ringSlot = -1;
+                    AssignNewItemLayout(*target, item);
+                }
+                if (item.slot >= 0) {
+                    occupiedSlots.insert(item.slot);
+                }
             }
             target->files.push_back(std::move(item));
         }
-        for (const std::uint64_t rootId : movedRootIds) {
-            ArrangeAttachedSubtreeOutward(*target, rootId);
-        }
         target->expanded = true;
-        SetSelection({HitKind::Core, kUnclassifiedCoreId, 0}, true);
+        // Do not select the system fallback core after the source disappears.
+        // Selecting it made the next context menu appear to belong to the
+        // dissolved core while correctly hiding lifecycle commands for the
+        // non-dissolvable "未分类" core.
+        ClearSelection();
         layoutDirty_ = true;
         PushUndo(std::move(before));
         ScheduleSave();
