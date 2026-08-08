@@ -12587,21 +12587,42 @@ private:
         // Decide from the actual release point.  Using the old-orientation
         // rectangle first required a second drag before a side drop became
         // vertical (or a top/bottom drop became horizontal).
-        const D2D1_POINT_2F release = workspaceChromeDragLastDip_;
-        const std::array<float, 4> distances{
+        D2D1_POINT_2F release = workspaceChromeDragLastDip_;
+        POINT releasePixels{};
+        if (window_ != nullptr && IsWindow(window_) != FALSE &&
+            GetCursorPos(&releasePixels) != FALSE &&
+            ScreenToClient(window_, &releasePixels) != FALSE) {
+            release = PixelToDip(releasePixels.x, releasePixels.y);
+        }
+        const std::array<float, 4> pointerDistances{
             release.y,
             client.width - release.x,
             client.height - release.y,
             release.x};
-        const int edge = static_cast<int>(std::distance(
-            distances.begin(),
-            std::min_element(distances.begin(), distances.end())));
+        const D2D1_RECT_F before = WorkspaceChromeGroupRectangle(client);
+        const std::array<float, 4> groupDistances{
+            before.top,
+            client.width - before.right,
+            client.height - before.bottom,
+            before.left};
+        int edge = static_cast<int>(std::distance(
+            pointerDistances.begin(),
+            std::min_element(
+                pointerDistances.begin(), pointerDistances.end())));
         constexpr float kEdgeSnapDistance = 52.0f;
-        if (distances[edge] <= kEdgeSnapDistance) {
+        constexpr float kEdgeContactDistance = 14.0f;
+        const int contactedEdge = static_cast<int>(std::distance(
+            groupDistances.begin(),
+            std::min_element(groupDistances.begin(), groupDistances.end())));
+        const bool stripTouchesEdge =
+            groupDistances[contactedEdge] <= kEdgeContactDistance;
+        if (stripTouchesEdge) {
+            edge = contactedEdge;
+        }
+        if (stripTouchesEdge || pointerDistances[edge] <= kEdgeSnapDistance) {
             // Keep the pointer attached to the same relative point on the
             // strip.  The old code used the release point as the strip
             // centre, which made a handle drag jump the whole strip left.
-            const D2D1_RECT_F before = WorkspaceChromeGroupRectangle(client);
             const float beforeWidth = std::max(1.0f, before.right - before.left);
             const float beforeHeight = std::max(1.0f, before.bottom - before.top);
             const float anchorX = std::clamp(
