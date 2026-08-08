@@ -4415,6 +4415,12 @@ public:
             if (dividerHandleWindow_ == source) {
                 AppendRuntimeDiagnostic("divider_window_destroyed");
                 DestroyDividerTooltip();
+                dividerHandleMouseTracking_ = false;
+                if (draggingDivider_) {
+                    CancelDividerDrag();
+                } else {
+                    dividerHovered_ = false;
+                }
                 dividerHandleWindow_ = nullptr;
             }
             SetWindowLongPtrW(source, GWLP_USERDATA, 0);
@@ -22085,6 +22091,9 @@ private:
         if (!DividerEnabled() || state_.workspacePaused ||
             !workspaceVisible_ || window_ == nullptr ||
             IsWindow(window_) == FALSE) {
+            dividerHandleMouseTracking_ = false;
+            dividerHovered_ = false;
+            HideDividerTooltip();
             ShowWindow(dividerHandleWindow_, SW_HIDE);
             return;
         }
@@ -22137,6 +22146,12 @@ private:
         DestroyDividerTooltip();
         if (dividerHandleWindow_ == nullptr) {
             return;
+        }
+        dividerHandleMouseTracking_ = false;
+        if (draggingDivider_) {
+            CancelDividerDrag();
+        } else {
+            dividerHovered_ = false;
         }
         HWND handle = dividerHandleWindow_;
         dividerHandleWindow_ = nullptr;
