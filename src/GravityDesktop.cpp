@@ -9837,13 +9837,13 @@ private:
                 ? compactWidths
                 : regularWidths;
         constexpr float gap = 2.0f;
-        float horizontalWidth = 20.0f + gap * (kWorkspaceControlCount - 1);
+        float horizontalWidth = 40.0f + gap * (kWorkspaceControlCount - 1);
         for (const float width : widths) {
             horizontalWidth += width;
         }
         const bool vertical = WorkspaceChromeIsVertical();
         const float groupWidth = vertical
-            ? (client.width < 680.0f ? 88.0f : 144.0f)
+            ? (client.width < 680.0f ? 108.0f : 164.0f)
             : horizontalWidth;
         const float groupHeight = vertical
             ? 6.0f + kWorkspaceControlCount * 32.0f +
@@ -9869,8 +9869,10 @@ private:
         const D2D1_SIZE_F& client) const {
         const D2D1_RECT_F group = WorkspaceChromeGroupRectangle(client);
         return D2D1::RectF(
-            group.left + 3.0f, group.top + 3.0f,
-            group.left + 13.0f, group.bottom - 3.0f);
+            group.left + 5.0f,
+            group.top + (group.bottom - group.top - 24.0f) * 0.5f,
+            group.left + 29.0f,
+            group.top + (group.bottom - group.top + 24.0f) * 0.5f);
     }
 
     D2D1_RECT_F WorkspaceControlRectangle(const D2D1_SIZE_F& client, int index) const {
@@ -9886,10 +9888,10 @@ private:
         const D2D1_RECT_F group = WorkspaceChromeGroupRectangle(client);
         if (WorkspaceChromeIsVertical()) {
             const float top = group.top + 3.0f + safeIndex * (32.0f + gap);
-            return D2D1::RectF(group.left + 16.0f, top,
+            return D2D1::RectF(group.left + 36.0f, top,
                                 group.right - 4.0f, top + 32.0f);
         }
-        float left = group.left + 16.0f;
+        float left = group.left + 36.0f;
         for (int current = 0; current < safeIndex; ++current) {
             left += widths[current] + gap;
         }
@@ -9944,9 +9946,21 @@ private:
 
     D2D1_RECT_F WorkspaceChromeInteractionRectangle(
         const D2D1_SIZE_F& client) const {
-        return WorkspaceChromeCollapsed(client)
-            ? WorkspaceChromeRevealRectangle(client)
-            : WorkspaceChromeGroupRectangle(client);
+        const D2D1_RECT_F group = WorkspaceChromeGroupRectangle(client);
+        if (state_.workspaceChromePinned ||
+            (!WorkspaceChromeCollapsed(client) && !workspaceChromeHovered_ &&
+             !draggingWorkspaceChrome_ && !workspaceChromePointerPending_)) {
+            return group;
+        }
+        const D2D1_RECT_F reveal = WorkspaceChromeRevealRectangle(client);
+        // This bounding bridge is deliberate.  Without it the pointer enters
+        // the reveal line, the strip expands away from the pointer, then the
+        // leave handler immediately collapses it again.
+        return D2D1::RectF(
+            std::min(group.left, reveal.left),
+            std::min(group.top, reveal.top),
+            std::max(group.right, reveal.right),
+            std::max(group.bottom, reveal.bottom));
     }
 
     void DrawWorkspaceChrome(const D2D1_SIZE_F& client) {
@@ -10062,9 +10076,35 @@ private:
                            ? (dark ? 0xFFFFFF : 0x155A8A)
                            : (dark ? 0xF5F5F5 : 0x242424)),
                 disabled ? 0.38f : (stripActive ? 0.98f : 0.62f)));
-            renderTarget_->DrawTextW(labels[index], static_cast<UINT32>(wcslen(labels[index])),
-                                     hudFormat_.Get(), button, brush_.Get(),
-                                     D2D1_DRAW_TEXT_OPTIONS_CLIP);
+            if (index == 0) {
+                // A compact pushpin rather than a text label: its filled
+                // background is the selected/fixed state.
+                const float cx = (button.left + button.right) * 0.5f;
+                const float cy = (button.top + button.bottom) * 0.5f;
+                renderTarget_->FillRoundedRectangle(
+                    D2D1::RoundedRect(
+                        D2D1::RectF(cx - 6.5f, cy - 7.0f,
+                                     cx + 6.5f, cy - 3.0f),
+                        1.5f, 1.5f),
+                    brush_.Get());
+                renderTarget_->FillRectangle(
+                    D2D1::RectF(cx - 3.0f, cy - 3.0f,
+                                 cx + 3.0f, cy + 3.5f),
+                    brush_.Get());
+                renderTarget_->DrawLine(
+                    D2D1::Point2F(cx - 6.5f, cy + 3.5f),
+                    D2D1::Point2F(cx + 6.5f, cy + 3.5f),
+                    brush_.Get(), 1.4f);
+                renderTarget_->DrawLine(
+                    D2D1::Point2F(cx, cy + 3.5f),
+                    D2D1::Point2F(cx, cy + 8.5f),
+                    brush_.Get(), 1.4f);
+            } else {
+                renderTarget_->DrawTextW(
+                    labels[index], static_cast<UINT32>(wcslen(labels[index])),
+                    hudFormat_.Get(), button, brush_.Get(),
+                    D2D1_DRAW_TEXT_OPTIONS_CLIP);
+            }
         }
     }
 
