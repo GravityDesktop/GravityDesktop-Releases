@@ -5267,6 +5267,11 @@ private:
                 kDesktopReconnectTimer);
             desktopReconnectPending_ = false;
             desktopReconnectAttempts_ = 0;
+            // Reconnect could not establish a coherent desktop surface. Do
+            // not leave a visible divider or invisible input island behind:
+            // fail open to the normal Windows desktop and retain only the tray
+            // recovery path.
+            RequestDesktopFailOpen("desktop_reconnect_exhausted");
         }
     }
 
