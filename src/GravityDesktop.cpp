@@ -5685,7 +5685,12 @@ private:
 
     void AttachToDesktopCompanionLayer() {
         if (window_ == nullptr) return;
-        HWND desktopHost = DesktopHostReady(desktopHost_)
+        // Once attached, retain the same Explorer host for its lifetime.
+        // During Win+D Explorer can briefly move SHELLDLL_DefView between
+        // Progman and WorkerW even though both windows remain alive. Treating
+        // that transient move as a failed host causes repeated SetParent
+        // calls, which makes the companion surface blink or disappear.
+        HWND desktopHost = DesktopHostStillUsable(desktopHost_)
             ? desktopHost_
             : FindDesktopViewHost();
         if (desktopHost == nullptr) return;
@@ -5749,6 +5754,23 @@ private:
                    L"SHELLDLL_DefView", nullptr) != nullptr;
     }
 
+    bool DesktopHostStillUsable(HWND desktopHost) const {
+        if (desktopHost == nullptr || IsWindow(desktopHost) == FALSE) {
+            return false;
+        }
+        // Explorer replacement is the only case in which a still-existing
+        // desktop host must be discarded.  A temporary DefView reparenting
+        // inside the same Explorer process is not a replacement.
+        const HWND shellWindow = GetShellWindow();
+        DWORD shellProcessId = 0;
+        DWORD hostProcessId = 0;
+        if (shellWindow != nullptr) {
+            GetWindowThreadProcessId(shellWindow, &shellProcessId);
+        }
+        GetWindowThreadProcessId(desktopHost, &hostProcessId);
+        return shellProcessId == 0 || hostProcessId == shellProcessId;
+    }
+
     bool DesktopSurfacesHealthy() const {
         if (window_ == nullptr ||
             interactionWindow_ == nullptr ||
@@ -5773,7 +5795,7 @@ private:
         // Explorer can expose a transient second candidate during a shell
         // transition; changing parent merely because enumeration order changed
         // is destabilizing and can orphan the visible surface.
-        if (!DesktopHostReady(desktopHost_)) {
+        if (!DesktopHostStillUsable(desktopHost_)) {
             return false;
         }
         const bool dividerAttached =
