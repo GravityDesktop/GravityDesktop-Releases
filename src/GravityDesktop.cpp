@@ -9923,15 +9923,28 @@ private:
             std::min_element(distances.begin(), distances.end())));
     }
 
+    bool WorkspaceChromePointerOverGroup(const D2D1_RECT_F& group) const {
+        if (window_ == nullptr || IsWindow(window_) == FALSE) {
+            return false;
+        }
+        POINT cursor{};
+        if (GetCursorPos(&cursor) == FALSE ||
+            ScreenToClient(window_, &cursor) == FALSE) {
+            return false;
+        }
+        return PointInside(PixelToDip(cursor.x, cursor.y), group);
+    }
+
     bool WorkspaceChromeCollapsed(const D2D1_SIZE_F& client) const {
+        const D2D1_RECT_F group = WorkspaceChromeGroupRectangle(client);
         if (state_.workspaceChromePinned || workspaceChromeHovered_ ||
+            WorkspaceChromePointerOverGroup(group) ||
             draggingWorkspaceChrome_ || workspaceChromePointerPending_ ||
             workspaceChromeMenuOpen_ || corePlacementMode_ ||
             (settingsWindow_ != nullptr &&
              IsWindowVisible(settingsWindow_) != FALSE)) {
             return false;
         }
-        const D2D1_RECT_F group = WorkspaceChromeGroupRectangle(client);
         const float nearest = std::min({
             group.top, group.left,
             client.width - group.right,
@@ -12585,6 +12598,16 @@ private:
             std::min_element(distances.begin(), distances.end())));
         constexpr float kEdgeSnapDistance = 52.0f;
         if (distances[edge] <= kEdgeSnapDistance) {
+            // Keep the pointer attached to the same relative point on the
+            // strip.  The old code used the release point as the strip
+            // centre, which made a handle drag jump the whole strip left.
+            const D2D1_RECT_F before = WorkspaceChromeGroupRectangle(client);
+            const float beforeWidth = std::max(1.0f, before.right - before.left);
+            const float beforeHeight = std::max(1.0f, before.bottom - before.top);
+            const float anchorX = std::clamp(
+                workspaceChromeDragOffsetDip_.x / beforeWidth, 0.0f, 1.0f);
+            const float anchorY = std::clamp(
+                workspaceChromeDragOffsetDip_.y / beforeHeight, 0.0f, 1.0f);
             state_.workspaceChromeOrientation =
                 (edge == 1 || edge == 3) ? 1 : 0;
             const D2D1_RECT_F snapped = WorkspaceChromeGroupRectangle(client);
@@ -12592,10 +12615,12 @@ private:
             const float height = snapped.bottom - snapped.top;
             constexpr float kInset = 6.0f;
             float centerX = std::clamp(
-                release.x, width * 0.5f + kInset,
+                release.x + (0.5f - anchorX) * width,
+                width * 0.5f + kInset,
                 client.width - width * 0.5f - kInset);
             float centerY = std::clamp(
-                release.y, height * 0.5f + kInset,
+                release.y + (0.5f - anchorY) * height,
+                height * 0.5f + kInset,
                 client.height - height * 0.5f - kInset);
             if (edge == 0) centerY = height * 0.5f + kInset;
             if (edge == 1) centerX = client.width - width * 0.5f - kInset;
