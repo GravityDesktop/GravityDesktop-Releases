@@ -3912,6 +3912,14 @@ public:
                 window_ == nullptr ? nullptr : GetParent(window_))
             << " visual_owner=" << handleValue(
                 window_ == nullptr ? nullptr : GetWindow(window_, GW_OWNER))
+            << " input_owner=" << handleValue(
+                interactionWindow_ == nullptr
+                    ? nullptr
+                    : GetWindow(interactionWindow_, GW_OWNER))
+            << " divider_owner=" << handleValue(
+                dividerHandleWindow_ == nullptr
+                    ? nullptr
+                    : GetWindow(dividerHandleWindow_, GW_OWNER))
             << " visual_visible=" <<
                 (window_ != nullptr && IsWindowVisible(window_) != FALSE ? 1 : 0)
             << " input_visible=" <<
