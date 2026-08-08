@@ -8,6 +8,7 @@
 #include <dwrite.h>
 #include <shellapi.h>
 #include <shlobj.h>
+#include <shobjidl.h>
 #include <shlwapi.h>
 #include <wincodec.h>
 #include <wrl/client.h>
@@ -3521,6 +3522,9 @@ public:
             LoadCoreShortLabelOverrides();
         }
         NormalizeStateModel();
+        if (!benchmarkMode_) {
+            EnsureManagedLibraryDesktopShortcut();
+        }
         // Pause is a runtime tray state. An explicit process launch must not
         // show a fully rendered workspace whose input path immediately exits.
         if (!benchmarkMode_) {
@@ -20430,6 +20434,84 @@ private:
             : std::filesystem::path(state_.managedLibraryPath);
     }
 
+    std::optional<std::filesystem::path>
+    ManagedLibraryDesktopShortcutPath() const {
+        const std::optional<std::filesystem::path> desktop =
+            CurrentUserDesktopPath();
+        if (!desktop.has_value()) return std::nullopt;
+        return *desktop / L"引力桌面文件库.lnk";
+    }
+
+    bool HasManagedFiles() const {
+        return std::any_of(
+            state_.cores.begin(), state_.cores.end(),
+            [](const Core& core) {
+                return std::any_of(
+                    core.files.begin(), core.files.end(),
+                    [](const FileItem& item) {
+                        return item.storageMode == FileStorageMode::Managed;
+                    });
+            });
+    }
+
+    void EnsureManagedLibraryDesktopShortcut() {
+        if (!HasManagedFiles()) return;
+        const std::optional<std::filesystem::path> shortcutPath =
+            ManagedLibraryDesktopShortcutPath();
+        if (!shortcutPath.has_value()) {
+            AppendRuntimeDiagnostic("managed_library_shortcut_desktop_unavailable");
+            return;
+        }
+        const std::filesystem::path library = ManagedLibraryPath();
+        std::error_code error;
+        std::filesystem::create_directories(library, error);
+        if (error) {
+            AppendRuntimeDiagnostic("managed_library_shortcut_library_unavailable",
+                                    S_OK,
+                                    static_cast<DWORD>(error.value()));
+            return;
+        }
+        if (std::filesystem::exists(*shortcutPath, error) && !error) {
+            // Never overwrite a file a user may have placed on the desktop.
+            AppendRuntimeDiagnostic("managed_library_shortcut_existing");
+            return;
+        }
+        ComPtr<IShellLinkW> shellLink;
+        HRESULT result = CoCreateInstance(
+            CLSID_ShellLink, nullptr, CLSCTX_INPROC_SERVER,
+            IID_PPV_ARGS(shellLink.ReleaseAndGetAddressOf()));
+        if (FAILED(result)) {
+            AppendRuntimeDiagnostic("managed_library_shortcut_create_failed",
+                                    result);
+            return;
+        }
+        result = shellLink->SetPath(library.c_str());
+        if (SUCCEEDED(result)) {
+            result = shellLink->SetDescription(
+                L"引力桌面托管文件库（程序故障时仍可直接访问）");
+        }
+        if (SUCCEEDED(result)) {
+            wchar_t executable[MAX_PATH]{};
+            if (GetModuleFileNameW(
+                    nullptr, executable,
+                    static_cast<DWORD>(std::size(executable))) > 0) {
+                (void)shellLink->SetIconLocation(executable, 0);
+            }
+        }
+        ComPtr<IPersistFile> persist;
+        if (SUCCEEDED(result)) {
+            result = shellLink.As(&persist);
+        }
+        if (SUCCEEDED(result)) {
+            result = persist->Save(shortcutPath->c_str(), TRUE);
+        }
+        AppendRuntimeDiagnostic(
+            SUCCEEDED(result)
+                ? "managed_library_shortcut_created"
+                : "managed_library_shortcut_save_failed",
+            result);
+    }
+
     std::optional<std::filesystem::path> CurrentUserDesktopPath() const {
         PWSTR desktop = nullptr;
         if (FAILED(SHGetKnownFolderPath(
@@ -20734,6 +20816,15 @@ private:
             return false;
         }
         const std::wstring normalized = NormalizePath(path);
+        if (const std::optional<std::filesystem::path> shortcut =
+                ManagedLibraryDesktopShortcutPath();
+            shortcut.has_value() &&
+            PathEquals(normalized, NormalizePath(shortcut->wstring()))) {
+            if (reason != nullptr) {
+                *reason = L"“引力桌面文件库”是受保护的恢复入口";
+            }
+            return false;
+        }
         const std::wstring parent = NormalizePath(
             std::filesystem::path(normalized).parent_path().wstring());
         if (!PathEquals(parent, NormalizePath(desktop->wstring()))) {
