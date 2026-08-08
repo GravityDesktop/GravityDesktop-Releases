@@ -9841,9 +9841,9 @@ private:
             ? (client.width < 680.0f ? 76.0f : 132.0f)
             : horizontalWidth;
         const float groupHeight = vertical
-            ? 6.0f + kWorkspaceControlCount * 32.0f +
+            ? 14.0f + kWorkspaceControlCount * 32.0f +
                   (kWorkspaceControlCount - 1) * gap + 6.0f
-            : 38.0f;
+            : 48.0f;
         if (!state_.workspaceChromePositionValid) {
             return D2D1::RectF(
                 std::max(6.0f, client.width - groupWidth - 10.0f),
@@ -9860,6 +9860,14 @@ private:
         return D2D1::RectF(left, top, left + groupWidth, top + groupHeight);
     }
 
+    D2D1_RECT_F WorkspaceChromeDragHandleRectangle(
+        const D2D1_SIZE_F& client) const {
+        const D2D1_RECT_F group = WorkspaceChromeGroupRectangle(client);
+        return D2D1::RectF(
+            group.left + 3.0f, group.top + 2.0f,
+            group.right - 3.0f, group.top + 12.0f);
+    }
+
     D2D1_RECT_F WorkspaceControlRectangle(const D2D1_SIZE_F& client, int index) const {
         static constexpr std::array<float, kWorkspaceControlCount> regularWidths{
             102.0f, 66.0f, 104.0f, 68.0f,
@@ -9872,7 +9880,7 @@ private:
         const int safeIndex = std::clamp(index, 0, kWorkspaceControlCount - 1);
         const D2D1_RECT_F group = WorkspaceChromeGroupRectangle(client);
         if (WorkspaceChromeIsVertical()) {
-            const float top = group.top + 3.0f + safeIndex * (32.0f + gap);
+            const float top = group.top + 14.0f + safeIndex * (32.0f + gap);
             return D2D1::RectF(group.left + 4.0f, top,
                                 group.right - 4.0f, top + 32.0f);
         }
@@ -9880,7 +9888,7 @@ private:
         for (int current = 0; current < safeIndex; ++current) {
             left += widths[current] + gap;
         }
-        return D2D1::RectF(left, group.top + 3.0f,
+        return D2D1::RectF(left, group.top + 14.0f,
                             left + widths[safeIndex], group.bottom - 3.0f);
     }
 
@@ -9895,7 +9903,8 @@ private:
             PixelToDip(cursorPixels.x, cursorPixels.y);
 
         const D2D1_RECT_F group = WorkspaceChromeGroupRectangle(client);
-        const bool stripHovered = PointInside(cursor, group);
+        const bool stripHovered = workspaceChromeHovered_ ||
+            PointInside(cursor, group);
         const bool stripActive = stripHovered || draggingWorkspaceChrome_;
         const float stripAlpha = draggingWorkspaceChrome_
             ? 0.98f : (stripHovered ? 0.92f : 0.52f);
@@ -9919,6 +9928,24 @@ private:
         renderTarget_->DrawRoundedRectangle(
             D2D1::RoundedRect(group, 8.0f, 8.0f),
             brush_.Get(), 1.0f);
+        const D2D1_RECT_F dragHandle =
+            WorkspaceChromeDragHandleRectangle(client);
+        brush_->SetColor(D2D1::ColorF(
+            accent, draggingWorkspaceChrome_ ? 0.92f :
+                (stripHovered ? 0.72f : 0.38f)));
+        renderTarget_->FillRoundedRectangle(
+            D2D1::RoundedRect(dragHandle, 4.0f, 4.0f), brush_.Get());
+        brush_->SetColor(D2D1::ColorF(
+            dark ? 0xFFFFFF : 0x16324A,
+            stripHovered ? 0.82f : 0.52f));
+        const float gripCenter = (dragHandle.left + dragHandle.right) * 0.5f;
+        for (int line = -1; line <= 1; ++line) {
+            const float y = dragHandle.top + 3.0f + (line + 1) * 2.0f;
+            renderTarget_->DrawLine(
+                D2D1::Point2F(gripCenter - 10.0f, y),
+                D2D1::Point2F(gripCenter + 10.0f, y),
+                brush_.Get(), 1.0f);
+        }
 
         const bool compact = client.width < 680.0f;
         const std::array<const wchar_t*, kWorkspaceControlCount> labels{
@@ -12356,11 +12383,13 @@ private:
     }
 
     bool BeginWorkspaceChromePointer(D2D1_POINT_2F point) {
-        const D2D1_RECT_F group =
-            WorkspaceChromeGroupRectangle(ClientDipSize());
-        if (!PointInside(point, group)) return false;
+        const D2D1_SIZE_F client = ClientDipSize();
+        const D2D1_RECT_F group = WorkspaceChromeGroupRectangle(client);
+        if (!PointInside(point, WorkspaceChromeDragHandleRectangle(client))) {
+            return false;
+        }
         workspaceChromePointerPending_ = true;
-        workspaceChromePendingButton_ = WorkspaceControlIndexAt(point);
+        workspaceChromePendingButton_ = -1;
         workspaceChromePointerStartDip_ = point;
         workspaceChromeDragOffsetDip_ = D2D1::Point2F(
             point.x - group.left, point.y - group.top);
@@ -17474,20 +17503,6 @@ private:
 
     void OnDoubleClick(int x, int y) {
         const D2D1_POINT_2F dip = PixelToDip(x, y);
-        if (workspaceChromePointerPending_) {
-            if (DistanceSquared(dip, workspaceChromePointerStartDip_) > 9.0f) {
-                workspaceChromePointerPending_ = false;
-                draggingWorkspaceChrome_ = true;
-            }
-            if (draggingWorkspaceChrome_) {
-                UpdateWorkspaceChromePosition(dip);
-            }
-            return;
-        }
-        if (draggingWorkspaceChrome_) {
-            UpdateWorkspaceChromePosition(dip);
-            return;
-        }
         if (corePlacementMode_) {
             return;
         }
@@ -17603,6 +17618,10 @@ private:
 
     void OnPointerLeave(HWND source) {
         CancelPointerLeaveTracking(source);
+        if (workspaceChromeHovered_) {
+            workspaceChromeHovered_ = false;
+            Invalidate();
+        }
         if (!draggingDivider_) {
             const bool wasDividerHovered = dividerHovered_;
             dividerHovered_ = false;
@@ -17647,6 +17666,26 @@ private:
             interactionWindow_ != nullptr ? interactionWindow_ : window_);
 
         const D2D1_POINT_2F dip = PixelToDip(x, y);
+        const bool workspaceChromeHovered = PointInside(
+            dip, WorkspaceChromeGroupRectangle(ClientDipSize()));
+        if (workspaceChromeHovered_ != workspaceChromeHovered) {
+            workspaceChromeHovered_ = workspaceChromeHovered;
+            Invalidate();
+        }
+        if (workspaceChromePointerPending_) {
+            if (DistanceSquared(dip, workspaceChromePointerStartDip_) > 9.0f) {
+                workspaceChromePointerPending_ = false;
+                draggingWorkspaceChrome_ = true;
+            }
+            if (draggingWorkspaceChrome_) {
+                UpdateWorkspaceChromePosition(dip);
+            }
+            return;
+        }
+        if (draggingWorkspaceChrome_) {
+            UpdateWorkspaceChromePosition(dip);
+            return;
+        }
         if (corePlacementMode_) {
             corePlacementPreviewDip_ = dip;
             Invalidate();
@@ -23394,6 +23433,7 @@ private:
     bool draggingDivider_ = false;
     bool workspaceChromePointerPending_ = false;
     bool draggingWorkspaceChrome_ = false;
+    bool workspaceChromeHovered_ = false;
     bool coreDistanceSliderActive_ = false;
     bool draggingCoreDistancePanel_ = false;
     bool draggingCoreDistanceSlider_ = false;
