@@ -17796,6 +17796,12 @@ private:
         if (menu == nullptr) {
             return;
         }
+        // A desktop reference created before managed storage was introduced
+        // can be collected from the core menu as well as the file menu.  Keep
+        // the command IDs local to this popup: they are only a routing layer
+        // for the existing, transactional conversion routine below.
+        constexpr UINT kStoreDesktopReferenceCommandBase = 62000;
+        std::vector<std::uint64_t> storeableDesktopReferenceIds;
         if (hit.kind == HitKind::Core || hit.kind == HitKind::More) {
             const Core* core = FindCore(hit.coreId);
             SetSelection({HitKind::Core, hit.coreId, 0}, true);
@@ -17804,6 +17810,32 @@ private:
             AppendMenuW(menu, MF_STRING, MenuRenameCore, L"重命名核心\tF2");
             AppendMenuW(menu, MF_STRING, MenuCoreAppearanceSettings,
                         L"核心外观设置...");
+            if (core != nullptr) {
+                HMENU storeReferencesMenu = CreatePopupMenu();
+                if (storeReferencesMenu != nullptr) {
+                    for (const FileItem& item : core->files) {
+                        if (item.storageMode != FileStorageMode::Reference ||
+                            !IsEligibleDesktopManagedFile(item.path)) {
+                            continue;
+                        }
+                        const UINT command =
+                            kStoreDesktopReferenceCommandBase +
+                            static_cast<UINT>(storeableDesktopReferenceIds.size());
+                        AppendMenuW(
+                            storeReferencesMenu, MF_STRING, command,
+                            FileDisplayName(item.path).c_str());
+                        storeableDesktopReferenceIds.push_back(item.id);
+                    }
+                    if (!storeableDesktopReferenceIds.empty()) {
+                        AppendMenuW(
+                            menu, MF_POPUP,
+                            reinterpret_cast<UINT_PTR>(storeReferencesMenu),
+                            L"收纳桌面文件（移出桌面）");
+                    } else {
+                        DestroyMenu(storeReferencesMenu);
+                    }
+                }
+            }
             AppendMenuW(menu, MF_SEPARATOR, 0, nullptr);
             const bool layoutLocked = core != nullptr && core->layoutLocked;
             const UINT layoutCommandState =
@@ -17946,7 +17978,17 @@ private:
         const UINT command = TrackPopupMenuPreservingSelection(
             menu, TPM_RETURNCMD | TPM_RIGHTBUTTON, screen.x, screen.y);
         DestroyMenu(menu);
-        ExecuteMenuCommand(command);
+        if (command >= kStoreDesktopReferenceCommandBase &&
+            command < kStoreDesktopReferenceCommandBase +
+                storeableDesktopReferenceIds.size()) {
+            const std::size_t index =
+                static_cast<std::size_t>(
+                    command - kStoreDesktopReferenceCommandBase);
+            StoreExistingDesktopReferenceInCore(
+                hit.coreId, storeableDesktopReferenceIds[index]);
+        } else {
+            ExecuteMenuCommand(command);
+        }
         Invalidate();
     }
 
