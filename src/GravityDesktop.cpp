@@ -335,6 +335,7 @@ enum MenuCommand : UINT {
     MenuSaveNow,
     MenuToggleAutoStart,
     MenuOpenDataFolder,
+    MenuGenerateDiagnosticReport,
     MenuAdjustCoreDistance,
     MenuConnectionStyleThin,
     MenuConnectionStyleStandard,
@@ -1908,6 +1909,109 @@ bool WriteUtf8Atomic(const std::filesystem::path& target, const std::string& dat
     }
     DeleteFileW(temporary.c_str());
     return false;
+}
+
+void AppendZipUInt16(std::vector<std::uint8_t>& bytes, std::uint16_t value) {
+    bytes.push_back(static_cast<std::uint8_t>(value & 0xFF));
+    bytes.push_back(static_cast<std::uint8_t>((value >> 8) & 0xFF));
+}
+
+void AppendZipUInt32(std::vector<std::uint8_t>& bytes, std::uint32_t value) {
+    AppendZipUInt16(bytes, static_cast<std::uint16_t>(value & 0xFFFF));
+    AppendZipUInt16(bytes, static_cast<std::uint16_t>((value >> 16) & 0xFFFF));
+}
+
+std::uint32_t Crc32ForZip(std::string_view data) {
+    std::uint32_t value = 0xFFFFFFFFU;
+    for (const unsigned char byte : data) {
+        value ^= byte;
+        for (int bit = 0; bit < 8; ++bit) {
+            value = (value >> 1) ^
+                ((value & 1U) != 0 ? 0xEDB88320U : 0U);
+        }
+    }
+    return value ^ 0xFFFFFFFFU;
+}
+
+struct ZipStoredEntry {
+    std::string name;
+    std::string data;
+};
+
+// Diagnostic reports use the ZIP "store" method only.  It avoids a runtime
+// compression dependency and is sufficient for the bounded log payload.
+bool WriteStoredZip(const std::filesystem::path& target,
+                    const std::vector<ZipStoredEntry>& entries) {
+    struct CentralRecord {
+        const ZipStoredEntry* entry = nullptr;
+        std::uint32_t offset = 0;
+        std::uint32_t crc = 0;
+    };
+    std::vector<std::uint8_t> bytes;
+    std::vector<CentralRecord> records;
+    records.reserve(entries.size());
+    for (const ZipStoredEntry& entry : entries) {
+        if (entry.name.empty() ||
+            entry.name.size() > UINT16_MAX ||
+            entry.data.size() > UINT32_MAX ||
+            bytes.size() > UINT32_MAX) {
+            return false;
+        }
+        const std::uint32_t offset = static_cast<std::uint32_t>(bytes.size());
+        const std::uint32_t crc = Crc32ForZip(entry.data);
+        AppendZipUInt32(bytes, 0x04034B50U);
+        AppendZipUInt16(bytes, 20);
+        AppendZipUInt16(bytes, 0);
+        AppendZipUInt16(bytes, 0);
+        AppendZipUInt16(bytes, 0);
+        AppendZipUInt16(bytes, 0);
+        AppendZipUInt32(bytes, crc);
+        AppendZipUInt32(bytes, static_cast<std::uint32_t>(entry.data.size()));
+        AppendZipUInt32(bytes, static_cast<std::uint32_t>(entry.data.size()));
+        AppendZipUInt16(bytes, static_cast<std::uint16_t>(entry.name.size()));
+        AppendZipUInt16(bytes, 0);
+        bytes.insert(bytes.end(), entry.name.begin(), entry.name.end());
+        bytes.insert(bytes.end(), entry.data.begin(), entry.data.end());
+        records.push_back({&entry, offset, crc});
+    }
+    if (bytes.size() > UINT32_MAX) return false;
+    const std::uint32_t centralOffset = static_cast<std::uint32_t>(bytes.size());
+    for (const CentralRecord& record : records) {
+        const ZipStoredEntry& entry = *record.entry;
+        AppendZipUInt32(bytes, 0x02014B50U);
+        AppendZipUInt16(bytes, 20);
+        AppendZipUInt16(bytes, 20);
+        AppendZipUInt16(bytes, 0);
+        AppendZipUInt16(bytes, 0);
+        AppendZipUInt16(bytes, 0);
+        AppendZipUInt16(bytes, 0);
+        AppendZipUInt32(bytes, record.crc);
+        AppendZipUInt32(bytes, static_cast<std::uint32_t>(entry.data.size()));
+        AppendZipUInt32(bytes, static_cast<std::uint32_t>(entry.data.size()));
+        AppendZipUInt16(bytes, static_cast<std::uint16_t>(entry.name.size()));
+        AppendZipUInt16(bytes, 0);
+        AppendZipUInt16(bytes, 0);
+        AppendZipUInt16(bytes, 0);
+        AppendZipUInt16(bytes, 0);
+        AppendZipUInt32(bytes, 0);
+        AppendZipUInt32(bytes, record.offset);
+        bytes.insert(bytes.end(), entry.name.begin(), entry.name.end());
+    }
+    if (bytes.size() > UINT32_MAX) return false;
+    const std::uint32_t centralSize =
+        static_cast<std::uint32_t>(bytes.size()) - centralOffset;
+    if (records.size() > UINT16_MAX) return false;
+    AppendZipUInt32(bytes, 0x06054B50U);
+    AppendZipUInt16(bytes, 0);
+    AppendZipUInt16(bytes, 0);
+    AppendZipUInt16(bytes, static_cast<std::uint16_t>(records.size()));
+    AppendZipUInt16(bytes, static_cast<std::uint16_t>(records.size()));
+    AppendZipUInt32(bytes, centralSize);
+    AppendZipUInt32(bytes, centralOffset);
+    AppendZipUInt16(bytes, 0);
+    return WriteUtf8Atomic(
+        target,
+        std::string(reinterpret_cast<const char*>(bytes.data()), bytes.size()));
 }
 
 template <typename WriteOperation>
@@ -10022,6 +10126,11 @@ private:
                 16, 56, 340, 40);
             CreateSettingsButton(settingsContentWindow_, L"打开程序数据文件夹", 16, 108, 180, 30,
                                  MenuOpenDataFolder);
+            CreateSettingsText(settingsContentWindow_,
+                L"问题报告只包含脱敏运行日志和窗口状态，不会上传。",
+                16, 152, 340, 28);
+            CreateSettingsButton(settingsContentWindow_, L"生成问题报告", 16, 190, 150, 30,
+                                 MenuGenerateDiagnosticReport);
             break;
         }
         LayoutSettingsWindow();
@@ -10441,6 +10550,9 @@ private:
         AppendMenuW(
             advancedMenu, MF_STRING, MenuOpenDataFolder,
             L"打开程序数据文件夹");
+        AppendMenuW(
+            advancedMenu, MF_STRING, MenuGenerateDiagnosticReport,
+            L"生成问题报告");
         AppendMenuW(
             menu, MF_POPUP,
             reinterpret_cast<UINT_PTR>(advancedMenu), L"高级");
@@ -16362,6 +16474,107 @@ private:
         Invalidate();
     }
 
+    std::string BuildDiagnosticReportText() const {
+        const auto handleValue = [](HWND handle) {
+            return static_cast<unsigned long long>(
+                reinterpret_cast<std::uintptr_t>(handle));
+        };
+        RECT visualRect{};
+        const bool hasVisualRect =
+            window_ != nullptr && GetWindowRect(window_, &visualRect) != FALSE;
+        SYSTEM_INFO systemInfo{};
+        GetNativeSystemInfo(&systemInfo);
+        std::ostringstream output;
+        output.imbue(std::locale::classic());
+        output << "report_schema=1\n"
+               << "product=Gravity Desktop\n"
+               << "version=0.1.0-alpha\n"
+               << "timestamp=" << UnixTimeNow() << "\n"
+               << "architecture=" <<
+                   (systemInfo.wProcessorArchitecture == PROCESSOR_ARCHITECTURE_AMD64
+                        ? "x64" : "other") << "\n"
+               << "monitor_count=" << GetSystemMetrics(SM_CMONITORS) << "\n"
+               << "dpi=" << static_cast<int>(std::round(dpi_)) << "\n"
+               << "workspace_visible=" << (workspaceVisible_ ? 1 : 0) << "\n"
+               << "workspace_paused=" << (state_.workspacePaused ? 1 : 0) << "\n"
+               << "fail_open=" << (failOpenActive_ ? 1 : 0) << "\n"
+               << "desktop_child_hosted=" << (desktopChildHosted_ ? 1 : 0) << "\n"
+               << "core_count=" << state_.cores.size() << "\n"
+               << "reference_count=" << ReferenceCount(state_) << "\n"
+               << "visual_hwnd=" << handleValue(window_) << "\n"
+               << "interaction_hwnd=" << handleValue(interactionWindow_) << "\n"
+               << "divider_hwnd=" << handleValue(dividerHandleWindow_) << "\n"
+               << "desktop_host_hwnd=" << handleValue(desktopHost_) << "\n"
+               << "visual_visible=" <<
+                    (window_ != nullptr && IsWindowVisible(window_) != FALSE ? 1 : 0)
+               << "\n"
+               << "interaction_visible=" <<
+                    (interactionWindow_ != nullptr &&
+                     IsWindowVisible(interactionWindow_) != FALSE ? 1 : 0)
+               << "\n"
+               << "visual_rect=";
+        if (hasVisualRect) {
+            output << visualRect.left << ',' << visualRect.top << ','
+                   << visualRect.right << ',' << visualRect.bottom;
+        } else {
+            output << "none";
+        }
+        output << "\nprivacy=No state.json, relationships.json, user names, paths, or file contents included.\n";
+        return output.str();
+    }
+
+    static std::string LastDiagnosticLogBytes(
+        const std::filesystem::path& path) {
+        constexpr std::size_t kPerLogLimit = 512U * 1024U;
+        const std::optional<std::string> content = ReadUtf8File(path);
+        if (!content) return {};
+        if (content->size() <= kPerLogLimit) return *content;
+        return content->substr(content->size() - kPerLogLimit);
+    }
+
+    void GenerateDiagnosticReport() {
+        if (stateFile_.empty()) {
+            SetStatus(L"无法生成问题报告：程序数据目录不可用");
+            return;
+        }
+        const std::filesystem::path reportFolder =
+            stateFile_.parent_path() / L"reports";
+        std::error_code error;
+        std::filesystem::create_directories(reportFolder, error);
+        if (error) {
+            SetStatus(L"无法创建问题报告目录");
+            return;
+        }
+        std::vector<ZipStoredEntry> entries;
+        entries.push_back({"diagnostic.txt", BuildDiagnosticReportText()});
+        const std::filesystem::path logFolder =
+            RuntimeDiagnosticLogPath().parent_path();
+        const std::array<std::filesystem::path, 5> logs{
+            logFolder / L"runtime.log",
+            logFolder / L"runtime.1.log",
+            logFolder / L"runtime.2.log",
+            logFolder / L"runtime.3.log",
+            logFolder / L"runtime.4.log"};
+        for (const std::filesystem::path& log : logs) {
+            const std::string text = LastDiagnosticLogBytes(log);
+            if (!text.empty()) {
+                entries.push_back({
+                    "logs/" + WideToUtf8(log.filename().wstring()), text});
+            }
+        }
+        const std::filesystem::path report = reportFolder /
+            (L"GravityDesktop-Report-" + BackupTimestamp() + L".zip");
+        if (!WriteStoredZip(report, entries)) {
+            AppendRuntimeDiagnostic(
+                "diagnostic_report_create_failed", E_FAIL, GetLastError());
+            SetStatus(L"问题报告生成失败");
+            return;
+        }
+        AppendRuntimeDiagnostic("diagnostic_report_created");
+        SetStatus(L"问题报告已生成；未上传，也未包含文件内容或布局数据");
+        Invalidate();
+    }
+
     void ShowCoreFileList(std::uint64_t coreId, int x, int y) {
         Core* core = FindCore(coreId);
         if (core == nullptr || core->files.empty()) {
@@ -17722,6 +17935,9 @@ private:
             break;
         case MenuOpenDataFolder:
             OpenDataFolder();
+            break;
+        case MenuGenerateDiagnosticReport:
+            GenerateDiagnosticReport();
             break;
         case MenuAdjustCoreDistance:
             OpenCoreDistanceSlider(selected_.coreId);
@@ -24870,6 +25086,22 @@ bool RunSelfTest() {
             "\"core_name\":\"invalid\",\"files\":[{\"file_stable_id\":2,"
             "\"storage_mode\":\"invalid\"}]}]}",
             rejectedRecoveryManifest)) {
+        return false;
+    }
+    const std::filesystem::path diagnosticZip =
+        relationTestDirectory / L"diagnostic-report.zip";
+    if (!WriteStoredZip(
+            diagnosticZip,
+            {{"diagnostic.txt", "version=0.1.0-alpha\n"},
+             {"logs/runtime.log", "event=test\n"}})) {
+        return false;
+    }
+    const std::optional<std::string> diagnosticZipBytes =
+        ReadUtf8File(diagnosticZip);
+    if (!diagnosticZipBytes || diagnosticZipBytes->size() < 22 ||
+        diagnosticZipBytes->substr(0, 4) != "PK\x03\x04" ||
+        diagnosticZipBytes->find("diagnostic.txt") == std::string::npos ||
+        diagnosticZipBytes->find("logs/runtime.log") == std::string::npos) {
         return false;
     }
     // Reinstallation recovery rebuilds only logical references.  It must not
