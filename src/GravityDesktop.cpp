@@ -26383,6 +26383,34 @@ bool RunSelfTest() {
         return false;
     }
 
+    blockerFile = CreateFileW(
+        saveBlocker.c_str(), GENERIC_WRITE, 0, nullptr, CREATE_ALWAYS,
+        FILE_ATTRIBUTE_TEMPORARY, nullptr);
+    if (blockerFile == INVALID_HANDLE_VALUE) {
+        return false;
+    }
+    CloseHandle(blockerFile);
+    HWND saveRetryWindow = CreateWindowExW(
+        WS_EX_TOOLWINDOW, L"STATIC", L"", WS_POPUP,
+        0, 0, 16, 16, nullptr, nullptr,
+        GetModuleHandleW(nullptr), nullptr);
+    if (saveRetryWindow == nullptr) {
+        return false;
+    }
+    GravityApp saveRetryApp;
+    saveRetryApp.AttachWindow(saveRetryWindow);
+    saveRetryApp.stateFile_ = saveBlocker / L"state.json";
+    saveRetryApp.dirty_ = true;
+    saveRetryApp.OnTimer(kSaveTimer);
+    const bool saveRetryScheduled =
+        saveRetryApp.dirty_ && saveRetryApp.saveRetryAttempt_ == 1;
+    KillTimer(saveRetryWindow, kSaveTimer);
+    DestroyWindow(saveRetryWindow);
+    DeleteFileW(saveBlocker.c_str());
+    if (!saveRetryScheduled) {
+        return false;
+    }
+
     HWND pauseVisual = CreateWindowExW(
         WS_EX_TOOLWINDOW, L"STATIC", L"", WS_POPUP | WS_VISIBLE,
         0, 0, 16, 16, nullptr, nullptr, GetModuleHandleW(nullptr), nullptr);
