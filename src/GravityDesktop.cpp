@@ -374,8 +374,10 @@ enum MenuCommand : UINT {
     MenuTrayPauseResume,
     MenuTraySettings,
     MenuTrayTutorial,
-    MenuExportLayout,
-    MenuImportLayout,
+    MenuExportLayoutSnapshot,
+    MenuImportLayoutSnapshot,
+    MenuExportWorkspaceBackup,
+    MenuImportWorkspaceBackup,
     MenuRefreshReferences,
     MenuTrayExit,
 };
@@ -1193,6 +1195,23 @@ struct WorkspaceState {
     D2D1_POINT_2F fullScreenViewOffset = D2D1::Point2F();
     std::vector<Core> cores;
     std::vector<FileFamily> families;
+};
+
+struct LayoutSnapshotRestoreSummary {
+    int restoredCores = 0;
+    int restoredFiles = 0;
+    int currentOnlyFilesKept = 0;
+    int missingCoresSkipped = 0;
+    int movedFilesSkipped = 0;
+};
+
+struct WorkspaceRestorePlan {
+    WorkspaceState candidate;
+    int existingReferencesKept = 0;
+    int restoredReferences = 0;
+    int missingReferencesSkipped = 0;
+    int continuationCoresCreated = 0;
+    int relationshipRepairsRequired = 0;
 };
 
 Core* FindCoreInState(WorkspaceState& state, std::uint64_t id) {
@@ -2564,6 +2583,216 @@ std::string SerializeState(const WorkspaceState& state) {
     return output.str();
 }
 
+std::string SerializeLayoutSnapshot(const WorkspaceState& state) {
+    std::ostringstream output;
+    output.imbue(std::locale::classic());
+    output << std::setprecision(9);
+    output << "{\n"
+           << "  \"kind\": \"gravity_desktop_layout_snapshot\",\n"
+           << "  \"schema_version\": 1,\n"
+           << "  \"cores\": [\n";
+    for (std::size_t coreIndex = 0;
+         coreIndex < state.cores.size(); ++coreIndex) {
+        const Core& core = state.cores[coreIndex];
+        output << "    {\"id\": " << core.id
+               << ", \"x_ratio\": " << core.xRatio
+               << ", \"y_ratio\": " << core.yRatio
+               << ", \"expanded\": "
+               << (core.expanded ? "true" : "false")
+               << ", \"layout_mode\": "
+               << static_cast<int>(core.layoutMode)
+               << ", \"layout_template\": "
+               << static_cast<int>(core.layoutTemplate)
+               << ", \"layout_locked\": "
+               << (core.layoutLocked ? "true" : "false")
+               << ", \"base_inner_radius\": "
+               << core.baseInnerRadius
+               << ", \"base_outer_radius\": "
+               << core.baseOuterRadius
+               << ", \"inner_distance_scale\": "
+               << core.innerDistanceScale
+               << ", \"outer_distance_scale\": "
+               << core.outerDistanceScale
+               << ", \"rotation_angle\": "
+               << core.rotationAngle
+               << ", \"base_rotation\": "
+               << core.baseRotationDegrees
+               << ", \"growth_direction\": "
+               << core.growthDirectionDegrees
+               << ", \"user_layout_customized\": "
+               << (core.userLayoutCustomized ? "true" : "false")
+               << ", \"files\": [";
+        if (!core.files.empty()) output << '\n';
+        for (std::size_t itemIndex = 0;
+             itemIndex < core.files.size(); ++itemIndex) {
+            const FileItem& item = core.files[itemIndex];
+            output << "      {\"id\": " << item.id
+                   << ", \"slot\": " << item.slot
+                   << ", \"ring\": " << item.ring
+                   << ", \"ring_slot\": " << item.ringSlot
+                   << ", \"angle\": " << item.angleDegrees
+                   << ", \"angle_offset\": "
+                   << item.angleOffsetDegrees
+                   << ", \"radius_offset\": " << item.radiusOffset
+                   << ", \"manual_x\": " << item.manualOffset.x
+                   << ", \"manual_y\": " << item.manualOffset.y
+                   << ", \"manually_moved\": "
+                   << (item.manuallyMoved ? "true" : "false")
+                   << ", \"locked_position\": "
+                   << (item.lockedPosition ? "true" : "false")
+                   << ", \"relative_angle\": " << item.relativeAngle
+                   << ", \"relative_radius\": " << item.relativeRadius
+                   << ", \"relative_manual_x\": "
+                   << item.relativeManualOffset.x
+                   << ", \"relative_manual_y\": "
+                   << item.relativeManualOffset.y
+                   << ", \"relative_manual_lock\": "
+                   << (item.relativeManualLock ? "true" : "false")
+                   << ", \"children_collapsed\": "
+                   << (item.childrenCollapsed ? "true" : "false")
+                   << ", \"detached_from_upper\": "
+                   << (item.detachedFromUpper ? "true" : "false")
+                   << ", \"detached_x\": "
+                   << item.detachedWorldPosition.x
+                   << ", \"detached_y\": "
+                   << item.detachedWorldPosition.y << '}';
+            if (itemIndex + 1 < core.files.size()) output << ',';
+            output << '\n';
+        }
+        output << "    ]}";
+        if (coreIndex + 1 < state.cores.size()) output << ',';
+        output << '\n';
+    }
+    output << "  ]\n}\n";
+    return output.str();
+}
+
+bool DeserializeLayoutSnapshot(const std::string& json,
+                               WorkspaceState& snapshot) {
+    JsonValue rootValue;
+    JsonParser parser(json);
+    if (!parser.Parse(rootValue)) return false;
+    const JsonValue::Object* root = rootValue.AsObject();
+    if (root == nullptr ||
+        StringMember(*root, "kind", L"") !=
+            L"gravity_desktop_layout_snapshot" ||
+        static_cast<int>(NumberMember(
+            *root, "schema_version", 0.0)) != 1) {
+        return false;
+    }
+    const JsonValue* coresValue = FindMember(*root, "cores");
+    const JsonValue::Array* cores =
+        coresValue == nullptr ? nullptr : coresValue->AsArray();
+    if (cores == nullptr) return false;
+
+    WorkspaceState loaded;
+    std::set<std::uint64_t> coreIds;
+    std::set<std::uint64_t> itemIds;
+    for (const JsonValue& coreValue : *cores) {
+        const JsonValue::Object* object = coreValue.AsObject();
+        if (object == nullptr) continue;
+        Core core;
+        core.id = static_cast<std::uint64_t>(
+            NumberMember(*object, "id", 0.0));
+        if (core.id == 0 || !coreIds.insert(core.id).second) continue;
+        core.xRatio = std::clamp(static_cast<float>(
+            NumberMember(*object, "x_ratio", -1.0)), -1.0f, 1.0f);
+        core.yRatio = std::clamp(static_cast<float>(
+            NumberMember(*object, "y_ratio", -1.0)), -1.0f, 1.0f);
+        core.expanded = BoolMember(*object, "expanded", true);
+        core.layoutMode = static_cast<LayoutMode>(std::clamp(
+            static_cast<int>(NumberMember(*object, "layout_mode", 0.0)),
+            0, 3));
+        core.layoutTemplate = static_cast<LayoutTemplate>(std::clamp(
+            static_cast<int>(NumberMember(
+                *object, "layout_template", 0.0)), 0, 3));
+        core.layoutLocked = BoolMember(*object, "layout_locked", false);
+        core.baseInnerRadius = std::clamp(static_cast<float>(NumberMember(
+            *object, "base_inner_radius", kDefaultRingRadii[0])),
+            30.0f, 640.0f);
+        core.baseOuterRadius = std::clamp(static_cast<float>(NumberMember(
+            *object, "base_outer_radius", kDefaultRingRadii[1])),
+            core.baseInnerRadius + 20.0f, 960.0f);
+        core.innerDistanceScale = std::clamp(static_cast<float>(NumberMember(
+            *object, "inner_distance_scale", 1.0)), 0.60f, 1.40f);
+        core.outerDistanceScale = std::clamp(static_cast<float>(NumberMember(
+            *object, "outer_distance_scale", 1.0)), 0.70f, 1.60f);
+        core.rotationAngle = NormalizeDegrees(static_cast<float>(NumberMember(
+            *object, "rotation_angle", 0.0)));
+        core.baseRotationDegrees = NormalizeDegrees(static_cast<float>(
+            NumberMember(*object, "base_rotation", 0.0)));
+        core.growthDirectionDegrees = NormalizeDegrees(static_cast<float>(
+            NumberMember(*object, "growth_direction", 0.0)));
+        core.userLayoutCustomized = BoolMember(
+            *object, "user_layout_customized", false);
+
+        if (const JsonValue* filesValue = FindMember(*object, "files")) {
+            if (const JsonValue::Array* files = filesValue->AsArray()) {
+                for (const JsonValue& fileValue : *files) {
+                    const JsonValue::Object* file = fileValue.AsObject();
+                    if (file == nullptr) continue;
+                    FileItem item;
+                    item.id = static_cast<std::uint64_t>(
+                        NumberMember(*file, "id", 0.0));
+                    if (item.id == 0 || !itemIds.insert(item.id).second) {
+                        continue;
+                    }
+                    item.slot = static_cast<int>(
+                        NumberMember(*file, "slot", -1.0));
+                    item.ring = static_cast<int>(
+                        NumberMember(*file, "ring", -1.0));
+                    item.ringSlot = static_cast<int>(
+                        NumberMember(*file, "ring_slot", -1.0));
+                    item.angleDegrees = NormalizeDegrees(static_cast<float>(
+                        NumberMember(*file, "angle", -90.0)));
+                    item.angleOffsetDegrees = std::clamp(static_cast<float>(
+                        NumberMember(*file, "angle_offset", 0.0)),
+                        -180.0f, 180.0f);
+                    item.radiusOffset = std::clamp(static_cast<float>(
+                        NumberMember(*file, "radius_offset", 0.0)),
+                        -2000.0f, 2000.0f);
+                    item.manualOffset = D2D1::Point2F(
+                        std::clamp(static_cast<float>(NumberMember(
+                            *file, "manual_x", 0.0)), -2000.0f, 2000.0f),
+                        std::clamp(static_cast<float>(NumberMember(
+                            *file, "manual_y", 0.0)), -2000.0f, 2000.0f));
+                    item.manuallyMoved = BoolMember(
+                        *file, "manually_moved", false);
+                    item.lockedPosition = BoolMember(
+                        *file, "locked_position", item.manuallyMoved);
+                    item.relativeAngle = NormalizeDegrees(static_cast<float>(
+                        NumberMember(*file, "relative_angle", 90.0)));
+                    item.relativeRadius = std::clamp(static_cast<float>(
+                        NumberMember(*file, "relative_radius", 62.0)),
+                        36.0f, 8192.0f);
+                    item.relativeManualOffset = D2D1::Point2F(
+                        std::clamp(static_cast<float>(NumberMember(
+                            *file, "relative_manual_x", 0.0)),
+                            -2000.0f, 2000.0f),
+                        std::clamp(static_cast<float>(NumberMember(
+                            *file, "relative_manual_y", 0.0)),
+                            -2000.0f, 2000.0f));
+                    item.relativeManualLock = BoolMember(
+                        *file, "relative_manual_lock", false);
+                    item.childrenCollapsed = BoolMember(
+                        *file, "children_collapsed", false);
+                    item.detachedFromUpper = BoolMember(
+                        *file, "detached_from_upper", false);
+                    item.detachedWorldPosition = D2D1::Point2F(
+                        static_cast<float>(NumberMember(
+                            *file, "detached_x", 0.0)),
+                        static_cast<float>(NumberMember(
+                            *file, "detached_y", 0.0)));
+                    core.files.push_back(std::move(item));
+                }
+            }
+        }
+        loaded.cores.push_back(std::move(core));
+    }
+    snapshot = std::move(loaded);
+    return true;
+}
+
 // This is deliberately a compact, independent recovery index rather than a
 // second copy of the visual layout.  The state file remains authoritative;
 // the manifest exists so recovery can discover real files and their logical
@@ -2790,6 +3019,67 @@ int FindFreeSlot(const Core& core) {
         ++slot;
     }
     return slot < kPriorityPlacementSlots ? slot : -1;
+}
+
+LayoutSnapshotRestoreSummary ApplyLayoutSnapshot(
+    WorkspaceState& current, const WorkspaceState& snapshot) {
+    LayoutSnapshotRestoreSummary summary;
+    for (const Core& savedCore : snapshot.cores) {
+        Core* core = FindCoreInState(current, savedCore.id);
+        if (core == nullptr) {
+            ++summary.missingCoresSkipped;
+            continue;
+        }
+        core->xRatio = savedCore.xRatio;
+        core->yRatio = savedCore.yRatio;
+        core->expanded = savedCore.expanded;
+        core->layoutMode = savedCore.layoutMode;
+        core->layoutTemplate = savedCore.layoutTemplate;
+        core->layoutLocked = savedCore.layoutLocked;
+        core->baseInnerRadius = savedCore.baseInnerRadius;
+        core->baseOuterRadius = savedCore.baseOuterRadius;
+        core->innerDistanceScale = savedCore.innerDistanceScale;
+        core->outerDistanceScale = savedCore.outerDistanceScale;
+        core->rotationAngle = savedCore.rotationAngle;
+        core->baseRotationDegrees = savedCore.baseRotationDegrees;
+        core->growthDirectionDegrees = savedCore.growthDirectionDegrees;
+        core->userLayoutCustomized = savedCore.userLayoutCustomized;
+        ++summary.restoredCores;
+
+        std::unordered_map<std::uint64_t, const FileItem*> savedItems;
+        for (const FileItem& savedItem : savedCore.files) {
+            savedItems.emplace(savedItem.id, &savedItem);
+        }
+        for (FileItem& item : core->files) {
+            const auto found = savedItems.find(item.id);
+            if (found == savedItems.end()) {
+                ++summary.currentOnlyFilesKept;
+                continue;
+            }
+            const FileItem& saved = *found->second;
+            item.slot = saved.slot;
+            item.ring = saved.ring;
+            item.ringSlot = saved.ringSlot;
+            item.angleDegrees = saved.angleDegrees;
+            item.angleOffsetDegrees = saved.angleOffsetDegrees;
+            item.radiusOffset = saved.radiusOffset;
+            item.manualOffset = saved.manualOffset;
+            item.manuallyMoved = saved.manuallyMoved;
+            item.lockedPosition = saved.lockedPosition;
+            item.relativeAngle = saved.relativeAngle;
+            item.relativeRadius = saved.relativeRadius;
+            item.relativeManualOffset = saved.relativeManualOffset;
+            item.relativeManualLock = saved.relativeManualLock;
+            item.childrenCollapsed = saved.childrenCollapsed;
+            item.detachedFromUpper = saved.detachedFromUpper;
+            item.detachedWorldPosition = saved.detachedWorldPosition;
+            ++summary.restoredFiles;
+            savedItems.erase(found);
+        }
+        summary.movedFilesSkipped +=
+            static_cast<int>(savedItems.size());
+    }
+    return summary;
 }
 
 int NormalizeDisplayLimit(int value) {
@@ -11103,14 +11393,24 @@ private:
                                  MenuResetView);
             break;
         case SettingsPage::Data:
+            CreateSettingsText(settingsContentWindow_, L"布局快照", 16, 54, 180, 22);
             CreateSettingsText(settingsContentWindow_,
-                L"布局备份不会移动、删除或覆盖真实文件。", 16, 56, 340, 24);
-            CreateSettingsButton(settingsContentWindow_, L"立即保存布局", 16, 94, 136, 30,
+                L"只保存和恢复现有核心、文件的位置。新增内容保留，已删除内容不会回来。",
+                16, 78, 340, 34);
+            CreateSettingsButton(settingsContentWindow_, L"导出布局快照", 16, 116, 154, 30,
+                                 MenuExportLayoutSnapshot);
+            CreateSettingsButton(settingsContentWindow_, L"恢复布局快照", 180, 116, 154, 30,
+                                 MenuImportLayoutSnapshot);
+            CreateSettingsText(settingsContentWindow_, L"完整工作区备份", 16, 166, 220, 22);
+            CreateSettingsText(settingsContentWindow_,
+                L"用于恢复核心、文件引用和关系。恢复前显示差异，容量超过18项时创建延续核心。",
+                16, 190, 340, 40);
+            CreateSettingsButton(settingsContentWindow_, L"导出完整备份", 16, 238, 154, 30,
+                                 MenuExportWorkspaceBackup);
+            CreateSettingsButton(settingsContentWindow_, L"恢复完整备份...", 180, 238, 154, 30,
+                                 MenuImportWorkspaceBackup);
+            CreateSettingsButton(settingsContentWindow_, L"立即保存当前状态", 16, 286, 154, 30,
                                  MenuSaveNow);
-            CreateSettingsButton(settingsContentWindow_, L"导出布局备份", 16, 132, 136, 30,
-                                 MenuExportLayout);
-            CreateSettingsButton(settingsContentWindow_, L"导入布局备份", 16, 170, 136, 30,
-                                 MenuImportLayout);
             break;
         case SettingsPage::CoreManagement: {
             CreateSettingsText(settingsContentWindow_, L"文件引用检查", 16, 58, 220, 22);
@@ -11534,9 +11834,17 @@ private:
             reinterpret_cast<UINT_PTR>(workspaceMenu), L"工作区");
 
         HMENU dataMenu = CreatePopupMenu();
-        AppendMenuW(dataMenu, MF_STRING, MenuSaveNow, L"立即保存布局");
-        AppendMenuW(dataMenu, MF_STRING, MenuExportLayout, L"导出布局备份");
-        AppendMenuW(dataMenu, MF_STRING, MenuImportLayout, L"导入布局备份");
+        AppendMenuW(dataMenu, MF_STRING, MenuSaveNow, L"立即保存当前状态");
+        AppendMenuW(dataMenu, MF_SEPARATOR, 0, nullptr);
+        AppendMenuW(dataMenu, MF_STRING, MenuExportLayoutSnapshot,
+                    L"导出布局快照");
+        AppendMenuW(dataMenu, MF_STRING, MenuImportLayoutSnapshot,
+                    L"恢复布局快照");
+        AppendMenuW(dataMenu, MF_SEPARATOR, 0, nullptr);
+        AppendMenuW(dataMenu, MF_STRING, MenuExportWorkspaceBackup,
+                    L"导出完整工作区备份");
+        AppendMenuW(dataMenu, MF_STRING, MenuImportWorkspaceBackup,
+                    L"恢复完整工作区备份...");
         AppendMenuW(
             menu, MF_POPUP,
             reinterpret_cast<UINT_PTR>(dataMenu), L"数据与备份");
@@ -19133,11 +19441,17 @@ private:
         case MenuTrayTutorial:
             StartTutorial();
             break;
-        case MenuExportLayout:
-            ExportLayout();
+        case MenuExportLayoutSnapshot:
+            ExportLayoutSnapshot();
             break;
-        case MenuImportLayout:
-            ImportLayout();
+        case MenuImportLayoutSnapshot:
+            ImportLayoutSnapshot();
+            break;
+        case MenuExportWorkspaceBackup:
+            ExportWorkspaceBackup();
+            break;
+        case MenuImportWorkspaceBackup:
+            ImportWorkspaceBackup();
             break;
         case MenuRefreshReferences:
             CheckReferences();
@@ -20943,116 +21257,418 @@ private:
         return count;
     }
 
-    WorkspaceState MergeImportedState(const WorkspaceState& imported) const {
-        WorkspaceState merged = state_;
+    WorkspaceRestorePlan BuildWorkspaceRestorePlan(
+        const WorkspaceState& imported,
+        bool requireExistingFiles = true) const {
+        WorkspaceRestorePlan plan;
+        plan.candidate = state_;
+        plan.existingReferencesKept = ReferenceCount(plan.candidate);
+        (void)ApplyLayoutSnapshot(plan.candidate, imported);
+
         std::set<std::uint64_t> usedIds;
-        std::set<std::wstring> usedPaths;
-        for (const Core& core : merged.cores) {
+        struct ItemLocation {
+            std::uint64_t coreId = 0;
+            std::uint64_t itemId = 0;
+        };
+        std::unordered_map<std::uint64_t, ItemLocation> currentItemsById;
+        std::map<std::wstring, ItemLocation> currentItemsByPath;
+        for (const Core& core : plan.candidate.cores) {
             usedIds.insert(core.id);
             for (const FileItem& item : core.files) {
                 usedIds.insert(item.id);
-                usedPaths.insert(NormalizePath(item.path));
+                const ItemLocation location{core.id, item.id};
+                currentItemsById.emplace(item.id, location);
+                currentItemsByPath.emplace(
+                    NormalizePath(item.path), location);
             }
         }
-        for (const FileFamily& family : merged.families) usedIds.insert(family.id);
-        auto allocateId = [&merged, &usedIds]() {
-            while (usedIds.contains(merged.nextId)) ++merged.nextId;
-            const std::uint64_t result = merged.nextId++;
+        for (const FileFamily& family : plan.candidate.families) {
+            usedIds.insert(family.id);
+        }
+        auto allocateId = [&plan, &usedIds]() {
+            while (usedIds.contains(plan.candidate.nextId)) {
+                ++plan.candidate.nextId;
+            }
+            const std::uint64_t result = plan.candidate.nextId++;
             usedIds.insert(result);
             return result;
         };
 
-        std::unordered_map<std::uint64_t, std::uint64_t> coreIds;
-        std::unordered_map<std::uint64_t, std::uint64_t> itemIds;
-        std::unordered_map<std::uint64_t, std::uint64_t> familyIds;
+        std::unordered_map<std::uint64_t, std::vector<std::uint64_t>>
+            targetCoreIds;
         for (const Core& sourceCore : imported.cores) {
-            if (sourceCore.id == kUnclassifiedCoreId) {
-                coreIds[sourceCore.id] = kUnclassifiedCoreId;
+            if (FindCoreInState(plan.candidate, sourceCore.id) != nullptr) {
+                targetCoreIds[sourceCore.id].push_back(sourceCore.id);
+            } else {
+                Core copied = sourceCore;
+                copied.files.clear();
+                copied.savedBaselineLayout.clear();
+                if (usedIds.contains(copied.id)) copied.id = allocateId();
+                usedIds.insert(copied.id);
+                targetCoreIds[sourceCore.id].push_back(copied.id);
+                plan.candidate.cores.push_back(std::move(copied));
+            }
+        }
+
+        std::unordered_map<std::uint64_t, std::uint64_t> itemIds;
+        std::unordered_map<std::uint64_t, std::uint64_t> itemCoreIds;
+        std::set<std::uint64_t> newlyRestoredSourceItems;
+        for (const Core& sourceCore : imported.cores) {
+            for (const FileItem& sourceItem : sourceCore.files) {
+                const auto sameId = currentItemsById.find(sourceItem.id);
+                if (sameId != currentItemsById.end()) {
+                    const Core* owner = FindCoreInState(
+                        plan.candidate, sameId->second.coreId);
+                    const FileItem* existing = owner == nullptr
+                        ? nullptr
+                        : FindItemInState(plan.candidate, owner->id,
+                                          sameId->second.itemId);
+                    if (existing != nullptr &&
+                        PathEquals(existing->path, sourceItem.path)) {
+                        itemIds[sourceItem.id] = existing->id;
+                        itemCoreIds[sourceItem.id] = owner->id;
+                        continue;
+                    }
+                }
+                const auto samePath = currentItemsByPath.find(
+                    NormalizePath(sourceItem.path));
+                if (samePath != currentItemsByPath.end()) {
+                    itemIds[sourceItem.id] = samePath->second.itemId;
+                    itemCoreIds[sourceItem.id] = samePath->second.coreId;
+                }
+            }
+        }
+
+        const auto findSourceItem = [&imported](std::uint64_t id)
+            -> const FileItem* {
+            for (const Core& core : imported.cores) {
+                const auto found = std::find_if(
+                    core.files.begin(), core.files.end(),
+                    [id](const FileItem& item) { return item.id == id; });
+                if (found != core.files.end()) return &*found;
+            }
+            return nullptr;
+        };
+        const auto sourceDepth = [&findSourceItem](const FileItem& item) {
+            int depth = 0;
+            std::uint64_t cursor = item.parentFileId;
+            std::unordered_set<std::uint64_t> visited;
+            while (cursor != 0 && visited.insert(cursor).second &&
+                   depth < static_cast<int>(kMaxRelationTraversalDepth)) {
+                const FileItem* parent = findSourceItem(cursor);
+                if (parent == nullptr) break;
+                ++depth;
+                cursor = parent->parentFileId;
+            }
+            return depth;
+        };
+
+        const auto createContinuation = [
+            &plan, &targetCoreIds, &allocateId](const Core& sourceCore) {
+            Core continued = sourceCore;
+            continued.id = allocateId();
+            continued.files.clear();
+            continued.savedBaselineLayout.clear();
+            const int sequence = static_cast<int>(
+                targetCoreIds[sourceCore.id].size()) + 1;
+            continued.name = sourceCore.name + L"（恢复 " +
+                std::to_wstring(sequence) + L"）";
+            continued.layoutTemplate = LayoutTemplate::HighCapacityDouble;
+            continued.displayLimit = kCoreFileCapacity;
+            continued.archived = false;
+            const float offset = 0.045f * static_cast<float>(sequence - 1);
+            if (continued.xRatio >= 0.0f) {
+                continued.xRatio = std::clamp(
+                    continued.xRatio + offset, 0.08f, 0.92f);
+            }
+            if (continued.yRatio >= 0.0f) {
+                continued.yRatio = std::clamp(
+                    continued.yRatio + offset, 0.08f, 0.92f);
+            }
+            const std::uint64_t id = continued.id;
+            plan.candidate.cores.push_back(std::move(continued));
+            targetCoreIds[sourceCore.id].push_back(id);
+            ++plan.continuationCoresCreated;
+            return id;
+        };
+
+        for (const Core& sourceCore : imported.cores) {
+            std::vector<const FileItem*> ordered;
+            ordered.reserve(sourceCore.files.size());
+            for (const FileItem& item : sourceCore.files) {
+                if (!itemIds.contains(item.id)) ordered.push_back(&item);
+            }
+            std::stable_sort(
+                ordered.begin(), ordered.end(),
+                [&sourceDepth](const FileItem* first,
+                               const FileItem* second) {
+                    return sourceDepth(*first) < sourceDepth(*second);
+                });
+            for (const FileItem* sourceItem : ordered) {
+                if (requireExistingFiles &&
+                    GetFileAttributesW(sourceItem->path.c_str()) ==
+                        INVALID_FILE_ATTRIBUTES) {
+                    ++plan.missingReferencesSkipped;
+                    continue;
+                }
+                std::uint64_t targetCoreId = 0;
+                if (sourceItem->parentFileId != 0) {
+                    const auto parentCore = itemCoreIds.find(
+                        sourceItem->parentFileId);
+                    if (parentCore != itemCoreIds.end()) {
+                        Core* parentTarget = FindCoreInState(
+                            plan.candidate, parentCore->second);
+                        if (parentTarget != nullptr &&
+                            parentTarget->files.size() < kCoreFileCapacity) {
+                            targetCoreId = parentTarget->id;
+                        }
+                    }
+                }
+                if (targetCoreId == 0) {
+                    for (const std::uint64_t candidateId :
+                         targetCoreIds[sourceCore.id]) {
+                        Core* target = FindCoreInState(
+                            plan.candidate, candidateId);
+                        if (target != nullptr &&
+                            target->files.size() < kCoreFileCapacity) {
+                            targetCoreId = candidateId;
+                            break;
+                        }
+                    }
+                }
+                if (targetCoreId == 0) {
+                    targetCoreId = createContinuation(sourceCore);
+                }
+                Core* target = FindCoreInState(
+                    plan.candidate, targetCoreId);
+                if (target == nullptr) continue;
+                FileItem copied = *sourceItem;
+                if (usedIds.contains(copied.id)) copied.id = allocateId();
+                usedIds.insert(copied.id);
+                copied.parentFileId = 0;
+                copied.familyId = 0;
+                copied.missing = false;
+                copied.slot = FindFreeSlot(*target);
+                copied.ring = RingForSlot(copied.slot);
+                copied.ringSlot = RingSlotForSlot(copied.slot);
+                itemIds[sourceItem->id] = copied.id;
+                itemCoreIds[sourceItem->id] = target->id;
+                newlyRestoredSourceItems.insert(sourceItem->id);
+                currentItemsByPath.emplace(
+                    NormalizePath(copied.path),
+                    ItemLocation{target->id, copied.id});
+                target->files.push_back(std::move(copied));
+                ++plan.restoredReferences;
+            }
+        }
+
+        const auto findTargetItem = [&plan](std::uint64_t id)
+            -> std::pair<Core*, FileItem*> {
+            for (Core& core : plan.candidate.cores) {
+                const auto found = std::find_if(
+                    core.files.begin(), core.files.end(),
+                    [id](const FileItem& item) { return item.id == id; });
+                if (found != core.files.end()) return {&core, &*found};
+            }
+            return {nullptr, nullptr};
+        };
+
+        for (const FileFamily& sourceFamily : imported.families) {
+            std::vector<const FileItem*> members;
+            for (const Core& sourceCore : imported.cores) {
+                for (const FileItem& sourceItem : sourceCore.files) {
+                    if (sourceItem.familyId == sourceFamily.id) {
+                        members.push_back(&sourceItem);
+                    }
+                }
+            }
+            bool completeNewFamily = !members.empty();
+            std::uint64_t targetCoreId = 0;
+            for (const FileItem* member : members) {
+                const auto mapped = itemIds.find(member->id);
+                const auto owner = itemCoreIds.find(member->id);
+                if (mapped == itemIds.end() || owner == itemCoreIds.end() ||
+                    !newlyRestoredSourceItems.contains(member->id)) {
+                    completeNewFamily = false;
+                    break;
+                }
+                if (targetCoreId == 0) targetCoreId = owner->second;
+                if (targetCoreId != owner->second) {
+                    completeNewFamily = false;
+                    break;
+                }
+            }
+            const auto root = itemIds.find(sourceFamily.rootFileId);
+            const auto current = itemIds.find(sourceFamily.currentFileId);
+            if (!completeNewFamily || root == itemIds.end() ||
+                current == itemIds.end()) {
+                plan.relationshipRepairsRequired +=
+                    static_cast<int>(std::count_if(
+                        members.begin(), members.end(),
+                        [&newlyRestoredSourceItems](const FileItem* item) {
+                            return newlyRestoredSourceItems.contains(item->id);
+                        }));
                 continue;
             }
-            Core copied = sourceCore;
-            copied.files.clear();
-            copied.id = usedIds.contains(copied.id) ? allocateId() : copied.id;
-            usedIds.insert(copied.id);
-            coreIds[sourceCore.id] = copied.id;
-            merged.cores.push_back(std::move(copied));
-        }
-
-        for (const Core& sourceCore : imported.cores) {
-            const auto coreId = coreIds.find(sourceCore.id);
-            if (coreId == coreIds.end()) continue;
-            auto target = std::find_if(merged.cores.begin(), merged.cores.end(),
-                [&coreId](const Core& core) { return core.id == coreId->second; });
-            if (target == merged.cores.end()) continue;
-            for (const FileItem& sourceItem : sourceCore.files) {
-                if (usedPaths.contains(NormalizePath(sourceItem.path))) continue;
-                FileItem copied = sourceItem;
-                copied.id = usedIds.contains(copied.id) ? allocateId() : copied.id;
-                usedIds.insert(copied.id);
-                usedPaths.insert(NormalizePath(copied.path));
-                itemIds[sourceItem.id] = copied.id;
-                target->files.push_back(std::move(copied));
+            FileFamily family = sourceFamily;
+            if (usedIds.contains(family.id)) family.id = allocateId();
+            usedIds.insert(family.id);
+            family.coreId = targetCoreId;
+            family.rootFileId = root->second;
+            family.currentFileId = current->second;
+            family.repairRequired = false;
+            family.snapshots.clear();
+            for (const FileItem* sourceMember : members) {
+                const auto mapped = itemIds.find(sourceMember->id);
+                auto [owner, item] = findTargetItem(mapped->second);
+                if (owner == nullptr || item == nullptr) continue;
+                item->familyId = family.id;
+                if (sourceMember->parentFileId != 0) {
+                    const auto parent = itemIds.find(
+                        sourceMember->parentFileId);
+                    if (parent != itemIds.end()) {
+                        item->parentFileId = parent->second;
+                    }
+                }
             }
+            plan.candidate.families.push_back(std::move(family));
         }
-
-        for (const FileFamily& sourceFamily : imported.families) {
-            const std::uint64_t mapped = usedIds.contains(sourceFamily.id)
-                ? allocateId() : sourceFamily.id;
-            usedIds.insert(mapped);
-            familyIds[sourceFamily.id] = mapped;
-        }
-        for (Core& core : merged.cores) {
-            for (FileItem& item : core.files) {
-                if (!itemIds.contains(item.id)) continue;
-                const auto parent = itemIds.find(item.parentFileId);
-                item.parentFileId = parent == itemIds.end() ? 0 : parent->second;
-                const auto family = familyIds.find(item.familyId);
-                item.familyId = family == familyIds.end() ? 0 : family->second;
-            }
-        }
-        for (const FileFamily& sourceFamily : imported.families) {
-            const auto id = familyIds.find(sourceFamily.id);
-            const auto core = coreIds.find(sourceFamily.coreId);
-            const auto root = itemIds.find(sourceFamily.rootFileId);
-            if (id == familyIds.end() || core == coreIds.end() || root == itemIds.end()) continue;
-            FileFamily copied = sourceFamily;
-            copied.id = id->second;
-            copied.coreId = core->second;
-            copied.rootFileId = root->second;
-            const auto current = itemIds.find(sourceFamily.currentFileId);
-            copied.currentFileId = current == itemIds.end() ? copied.rootFileId : current->second;
-            merged.families.push_back(std::move(copied));
-        }
-        return merged;
+        return plan;
     }
 
-    void ExportLayout() {
-        if (MessageBoxW(window_,
-                        L"导出的布局文件包含核心、视觉位置和本机文件路径，不包含文件内容。是否继续？",
-                        L"导出布局", MB_OKCANCEL | MB_ICONINFORMATION) != IDOK) {
-            return;
+    void ExportLayoutSnapshot() {
+        std::vector<wchar_t> path(32768, L'\0');
+        const std::wstring suggested =
+            L"GravityDesktop-布局快照-" + BackupTimestamp() + L".json";
+        wcsncpy_s(path.data(), path.size(), suggested.c_str(), _TRUNCATE);
+        OPENFILENAMEW dialog{sizeof(dialog)};
+        dialog.hwndOwner = window_;
+        dialog.lpstrTitle = L"导出布局快照";
+        dialog.lpstrFilter =
+            L"引力桌面布局快照 (*.json)\0*.json\0所有文件\0*.*\0";
+        dialog.lpstrFile = path.data();
+        dialog.nMaxFile = static_cast<DWORD>(path.size());
+        dialog.lpstrDefExt = L"json";
+        dialog.Flags = OFN_OVERWRITEPROMPT | OFN_PATHMUSTEXIST;
+        if (!GetSaveFileNameW(&dialog)) return;
+        if (WriteUtf8Atomic(
+                path.data(), SerializeLayoutSnapshot(state_))) {
+            SetStatus(L"布局快照已导出；不包含文件路径和真实文件内容");
+        } else {
+            SetStatus(L"布局快照导出失败");
         }
+    }
+
+    void ImportLayoutSnapshot() {
         std::vector<wchar_t> path(32768, L'\0');
         OPENFILENAMEW dialog{sizeof(dialog)};
         dialog.hwndOwner = window_;
-        dialog.lpstrFilter = L"引力桌面布局 (*.json)\0*.json\0所有文件\0*.*\0";
+        dialog.lpstrTitle = L"恢复布局快照";
+        dialog.lpstrFilter =
+            L"引力桌面布局快照 (*.json)\0*.json\0所有文件\0*.*\0";
+        dialog.lpstrFile = path.data();
+        dialog.nMaxFile = static_cast<DWORD>(path.size());
+        dialog.Flags = OFN_FILEMUSTEXIST | OFN_PATHMUSTEXIST;
+        if (!GetOpenFileNameW(&dialog)) return;
+        const std::optional<std::string> text = ReadUtf8File(path.data());
+        WorkspaceState snapshot;
+        if (!text || !DeserializeLayoutSnapshot(*text, snapshot)) {
+            MessageBoxW(
+                window_,
+                L"这不是有效的引力桌面布局快照。\n\n"
+                L"当前布局没有改变。",
+                L"恢复布局快照", MB_OK | MB_ICONERROR);
+            return;
+        }
+        WorkspaceState candidate = state_;
+        const LayoutSnapshotRestoreSummary summary =
+            ApplyLayoutSnapshot(candidate, snapshot);
+        if (summary.restoredCores == 0) {
+            MessageBoxW(
+                window_,
+                L"快照中没有与当前工作区匹配的核心。\n\n"
+                L"不会创建旧核心，也不会恢复已经删除的文件引用。",
+                L"恢复布局快照", MB_OK | MB_ICONINFORMATION);
+            return;
+        }
+        const std::wstring prompt =
+            L"恢复预览\n\n"
+            L"恢复核心位置与布局：" +
+            std::to_wstring(summary.restoredCores) + L" 个\n"
+            L"恢复现有文件位置：" +
+            std::to_wstring(summary.restoredFiles) + L" 个\n"
+            L"保留后来新增文件：" +
+            std::to_wstring(summary.currentOnlyFilesKept) + L" 个\n"
+            L"跳过已删除或已换核心文件：" +
+            std::to_wstring(summary.movedFilesSkipped) + L" 个\n\n"
+            L"不会新增或删除文件引用，不会改变父子关系和真实文件。";
+        if (MessageBoxW(
+                window_, prompt.c_str(), L"恢复布局快照",
+                MB_OKCANCEL | MB_ICONINFORMATION | MB_DEFBUTTON2) != IDOK) {
+            return;
+        }
+        if (!stateRecoveryBlocked_ && !SaveState()) return;
+        CreateHistoryBackup(true);
+        WorkspaceState before = state_;
+        state_ = std::move(candidate);
+        ApplyCoreRatiosToWorkspace();
+        RefreshResponsiveMetrics(true);
+        (void)ClampCoreClustersToWorkspace();
+        if (!CommitImportedStateWrite(
+                stateRecoveryBlocked_,
+                [&]() {
+                    return WriteStateWithRelationshipManifest(state_);
+                })) {
+            state_ = std::move(before);
+            ApplyCoreRatiosToWorkspace();
+            RefreshResponsiveMetrics(true);
+            SetStatus(L"布局快照恢复失败；已回到恢复前状态");
+            return;
+        }
+        dirty_ = false;
+        PushUndo(std::move(before));
+        layoutDirty_ = true;
+        SetStatus(L"布局快照已恢复；新增和删除的文件保持当前状态");
+        Invalidate();
+    }
+
+    void ExportWorkspaceBackup() {
+        if (MessageBoxW(
+                window_,
+                L"完整工作区备份包含核心、文件引用、关系、视觉位置和本机路径，"
+                L"但不包含任何真实文件内容。\n\n是否继续？",
+                L"导出完整工作区备份",
+                MB_OKCANCEL | MB_ICONINFORMATION) != IDOK) {
+            return;
+        }
+        std::vector<wchar_t> path(32768, L'\0');
+        const std::wstring suggested =
+            L"GravityDesktop-完整工作区-" + BackupTimestamp() + L".json";
+        wcsncpy_s(path.data(), path.size(), suggested.c_str(), _TRUNCATE);
+        OPENFILENAMEW dialog{sizeof(dialog)};
+        dialog.hwndOwner = window_;
+        dialog.lpstrTitle = L"导出完整工作区备份";
+        dialog.lpstrFilter =
+            L"引力桌面完整工作区备份 (*.json)\0*.json\0所有文件\0*.*\0";
         dialog.lpstrFile = path.data();
         dialog.nMaxFile = static_cast<DWORD>(path.size());
         dialog.lpstrDefExt = L"json";
         dialog.Flags = OFN_OVERWRITEPROMPT | OFN_PATHMUSTEXIST;
         if (!GetSaveFileNameW(&dialog)) return;
         if (WriteUtf8Atomic(path.data(), SerializeState(state_))) {
-            SetStatus(L"布局已导出；未导出任何真实文件内容");
+            SetStatus(L"完整工作区备份已导出；不包含真实文件内容");
         } else {
-            SetStatus(L"布局导出失败");
+            SetStatus(L"完整工作区备份导出失败");
         }
     }
 
-    void ImportLayout() {
+    void ImportWorkspaceBackup() {
         std::vector<wchar_t> path(32768, L'\0');
         OPENFILENAMEW dialog{sizeof(dialog)};
         dialog.hwndOwner = window_;
-        dialog.lpstrFilter = L"引力桌面布局 (*.json)\0*.json\0所有文件\0*.*\0";
+        dialog.lpstrTitle = L"恢复完整工作区备份";
+        dialog.lpstrFilter =
+            L"引力桌面完整工作区备份 (*.json)\0*.json\0所有文件\0*.*\0";
         dialog.lpstrFile = path.data();
         dialog.nMaxFile = static_cast<DWORD>(path.size());
         dialog.Flags = OFN_FILEMUSTEXIST | OFN_PATHMUSTEXIST;
@@ -21060,70 +21676,63 @@ private:
         const std::optional<std::string> text = ReadUtf8File(path.data());
         WorkspaceState imported;
         if (!text || !DeserializeState(*text, imported)) {
-            MessageBoxW(window_, L"无法读取布局文件；当前布局没有改变。",
-                        L"导入布局", MB_OK | MB_ICONERROR);
+            MessageBoxW(
+                window_,
+                L"无法读取完整工作区备份；当前工作区没有改变。",
+                L"恢复完整工作区备份", MB_OK | MB_ICONERROR);
             return;
         }
         const RelationValidationResult importedValidation =
             ValidateRelationState(imported);
         if (!importedValidation.IsValid()) {
-            const std::filesystem::path diagnosticBase =
-                stateFile_.empty()
-                    ? std::filesystem::path(path.data())
-                    : stateFile_.parent_path() /
-                          L"rejected-import.json";
-            std::filesystem::path preserved;
-            (void)PreserveInvalidRelationStateCopy(
-                diagnosticBase, *text, importedValidation,
-                &preserved);
-            std::wstring message =
-                L"导入文件包含非法文件关系；当前布局没有改变。\n\n" +
-                FormatRelationValidationReport(
-                    importedValidation, 8);
-            if (!preserved.empty()) {
-                message +=
-                    L"\n\n异常导入副本已保存到：\n" +
-                    preserved.wstring();
-            }
             MessageBoxW(
-                window_, message.c_str(), L"导入布局",
-                MB_OK | MB_ICONERROR);
+                window_,
+                (L"备份包含异常文件关系，已拒绝恢复。\n\n" +
+                 FormatRelationValidationReport(
+                     importedValidation, 8)).c_str(),
+                L"恢复完整工作区备份", MB_OK | MB_ICONERROR);
             return;
         }
-        const std::wstring prompt = L"导入预览：" +
-            std::to_wstring(imported.cores.size()) + L" 个核心，" +
-            std::to_wstring(ReferenceCount(imported)) + L" 个文件引用。\n\n"
-            L"此文件可能包含本机路径。\n\n"
-            L"选择“是”覆盖当前布局；选择“否”合并；取消则不导入。";
-        const int choice = MessageBoxW(window_, prompt.c_str(), L"导入布局",
-                                       MB_YESNOCANCEL | MB_ICONQUESTION | MB_DEFBUTTON3);
-        if (choice == IDCANCEL) return;
-        WorkspaceState candidate =
-            choice == IDYES
-                ? std::move(imported)
-                : MergeImportedState(imported);
+        WorkspaceRestorePlan plan = BuildWorkspaceRestorePlan(imported);
         const RelationValidationResult candidateValidation =
-            ValidateRelationState(candidate);
+            ValidateRelationState(plan.candidate);
         if (!candidateValidation.IsValid()) {
-            std::wstring message =
-                L"导入后的组合状态包含非法文件关系；"
-                L"当前布局没有改变。\n\n" +
-                FormatRelationValidationReport(
-                    candidateValidation, 8);
             MessageBoxW(
-                window_, message.c_str(), L"导入布局",
-                MB_OK | MB_ICONERROR);
+                window_,
+                (L"安全恢复计划未通过关系校验，当前工作区没有改变。\n\n" +
+                 FormatRelationValidationReport(
+                     candidateValidation, 8)).c_str(),
+                L"恢复完整工作区备份", MB_OK | MB_ICONERROR);
+            return;
+        }
+        const std::wstring prompt =
+            L"完整工作区恢复预览\n\n"
+            L"保留当前文件引用：" +
+            std::to_wstring(plan.existingReferencesKept) + L" 个\n"
+            L"恢复备份文件引用：" +
+            std::to_wstring(plan.restoredReferences) + L" 个\n"
+            L"跳过源文件缺失：" +
+            std::to_wstring(plan.missingReferencesSkipped) + L" 个\n"
+            L"创建容量延续核心：" +
+            std::to_wstring(plan.continuationCoresCreated) + L" 个\n"
+            L"暂不恢复的关系：" +
+            std::to_wstring(plan.relationshipRepairsRequired) + L" 项\n\n"
+            L"当前新增文件不会被删除；每个核心最多18项；真实文件不会移动。";
+        if (MessageBoxW(
+                window_, prompt.c_str(), L"恢复完整工作区备份",
+                MB_OKCANCEL | MB_ICONINFORMATION | MB_DEFBUTTON2) != IDOK) {
             return;
         }
         if (!stateRecoveryBlocked_ && !SaveState()) return;
         CreateHistoryBackup(true);
         WorkspaceState before = state_;
-        state_ = std::move(candidate);
+        state_ = std::move(plan.candidate);
         NormalizeStateModel();
         state_.workspacePaused = false;
         ApplyCompanionWorkspaceFrame();
+        ApplyCoreRatiosToWorkspace();
         RefreshResponsiveMetrics(true);
-        UpdateCoreRatios();
+        (void)ClampCoreClustersToWorkspace();
         if (!CommitImportedStateWrite(
                 stateRecoveryBlocked_,
                 [&]() {
@@ -21131,8 +21740,9 @@ private:
                 })) {
             state_ = std::move(before);
             NormalizeStateModel();
+            ApplyCoreRatiosToWorkspace();
             RefreshResponsiveMetrics(true);
-            SetStatus(L"导入写入失败；已完整恢复导入前布局");
+            SetStatus(L"完整工作区恢复失败；已回到恢复前状态");
             return;
         }
         dirty_ = false;
@@ -21140,7 +21750,7 @@ private:
         iconCache_.clear();
         iconShadowCache_.clear();
         layoutDirty_ = true;
-        SetStatus(choice == IDYES ? L"布局已覆盖导入" : L"布局已合并导入");
+        SetStatus(L"完整工作区已安全恢复；当前新增内容继续保留");
         Invalidate();
     }
 
@@ -27673,6 +28283,125 @@ bool RunSelfTest() {
         !GravityApp::ValidateFileRenameStem(L"rename", nullptr) ||
         GravityApp::ValidateFileRenameStem(L"CON", nullptr) ||
         GravityApp::ValidateFileRenameStem(L"bad:name", nullptr)) {
+        return false;
+    }
+
+    WorkspaceState currentLayoutState;
+    Core currentLayoutCore;
+    currentLayoutCore.id = 700;
+    currentLayoutCore.name = L"current-layout";
+    currentLayoutCore.xRatio = 0.20f;
+    currentLayoutCore.yRatio = 0.30f;
+    FileItem matchedLayoutItem;
+    matchedLayoutItem.id = 701;
+    matchedLayoutItem.path = L"C:\\current\\matched.txt";
+    matchedLayoutItem.displayName = L"current-display-name";
+    matchedLayoutItem.slot = 0;
+    matchedLayoutItem.angleDegrees = 10.0f;
+    FileItem currentOnlyLayoutItem;
+    currentOnlyLayoutItem.id = 702;
+    currentOnlyLayoutItem.path = L"C:\\current\\new-after-snapshot.txt";
+    currentOnlyLayoutItem.slot = 1;
+    currentLayoutCore.files = {
+        matchedLayoutItem, currentOnlyLayoutItem};
+    currentLayoutState.cores.push_back(currentLayoutCore);
+
+    WorkspaceState savedLayoutState;
+    Core savedLayoutCore = currentLayoutCore;
+    savedLayoutCore.xRatio = 0.72f;
+    savedLayoutCore.yRatio = 0.64f;
+    savedLayoutCore.files.clear();
+    FileItem savedMatchedLayoutItem = matchedLayoutItem;
+    savedMatchedLayoutItem.path = L"C:\\backup\\must-not-restore.txt";
+    savedMatchedLayoutItem.displayName = L"must-not-restore";
+    savedMatchedLayoutItem.slot = 8;
+    savedMatchedLayoutItem.angleDegrees = 145.0f;
+    FileItem removedSinceSnapshotItem;
+    removedSinceSnapshotItem.id = 703;
+    removedSinceSnapshotItem.path = L"C:\\backup\\removed.txt";
+    removedSinceSnapshotItem.slot = 9;
+    savedLayoutCore.files = {
+        savedMatchedLayoutItem, removedSinceSnapshotItem};
+    savedLayoutState.cores.push_back(savedLayoutCore);
+
+    WorkspaceState parsedLayoutSnapshot;
+    if (!DeserializeLayoutSnapshot(
+            SerializeLayoutSnapshot(savedLayoutState),
+            parsedLayoutSnapshot) ||
+        parsedLayoutSnapshot.cores.size() != 1 ||
+        parsedLayoutSnapshot.cores.front().files.size() != 2 ||
+        !parsedLayoutSnapshot.cores.front().files.front().path.empty()) {
+        return false;
+    }
+    const LayoutSnapshotRestoreSummary layoutSummary =
+        ApplyLayoutSnapshot(currentLayoutState, parsedLayoutSnapshot);
+    const Core& appliedLayoutCore = currentLayoutState.cores.front();
+    if (layoutSummary.restoredCores != 1 ||
+        layoutSummary.restoredFiles != 1 ||
+        layoutSummary.currentOnlyFilesKept != 1 ||
+        layoutSummary.movedFilesSkipped != 1 ||
+        appliedLayoutCore.files.size() != 2 ||
+        std::abs(appliedLayoutCore.xRatio - 0.72f) > 0.001f ||
+        appliedLayoutCore.files[0].slot != 8 ||
+        std::abs(appliedLayoutCore.files[0].angleDegrees - 145.0f) >
+            0.001f ||
+        appliedLayoutCore.files[0].path != matchedLayoutItem.path ||
+        appliedLayoutCore.files[0].displayName !=
+            matchedLayoutItem.displayName ||
+        appliedLayoutCore.files[1].id != currentOnlyLayoutItem.id ||
+        appliedLayoutCore.files[1].slot != currentOnlyLayoutItem.slot) {
+        return false;
+    }
+
+    GravityApp restorePlanApp;
+    Core restoreCurrentCore;
+    restoreCurrentCore.id = 800;
+    restoreCurrentCore.name = L"capacity-current";
+    for (int index = 0; index < 17; ++index) {
+        FileItem currentCapacityItem;
+        currentCapacityItem.id = 810 + index;
+        currentCapacityItem.path = L"C:\\current\\capacity-" +
+            std::to_wstring(index) + L".txt";
+        currentCapacityItem.slot = index;
+        restoreCurrentCore.files.push_back(currentCapacityItem);
+    }
+    restorePlanApp.state_.cores.push_back(restoreCurrentCore);
+    restorePlanApp.state_.nextId = 2000;
+
+    WorkspaceState restoreBackupState;
+    Core restoreBackupCore;
+    restoreBackupCore.id = restoreCurrentCore.id;
+    restoreBackupCore.name = L"capacity-backup";
+    for (int index = 0; index < 3; ++index) {
+        FileItem backupCapacityItem;
+        backupCapacityItem.id = 900 + index;
+        backupCapacityItem.path = L"C:\\backup\\capacity-" +
+            std::to_wstring(index) + L".txt";
+        backupCapacityItem.slot = index;
+        restoreBackupCore.files.push_back(backupCapacityItem);
+    }
+    restoreBackupState.cores.push_back(restoreBackupCore);
+    restoreBackupState.nextId = 3000;
+    const WorkspaceRestorePlan restorePlan =
+        restorePlanApp.BuildWorkspaceRestorePlan(
+            restoreBackupState, false);
+    int restorePlanReferences = 0;
+    bool restorePlanCapacityValid = true;
+    for (const Core& restoredCore : restorePlan.candidate.cores) {
+        restorePlanReferences +=
+            static_cast<int>(restoredCore.files.size());
+        restorePlanCapacityValid = restorePlanCapacityValid &&
+            restoredCore.files.size() <= kCoreFileCapacity;
+    }
+    if (restorePlan.existingReferencesKept != 17 ||
+        restorePlan.restoredReferences != 3 ||
+        restorePlan.missingReferencesSkipped != 0 ||
+        restorePlan.continuationCoresCreated != 1 ||
+        restorePlanReferences != 20 ||
+        !restorePlanCapacityValid ||
+        restorePlan.candidate.cores.size() != 2 ||
+        restorePlan.candidate.cores.front().files.size() != 18 ||
+        restorePlan.candidate.cores.back().files.size() != 2) {
         return false;
     }
 
