@@ -21409,8 +21409,15 @@ private:
                 transaction.stage = ManagedTransactionStage::RolledBack;
                 (void)PersistManagedTransaction(transaction);
                 ClearManagedTransaction();
+                SetStatus(
+                    L"还原失败：事务记录未完成，真实文件已安全回滚到文件库");
+            } else {
+                AppendRuntimeDiagnostic(
+                    "restore_transaction_persist_rollback_failed",
+                    E_FAIL, ERROR_WRITE_FAULT);
+                SetStatus(
+                    L"还原未完成：核心节点仍保留；请不要重复操作，重启后会自动恢复安全状态");
             }
-            SetStatus(L"还原失败：事务记录未完成，已尝试回滚真实文件");
             return false;
         }
         if (!RemoveItemTransactional(
@@ -21424,8 +21431,15 @@ private:
                 transaction.stage = ManagedTransactionStage::RolledBack;
                 (void)PersistManagedTransaction(transaction);
                 ClearManagedTransaction();
+                SetStatus(
+                    L"还原失败：核心状态未更新，真实文件已安全回滚到文件库");
+            } else {
+                AppendRuntimeDiagnostic(
+                    "restore_state_remove_rollback_failed",
+                    E_FAIL, ERROR_WRITE_FAULT);
+                SetStatus(
+                    L"还原未完成：核心节点仍保留；请不要重复操作，重启后会自动恢复安全状态");
             }
-            SetStatus(L"还原失败：核心状态未移除，真实文件已回滚");
             return false;
         }
         transaction.stage = ManagedTransactionStage::StateSaved;
@@ -22759,6 +22773,33 @@ private:
                    INVALID_FILE_ATTRIBUTES;
     }
 
+    static void NotifyShellFileMove(
+        const std::wstring& source,
+        const std::wstring& destination) {
+        const std::wstring sourceParent = NormalizePath(
+            std::filesystem::path(source).parent_path().wstring());
+        const std::wstring destinationParent = NormalizePath(
+            std::filesystem::path(destination).parent_path().wstring());
+        if (PathEquals(sourceParent, destinationParent)) {
+            SHChangeNotify(
+                SHCNE_RENAMEITEM, SHCNF_PATHW,
+                source.c_str(), destination.c_str());
+            return;
+        }
+
+        // A cross-directory move is a deletion in the source folder and a
+        // creation in the destination folder. Reporting it as a rename alone
+        // can leave Explorer's Desktop view stale, even though the file has
+        // already been restored successfully.
+        SHChangeNotify(SHCNE_DELETE, SHCNF_PATHW, source.c_str(), nullptr);
+        SHChangeNotify(SHCNE_CREATE, SHCNF_PATHW,
+                       destination.c_str(), nullptr);
+        SHChangeNotify(SHCNE_UPDATEDIR, SHCNF_PATHW,
+                       sourceParent.c_str(), nullptr);
+        SHChangeNotify(SHCNE_UPDATEDIR, SHCNF_PATHW,
+                       destinationParent.c_str(), nullptr);
+    }
+
     bool MoveFileWithoutReplacement(
         const std::wstring& source,
         const std::wstring& destination,
@@ -22789,8 +22830,7 @@ private:
             }
             return false;
         }
-        SHChangeNotify(SHCNE_RENAMEITEM, SHCNF_PATHW,
-                       source.c_str(), destination.c_str());
+        NotifyShellFileMove(source, destination);
         return true;
     }
 
