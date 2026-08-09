@@ -6170,8 +6170,7 @@ private:
             return "desktop_health_host_replaced";
         }
         const bool dividerAttached =
-            GetWindow(dividerHandleWindow_, GW_OWNER) ==
-            interactionWindow_;
+            GetParent(dividerHandleWindow_) == interactionWindow_;
         if (desktopChildHosted_) {
             if (GetParent(window_) != desktopHost_) {
                 // Explorer may move a desktop child between its two internal
@@ -13161,21 +13160,19 @@ private:
         const LONG_PTR style =
             GetWindowLongPtrW(dividerHandleWindow_, GWL_STYLE);
         bool frameChanged = false;
-        if ((style & WS_CHILD) != 0) {
+        if ((style & WS_CHILD) == 0) {
             SetWindowLongPtrW(
                 dividerHandleWindow_, GWL_STYLE,
-                (style & ~static_cast<LONG_PTR>(WS_CHILD)) |
-                    static_cast<LONG_PTR>(WS_POPUP));
-            SetParent(dividerHandleWindow_, nullptr);
+                (style & ~static_cast<LONG_PTR>(WS_POPUP)) |
+                    static_cast<LONG_PTR>(WS_CHILD));
             frameChanged = true;
         }
-        // The interaction-island popup is already proven to remain above the
-        // Windows desktop icons while staying below ordinary applications.
-        // Owning the tiny handle by that island preserves the same z-order.
-        if (GetWindow(dividerHandleWindow_, GW_OWNER) != interactionWindow_) {
-            SetWindowLongPtrW(
-                dividerHandleWindow_, GWLP_HWNDPARENT,
-                reinterpret_cast<LONG_PTR>(interactionWindow_));
+        // The handle is part of the interaction island, not an independent
+        // desktop popup.  Explorer can temporarily hide an owned popup during
+        // Win+D while leaving the island visible, which made only the triangle
+        // disappear.  A child follows the island as one lifecycle unit.
+        if (GetParent(dividerHandleWindow_) != interactionWindow_) {
+            SetParent(dividerHandleWindow_, interactionWindow_);
             frameChanged = true;
         }
         if (frameChanged) {
@@ -23922,20 +23919,18 @@ private:
             ShowWindow(dividerHandleWindow_, SW_HIDE);
             return;
         }
-        RECT workspace{};
-        if (GetWindowRect(window_, &workspace) == FALSE) {
-            return;
-        }
         const int width = DividerHandleWidthPixels();
         const int height = DividerHandleHeightPixels();
-        POINT origin{workspace.left - width / 2, workspace.top};
+        // interactionWindow_ starts exactly one handle half-width to the
+        // left of the visual workspace, so (0, 0) keeps the triangle centred
+        // on the same divider without a second screen-space positioning path.
         SetWindowPos(
             dividerHandleWindow_,
-            DesktopCompanionInsertAfter(),
-            origin.x, origin.y,
+            HWND_TOP,
+            0, 0,
             width, height,
-            SWP_NOACTIVATE | SWP_NOOWNERZORDER |
-                SWP_SHOWWINDOW);
+            SWP_NOACTIVATE |
+            SWP_SHOWWINDOW);
         UpdateDividerHandleHitRegion();
         UpdateDividerHandleVisual();
         UpdateDividerTooltipRectangle();
