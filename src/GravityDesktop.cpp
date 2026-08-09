@@ -19030,12 +19030,19 @@ private:
     bool ConfirmManagedCollection(
         const std::wstring& sourcePath,
         const Core& target) {
-        if (!ManagedCollectionConfirmationRequired()) {
+        const bool fromPublicDesktop = IsPublicDesktopManagedFile(sourcePath);
+        // Public Desktop entries are shared by every Windows user. Keep their
+        // confirmation explicit even while the regular desktop has a short
+        // confirmation grace period.
+        if (!fromPublicDesktop && !ManagedCollectionConfirmationRequired()) {
             return true;
         }
-        const std::wstring message =
-            L"将“" + FileDisplayName(sourcePath) + L"”收纳到“" +
-            target.name + L"”？它会从桌面移走，之后可随时恢复。";
+        const std::wstring message = fromPublicDesktop
+            ? L"将“" + FileDisplayName(sourcePath) + L"”收纳到“" +
+                  target.name +
+                  L"”？它会从公共桌面移走，其他 Windows 用户也将不再看到这个快捷方式；之后可随时恢复。"
+            : L"将“" + FileDisplayName(sourcePath) + L"”收纳到“" +
+                  target.name + L"”？它会从桌面移走，之后可随时恢复。";
         const TASKDIALOG_BUTTON buttons[] = {
             {IDYES, L"收纳"},
             {IDCANCEL, L"取消"},
@@ -19046,8 +19053,9 @@ private:
                          TDF_SIZE_TO_CONTENT;
         dialog.pszWindowTitle = L"收纳到核心";
         dialog.pszContent = message.c_str();
-        dialog.pszFooter =
-            L"确认后，连续收纳文件时10分钟内不再询问。";
+        dialog.pszFooter = fromPublicDesktop
+            ? L"公共桌面项目每次收纳都会再次确认。"
+            : L"确认后，连续收纳文件时10分钟内不再询问。";
         dialog.pszMainIcon = TD_WARNING_ICON;
         dialog.cButtons = static_cast<UINT>(
             sizeof(buttons) / sizeof(buttons[0]));
@@ -22566,6 +22574,18 @@ private:
         return path;
     }
 
+    std::optional<std::filesystem::path> PublicDesktopPath() const {
+        PWSTR desktop = nullptr;
+        if (FAILED(SHGetKnownFolderPath(
+                FOLDERID_PublicDesktop, KF_FLAG_DEFAULT, nullptr,
+                &desktop))) {
+            return std::nullopt;
+        }
+        std::filesystem::path path(desktop);
+        CoTaskMemFree(desktop);
+        return path;
+    }
+
     bool PersistManagedTransaction(
         const ManagedFileTransaction& transaction) const {
         const std::filesystem::path path = ManagedTransactionPath();
@@ -22863,6 +22883,18 @@ private:
         return true;
     }
 
+    bool IsPublicDesktopManagedFile(const std::wstring& path) const {
+        const std::optional<std::filesystem::path> publicDesktop =
+            PublicDesktopPath();
+        if (!publicDesktop.has_value()) {
+            return false;
+        }
+        const std::wstring normalized = NormalizePath(path);
+        const std::wstring parent = NormalizePath(
+            std::filesystem::path(normalized).parent_path().wstring());
+        return PathEquals(parent, NormalizePath(publicDesktop->wstring()));
+    }
+
     bool IsEligibleDesktopManagedFile(
         const std::wstring& path,
         std::wstring* reason = nullptr) const {
@@ -22891,8 +22923,13 @@ private:
         }
         const std::wstring parent = NormalizePath(
             std::filesystem::path(normalized).parent_path().wstring());
-        if (!PathEquals(parent, NormalizePath(desktop->wstring()))) {
-            if (reason != nullptr) *reason = L"该文件不在当前用户桌面目录";
+        const bool onCurrentUserDesktop =
+            PathEquals(parent, NormalizePath(desktop->wstring()));
+        const bool onPublicDesktop = IsPublicDesktopManagedFile(normalized);
+        if (!onCurrentUserDesktop && !onPublicDesktop) {
+            if (reason != nullptr) {
+                *reason = L"该文件不在当前用户桌面或公共桌面目录";
+            }
             return false;
         }
         const DWORD attributes = GetFileAttributesW(normalized.c_str());
