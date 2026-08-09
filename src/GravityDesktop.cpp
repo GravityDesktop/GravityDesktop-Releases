@@ -22647,7 +22647,7 @@ private:
             std::filesystem::path(CurrentExecutablePath()).parent_path() /
             L"GravityDesktopLibrary.ico";
         const std::filesystem::path durableLibraryIcon =
-            durableRecovery.parent_path() / L"GravityDesktopLibrary.ico";
+            durableRecovery.parent_path() / L"GravityDesktopLibrary-v2.ico";
         if (FilePathExists(sourceRecovery.wstring())) {
             std::filesystem::create_directories(
                 durableRecovery.parent_path(), error);
