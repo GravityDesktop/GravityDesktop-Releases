@@ -2594,6 +2594,57 @@ struct RelationshipRecoveryManifest {
     std::vector<RelationshipRecoveryCore> cores;
 };
 
+// The emergency recovery tool owns the journal.  The main process only reads
+// completed entries so it can retire stale visual references after files have
+// already been returned to the Windows desktop.  This keeps the real-file
+// operation one-way and prevents a white, unopenable node from surviving a
+// successful recovery.
+struct EmergencyRecoveryJournalEntry {
+    std::uint64_t stableId = 0;
+    std::wstring sourcePath;
+    std::wstring destinationPath;
+    std::wstring state;
+};
+
+bool DeserializeEmergencyRecoveryJournal(
+    const std::string& json,
+    std::vector<EmergencyRecoveryJournalEntry>& entries) {
+    JsonValue rootValue;
+    JsonParser parser(json);
+    if (!parser.Parse(rootValue)) return false;
+    const JsonValue::Object* root = rootValue.AsObject();
+    if (root == nullptr ||
+        static_cast<int>(NumberMember(*root, "schema_version", 0.0)) != 1) {
+        return false;
+    }
+    const JsonValue* entriesValue = FindMember(*root, "entries");
+    const JsonValue::Array* array =
+        entriesValue == nullptr ? nullptr : entriesValue->AsArray();
+    if (array == nullptr) return false;
+
+    std::vector<EmergencyRecoveryJournalEntry> parsed;
+    parsed.reserve(array->size());
+    std::unordered_set<std::uint64_t> ids;
+    for (const JsonValue& value : *array) {
+        const JsonValue::Object* object = value.AsObject();
+        if (object == nullptr) return false;
+        EmergencyRecoveryJournalEntry entry;
+        entry.stableId = static_cast<std::uint64_t>(
+            NumberMember(*object, "file_stable_id", 0.0));
+        entry.sourcePath = StringMember(*object, "source_path", L"");
+        entry.destinationPath =
+            StringMember(*object, "destination_path", L"");
+        entry.state = StringMember(*object, "state", L"");
+        if (entry.stableId == 0 || entry.state.empty() ||
+            !ids.insert(entry.stableId).second) {
+            return false;
+        }
+        parsed.push_back(std::move(entry));
+    }
+    entries = std::move(parsed);
+    return true;
+}
+
 bool DeserializeRelationshipRecoveryManifest(
     const std::string& json, RelationshipRecoveryManifest& manifest) {
     JsonValue rootValue;
@@ -3982,12 +4033,19 @@ public:
     // must never turn a successfully committed state/file transaction into a
     // rollback: that would reduce real-file safety rather than improve it.
     bool WriteStateWithRelationshipManifest(
-        const WorkspaceState& snapshot) const {
+        const WorkspaceState& snapshot,
+        bool forceRelationshipManifestWrite = false) const {
         if (stateFile_.empty() ||
             !WriteUtf8Atomic(stateFile_, SerializeState(snapshot))) {
             return false;
         }
-        (void)WriteRelationshipManifest(snapshot);
+        // A completed emergency recovery intentionally keeps its original
+        // manifest as a re-import record.  Ordinary visual saves must not
+        // overwrite that record with the now-detached workspace state.
+        if (forceRelationshipManifestWrite ||
+            !preserveExistingRelationshipManifest_) {
+            (void)WriteRelationshipManifest(snapshot);
+        }
         return true;
     }
 
@@ -4121,7 +4179,7 @@ public:
         const RelationValidationResult validation =
             ValidateRelationState(restored);
         if (!validation.IsValid() ||
-            !WriteStateWithRelationshipManifest(restored)) {
+            !WriteStateWithRelationshipManifest(restored, true)) {
             AppendRuntimeDiagnostic("relationship_recovery_restore_failed");
             return false;
         }
@@ -4306,6 +4364,139 @@ public:
         AppendRuntimeDiagnostic("desktop_fail_open_recovery_requested");
     }
 
+    void ReconcileCompletedEmergencyRecovery() {
+        const std::filesystem::path journalPath =
+            ManagedLibraryPath() / L"恢复事务.json";
+        const std::optional<std::string> text = ReadUtf8File(journalPath);
+        if (!text.has_value()) return;
+
+        std::vector<EmergencyRecoveryJournalEntry> journal;
+        if (!DeserializeEmergencyRecoveryJournal(*text, journal)) {
+            AppendRuntimeDiagnostic("emergency_recovery_journal_invalid");
+            return;
+        }
+
+        std::unordered_map<std::uint64_t, std::wstring> restoredSources;
+        for (const EmergencyRecoveryJournalEntry& entry : journal) {
+            if (entry.state != L"restored" || entry.sourcePath.empty() ||
+                entry.destinationPath.empty() ||
+                FilePathExists(entry.sourcePath) ||
+                !FilePathExists(entry.destinationPath)) {
+                continue;
+            }
+            restoredSources.emplace(entry.stableId, entry.sourcePath);
+        }
+        if (restoredSources.empty()) return;
+
+        // The independent manifest remains the recovery/re-import record even
+        // after active nodes are retired.  Never replace it with the reduced
+        // post-recovery state during normal saves.
+        const bool priorManifestPreservation =
+            preserveExistingRelationshipManifest_;
+        preserveExistingRelationshipManifest_ = true;
+
+        WorkspaceState candidate = state_;
+        std::unordered_set<std::uint64_t> removedIds;
+        std::unordered_set<std::uint64_t> affectedFamilyIds;
+        for (Core& core : candidate.cores) {
+            for (const FileItem& item : core.files) {
+                const auto restored = restoredSources.find(item.id);
+                if (restored == restoredSources.end() ||
+                    item.storageMode != FileStorageMode::Managed) {
+                    continue;
+                }
+                const std::wstring itemPath = NormalizePath(item.path);
+                const std::wstring managedPath = NormalizePath(item.managedPath);
+                const std::wstring sourcePath = NormalizePath(restored->second);
+                if (!PathEquals(itemPath, sourcePath) &&
+                    !PathEquals(managedPath, sourcePath)) {
+                    continue;
+                }
+                removedIds.insert(item.id);
+                if (item.familyId != 0) {
+                    affectedFamilyIds.insert(item.familyId);
+                }
+            }
+        }
+        if (removedIds.empty()) {
+            AppendRuntimeDiagnostic("emergency_recovery_already_reconciled");
+            return;
+        }
+
+        for (Core& core : candidate.cores) {
+            core.files.erase(
+                std::remove_if(
+                    core.files.begin(), core.files.end(),
+                    [&removedIds](const FileItem& item) {
+                        return removedIds.contains(item.id);
+                    }),
+                core.files.end());
+            core.savedBaselineLayout.erase(
+                std::remove_if(
+                    core.savedBaselineLayout.begin(),
+                    core.savedBaselineLayout.end(),
+                    [&removedIds](const CoreBaselineFileLayout& item) {
+                        return removedIds.contains(item.fileId);
+                    }),
+                core.savedBaselineLayout.end());
+        }
+
+        // A recovered member can leave a reference-only child or family peer
+        // behind.  Keep that survivor visible as an independent file rather
+        // than retaining a dangling parent/family identifier.
+        for (FileFamily& family : candidate.families) {
+            if (removedIds.contains(family.rootFileId) ||
+                removedIds.contains(family.currentFileId)) {
+                affectedFamilyIds.insert(family.id);
+            }
+        }
+        for (Core& core : candidate.cores) {
+            for (FileItem& item : core.files) {
+                if (removedIds.contains(item.parentFileId)) {
+                    item.parentFileId = 0;
+                    item.detachedFromUpper = true;
+                    item.childrenCollapsed = false;
+                }
+                if (affectedFamilyIds.contains(item.familyId)) {
+                    item.familyId = 0;
+                    item.parentFileId = 0;
+                    item.detachedFromUpper = true;
+                    item.childrenCollapsed = false;
+                }
+            }
+            RefreshAutomaticCoreIdentity(core);
+        }
+        candidate.families.erase(
+            std::remove_if(
+                candidate.families.begin(), candidate.families.end(),
+                [&affectedFamilyIds](const FileFamily& family) {
+                    return affectedFamilyIds.contains(family.id);
+                }),
+            candidate.families.end());
+
+        const RelationValidationResult validation =
+            ValidateRelationState(candidate);
+        if (!validation.IsValid() || stateRecoveryBlocked_ ||
+            stateFile_.empty() ||
+            !WriteStateWithRelationshipManifest(candidate)) {
+            preserveExistingRelationshipManifest_ = priorManifestPreservation;
+            AppendRuntimeDiagnostic("emergency_recovery_reconcile_failed");
+            SetStatus(L"紧急恢复后的引用未清理；真实文件仍安全保留在桌面和文件库中");
+            return;
+        }
+
+        state_ = std::move(candidate);
+        dirty_ = false;
+        layoutCache_.clear();
+        layoutDirty_ = true;
+        iconCache_.clear();
+        iconShadowCache_.clear();
+        SetStatus(
+            L"紧急恢复已完成：已从文件核心移除 " +
+            std::to_wstring(removedIds.size()) + L" 个已还原引用");
+        AppendRuntimeDiagnostic("emergency_recovery_reconciled");
+    }
+
     bool Initialize(HWND window) {
         window_ = window;
         dpi_ = static_cast<float>(GetDpiForWindow(window_));
@@ -4334,6 +4525,7 @@ public:
             LoadState();
             RecoverPendingManagedTransaction();
             RecoverPendingCoreDissolveTransaction();
+            ReconcileCompletedEmergencyRecovery();
             MigrateLegacyManagedLibraryItems();
             LoadCoreShortLabelOverrides();
             DiscoverRelationshipRecoveryManifest();
@@ -18513,7 +18705,11 @@ private:
             AppendMenuW(
                 menu, MF_STRING, MenuRemoveItem,
                 item != nullptr &&
-                        item->storageMode == FileStorageMode::Managed
+                        item->storageMode == FileStorageMode::Managed &&
+                        !FilePathExists(item->path)
+                    ? L"移除失效引用（文件已不在文件库）"
+                    : item != nullptr &&
+                          item->storageMode == FileStorageMode::Managed
                     ? L"从核心移除并还原到桌面"
                     : L"从核心移除引用");
         }
@@ -21473,6 +21669,14 @@ private:
         if (const FileItem* item = FindItem(coreId, itemId);
             item != nullptr &&
             item->storageMode == FileStorageMode::Managed) {
+            if (!FilePathExists(item->path)) {
+                // The emergency recovery tool may already have returned this
+                // file to the normal desktop.  Do not attempt a second file
+                // move; retire only the stale visual reference.
+                (void)RemoveItemTransactional(
+                    coreId, itemId, RemoveItemChoice::Prompt, true);
+                return;
+            }
             (void)RestoreManagedItemToDesktop(coreId, itemId);
             return;
         }

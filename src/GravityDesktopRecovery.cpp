@@ -34,6 +34,7 @@ struct ManagedEntry {
 
 struct RecoveryResult {
     int restored = 0;
+    int alreadyRestored = 0;
     int conflicts = 0;
     int missing = 0;
     int failed = 0;
@@ -399,16 +400,23 @@ std::map<std::wstring, PreviousRecoveryEntry> ReadPreviousRecoveryJournal(
 }
 
 std::filesystem::path AvailableRestoreDestination(
-    const std::filesystem::path& desktop, const std::filesystem::path& name) {
+    const std::filesystem::path& desktop, const std::filesystem::path& name,
+    const std::set<std::wstring>& reservedDestinations) {
     const std::filesystem::path requested = desktop / name.filename();
-    if (!FileExists(requested)) return requested;
+    if (!FileExists(requested) &&
+        !reservedDestinations.contains(NormalizePath(requested.wstring()))) {
+        return requested;
+    }
     const std::wstring stem = name.stem().wstring();
     const std::wstring extension = name.extension().wstring();
     for (int index = 2; index <= 9999; ++index) {
         const std::filesystem::path candidate = desktop /
             (stem + L"（引力桌面恢复 " + std::to_wstring(index) + L"）" +
              extension);
-        if (!FileExists(candidate)) return candidate;
+        if (!FileExists(candidate) &&
+            !reservedDestinations.contains(NormalizePath(candidate.wstring()))) {
+            return candidate;
+        }
     }
     return {};
 }
@@ -442,7 +450,14 @@ std::string BuildJournal(const std::vector<std::tuple<ManagedEntry,
 
 std::wstring ResultText(const RecoveryResult& result) {
     std::wostringstream output;
-    output << L"恢复完成\n\n成功恢复：" << result.restored
+    output << (result.failed == 0 && result.conflicts == 0
+                   ? L"恢复完成"
+                   : L"恢复未完全完成")
+           << L"\n\n本次成功恢复：" << result.restored;
+    if (result.alreadyRestored > 0) {
+        output << L"\n此前已恢复：" << result.alreadyRestored;
+    }
+    output
            << L"\n存在冲突：" << result.conflicts
            << L"\n源文件缺失：" << result.missing
            << L"\n恢复失败：" << result.failed;
@@ -475,8 +490,28 @@ bool RunRecovery(const std::filesystem::path& library, bool interactive,
                                      kTitle, MB_OK | MB_ICONERROR);
         return false;
     }
+    const std::filesystem::path journalPath = library / L"恢复事务.json";
+    const auto previous = ReadPreviousRecoveryJournal(journalPath);
+    int pendingEntryCount = 0;
+    for (const ManagedEntry& entry : entries) {
+        const std::filesystem::path source(entry.source);
+        const auto found = previous.find(NormalizePath(source));
+        if (found != previous.end() &&
+            found->second.state == L"restored" &&
+            !FileExists(source) && FileExists(found->second.destination)) {
+            continue;
+        }
+        ++pendingEntryCount;
+    }
+    if (pendingEntryCount == 0) {
+        if (interactive) {
+            MessageBoxW(nullptr, L"所有已托管文件都已恢复到 Windows 桌面。", kTitle,
+                        MB_OK | MB_ICONINFORMATION);
+        }
+        return true;
+    }
     if (interactive) {
-        const std::wstring prompt = L"发现 " + std::to_wstring(entries.size()) +
+        const std::wstring prompt = L"发现 " + std::to_wstring(pendingEntryCount) +
             L" 个由引力桌面托管的文件。\n\n"
             L"是否将它们恢复到 Windows 桌面？\n"
             L"核心关系记录会继续保留，以后可以重新导入。";
@@ -488,8 +523,10 @@ bool RunRecovery(const std::filesystem::path& library, bool interactive,
 
     std::vector<std::tuple<ManagedEntry, std::filesystem::path, std::wstring>> journal;
     journal.reserve(entries.size());
-    const std::filesystem::path journalPath = library / L"恢复事务.json";
-    const auto previous = ReadPreviousRecoveryJournal(journalPath);
+    // Every destination is decided before the first move.  Reserve each one
+    // immediately so two source files with the same original desktop name
+    // cannot both be scheduled for the same target in one recovery batch.
+    std::set<std::wstring> reservedDestinations;
     for (const ManagedEntry& entry : entries) {
         const std::filesystem::path source(entry.source);
         if (!IsPathInside(source, library)) {
@@ -498,11 +535,14 @@ bool RunRecovery(const std::filesystem::path& library, bool interactive,
             continue;
         }
         if (const auto found = previous.find(NormalizePath(source));
-            found != previous.end() && FileExists(found->second.destination)) {
+            found != previous.end() && !FileExists(source) &&
+            FileExists(found->second.destination)) {
             // A prior recovery reached the destination before a crash.  Do not
             // manufacture a second desktop copy when the tool is restarted.
             journal.emplace_back(entry, found->second.destination, L"restored");
-            ++result.restored;
+            reservedDestinations.insert(
+                NormalizePath(found->second.destination.wstring()));
+            ++result.alreadyRestored;
             continue;
         }
         const std::filesystem::path original(entry.originalPath);
@@ -512,7 +552,9 @@ bool RunRecovery(const std::filesystem::path& library, bool interactive,
             destination = found->second.destination;
         } else {
             destination = AvailableRestoreDestination(
-                *desktop, original.empty() ? source.filename() : original.filename());
+                *desktop,
+                original.empty() ? source.filename() : original.filename(),
+                reservedDestinations);
         }
         if (destination.empty()) {
             ++result.conflicts;
@@ -520,6 +562,7 @@ bool RunRecovery(const std::filesystem::path& library, bool interactive,
             continue;
         }
         journal.emplace_back(entry, destination, L"pending");
+        reservedDestinations.insert(NormalizePath(destination.wstring()));
     }
 
     if (!WriteUtf8Atomic(journalPath, BuildJournal(journal))) {
@@ -581,6 +624,10 @@ bool RunSelfTest() {
     const bool written = WriteUtf8Atomic(root / L"恢复清单.json", manifest);
     std::vector<ManagedEntry> entries;
     const std::filesystem::path restored = desktop / L"sample.txt";
+    const std::set<std::wstring> reserved{
+        NormalizePath(restored.wstring())};
+    const std::filesystem::path alternate = AvailableRestoreDestination(
+        desktop, L"sample.txt", reserved);
     const std::vector<std::tuple<ManagedEntry, std::filesystem::path,
                                  std::wstring>> journal{
         {ManagedEntry{1, source.wstring(), restored.wstring()}, restored,
@@ -592,7 +639,9 @@ bool RunSelfTest() {
         ReadManagedEntries(root / L"恢复清单.json", entries) &&
         entries.size() == 1 && entries.front().id == 1 &&
         previous.size() == 1 && previous.begin()->second.destination == restored &&
-        previous.begin()->second.state == L"restored";
+        previous.begin()->second.state == L"restored" &&
+        !alternate.empty() &&
+        NormalizePath(alternate) != NormalizePath(restored);
     std::filesystem::remove_all(root, error);
     return parsed;
 }
