@@ -92,12 +92,14 @@ constexpr UINT_PTR kDesktopHostWatchTimer = 10;
 constexpr UINT_PTR kDesktopReconnectTimer = 11;
 constexpr UINT_PTR kInteractionLayerRepairTimer = 12;
 constexpr UINT_PTR kDesktopVisibilityRestoreTimer = 13;
+constexpr UINT_PTR kDesktopHostMigrationTimer = 14;
 constexpr auto kManagedCollectionConfirmationWindow =
     std::chrono::minutes(10);
 constexpr UINT kDesktopHostWatchIntervalMs = 2000;
 constexpr UINT kDesktopReconnectIntervalMs = 250;
 constexpr UINT kInteractionLayerRepairDelayMs = 600;
 constexpr UINT kDesktopVisibilityRestoreDelayMs = 180;
+constexpr UINT kDesktopHostMigrationSettleDelayMs = 450;
 constexpr int kDesktopReconnectAttemptLimit = 40;
 constexpr std::uintmax_t kRuntimeDiagnosticLogMaximumBytes =
     2U * 1024U * 1024U;
@@ -1528,6 +1530,19 @@ std::wstring MakeDisplayName(const std::wstring& path, bool isDirectory) {
     if (title.empty()) {
         title = L"未知文件";
     }
+    // Emergency restore destinations append this suffix to avoid overwriting a
+    // desktop file.  Keeping its tail visible prevents a restored file from
+    // looking identical to the original after the normal 12-character trim.
+    constexpr std::wstring_view kRestoreMarker = L"（引力桌面恢复";
+    const std::size_t restore = title.find(kRestoreMarker);
+    if (restore != std::wstring::npos && title.size() > 12) {
+        const std::wstring prefix = Shorten(title.substr(0, restore), 5);
+        std::wstring suffix = title.substr(restore);
+        if (suffix.size() > 6) {
+            suffix = L"恢复" + suffix.substr(kRestoreMarker.size());
+        }
+        return Shorten(prefix + L"…" + suffix, 12);
+    }
     return Shorten(title, 12);
 }
 
@@ -2779,7 +2794,11 @@ int NormalizeDisplayLimit(int value) {
     return kNormalVisibleLimit;
 }
 
-bool DeserializeState(const std::string& json, WorkspaceState& state) {
+bool DeserializeState(const std::string& json, WorkspaceState& state,
+                      bool* automaticCoreNameMigrated = nullptr) {
+    if (automaticCoreNameMigrated != nullptr) {
+        *automaticCoreNameMigrated = false;
+    }
     JsonValue rootValue;
     JsonParser parser(json);
     if (!parser.Parse(rootValue)) {
@@ -3272,7 +3291,13 @@ bool DeserializeState(const std::string& json, WorkspaceState& state) {
             core.layoutVersion = documentVersion >= 4 ? kLayoutVersion
                                                        : core.layoutVersion;
         }
-        core.name = MigrateAutomaticCoreName(core.name);
+        const std::wstring migratedName =
+            MigrateAutomaticCoreName(core.name);
+        if (automaticCoreNameMigrated != nullptr &&
+            migratedName != core.name) {
+            *automaticCoreNameMigrated = true;
+        }
+        core.name = migratedName;
         loaded.cores.push_back(std::move(core));
     }
 
@@ -4345,6 +4370,7 @@ public:
     void RequestDesktopFailOpen(const char* reason,
                                 HRESULT result = S_OK,
                                 DWORD win32Error = ERROR_SUCCESS) {
+        CancelPendingDesktopHostMigration();
         AppendRuntimeDiagnostic(reason, result, win32Error);
         if (failOpenActive_ || failOpenRequested_ ||
             lifecycleWindow_ == nullptr ||
@@ -4593,6 +4619,12 @@ public:
             workspaceVisible_ =
                 IsWindowVisible(window_) != FALSE;
             EnsureInteractionWindowPresented();
+            // Persist metadata-only migrations after all startup recovery
+            // steps have completed.  This keeps automatic core names from
+            // changing only in memory while avoiding a write during parsing.
+            if (dirty_ && !stateRecoveryBlocked_) {
+                ScheduleSave(false);
+            }
             AppendRuntimeDiagnostic("startup_initialized");
         }
         return SUCCEEDED(textResult);
@@ -4608,6 +4640,8 @@ public:
                 lifecycleWindow_, kDesktopReconnectTimer);
             KillTimer(
                 lifecycleWindow_, kInteractionLayerRepairTimer);
+            KillTimer(
+                lifecycleWindow_, kDesktopHostMigrationTimer);
             if (shellHookRegistered_) {
                 DeregisterShellHookWindow(lifecycleWindow_);
                 shellHookRegistered_ = false;
@@ -5922,44 +5956,87 @@ private:
         applyingWorkspaceFrame_ = false;
     }
 
-    bool AdoptExplorerDesktopHostMigration() {
-        if (!desktopChildHosted_ || window_ == nullptr ||
-            IsWindow(window_) == FALSE) {
+    bool IsCompatibleExplorerDesktopHost(HWND host) const {
+        if (host == nullptr || IsWindow(host) == FALSE) {
             return false;
         }
-        const HWND actualHost = GetParent(window_);
-        if (actualHost == nullptr || actualHost == desktopHost_ ||
-            IsWindow(actualHost) == FALSE) {
-            return false;
-        }
-
         wchar_t className[32]{};
-        GetClassNameW(actualHost, className,
+        GetClassNameW(host, className,
                       static_cast<int>(std::size(className)));
         if (wcscmp(className, L"Progman") != 0 &&
             wcscmp(className, L"WorkerW") != 0) {
             return false;
         }
-
         const HWND shellWindow = GetShellWindow();
         DWORD shellProcessId = 0;
-        DWORD actualHostProcessId = 0;
+        DWORD hostProcessId = 0;
         if (shellWindow != nullptr) {
             GetWindowThreadProcessId(shellWindow, &shellProcessId);
         }
-        GetWindowThreadProcessId(actualHost, &actualHostProcessId);
-        if (actualHostProcessId == 0 ||
-            (shellProcessId != 0 &&
-             actualHostProcessId != shellProcessId)) {
+        GetWindowThreadProcessId(host, &hostProcessId);
+        return hostProcessId != 0 &&
+               (shellProcessId == 0 || hostProcessId == shellProcessId);
+    }
+
+    void CancelPendingDesktopHostMigration() {
+        if (lifecycleWindow_ != nullptr) {
+            KillTimer(lifecycleWindow_, kDesktopHostMigrationTimer);
+        }
+        pendingDesktopHostMigration_ = nullptr;
+    }
+
+    bool QueueExplorerDesktopHostMigration() {
+        if (!desktopChildHosted_ || window_ == nullptr ||
+            IsWindow(window_) == FALSE) {
+            return false;
+        }
+        const HWND actualHost = GetParent(window_);
+        if (actualHost == desktopHost_) {
+            CancelPendingDesktopHostMigration();
+            return false;
+        }
+        if (!IsCompatibleExplorerDesktopHost(actualHost)) {
             return false;
         }
 
-        // Explorer moves the whole desktop child band between Progman and a
-        // WorkerW during Win+D. The visual HWND follows that move
-        // automatically; adopt its real parent and retarget only the popup
-        // interaction owner. Reparenting the visual window back starts a tug
-        // of war with Explorer and causes the multi-second disappearance.
-        desktopHost_ = actualHost;
+        // Win+D and Explorer transitions can briefly bounce a desktop child
+        // between Progman and WorkerW.  Treat the first observation as a
+        // candidate only; accepting it immediately made our visual, input and
+        // divider surfaces fight over two valid Explorer hosts.
+        if (pendingDesktopHostMigration_ == actualHost) {
+            return true;
+        }
+        pendingDesktopHostMigration_ = actualHost;
+        AppendRuntimeDiagnostic("desktop_host_migration_pending");
+        if (lifecycleWindow_ != nullptr &&
+            SetTimer(lifecycleWindow_, kDesktopHostMigrationTimer,
+                     kDesktopHostMigrationSettleDelayMs, nullptr) == 0) {
+            AppendRuntimeDiagnostic("desktop_host_migration_timer_failed",
+                                    HRESULT_FROM_WIN32(GetLastError()),
+                                    GetLastError());
+        }
+        return true;
+    }
+
+    bool CommitPendingDesktopHostMigration() {
+        if (lifecycleWindow_ != nullptr) {
+            KillTimer(lifecycleWindow_, kDesktopHostMigrationTimer);
+        }
+        const HWND candidate = pendingDesktopHostMigration_;
+        pendingDesktopHostMigration_ = nullptr;
+        if (candidate == nullptr || window_ == nullptr ||
+            !desktopChildHosted_ || IsWindow(window_) == FALSE ||
+            GetParent(window_) != candidate ||
+            !IsCompatibleExplorerDesktopHost(candidate)) {
+            if (candidate != nullptr) {
+                AppendRuntimeDiagnostic("desktop_host_migration_cancelled");
+            }
+            return false;
+        }
+
+        // Commit only the final, settled parent.  The visual child already
+        // moved with Explorer, so never call SetParent here.
+        desktopHost_ = candidate;
         desktopHostAttachmentAttempted_ = true;
         AttachInteractionWindowToCompanionLayer();
         AttachDividerHandleWindowToCompanionLayer();
@@ -5969,10 +6046,18 @@ private:
 
     void AttachToDesktopCompanionLayer() {
         if (window_ == nullptr) return;
-        (void)AdoptExplorerDesktopHostMigration();
+        (void)QueueExplorerDesktopHostMigration();
+        // While Explorer is settling a child-band transition, keep the visual
+        // where Explorer placed it.  Reparenting it back to the previous host
+        // here would restart the Progman/WorkerW tug-of-war.
+        if (desktopChildHosted_ &&
+            IsCompatibleExplorerDesktopHost(GetParent(window_)) &&
+            GetParent(window_) != desktopHost_) {
+            return;
+        }
         // Keep the current Explorer host unless Explorer itself migrated the
-        // visual child band. AdoptExplorerDesktopHostMigration handles that
-        // legitimate Progman/WorkerW transition before this fallback path.
+        // visual child band. A settled migration is committed asynchronously;
+        // this fallback path must not race that transition.
         HWND desktopHost = DesktopHostStillUsable(desktopHost_)
             ? desktopHost_
             : FindDesktopViewHost();
@@ -6089,6 +6174,12 @@ private:
             interactionWindow_;
         if (desktopChildHosted_) {
             if (GetParent(window_) != desktopHost_) {
+                // Explorer may move a desktop child between its two internal
+                // hosts during a shell transition.  A compatible candidate is
+                // settled by the migration timer; it is not a damaged surface.
+                if (IsCompatibleExplorerDesktopHost(GetParent(window_))) {
+                    return nullptr;
+                }
                 return "desktop_health_visual_parent_changed";
             }
             if ((GetWindowLongPtrW(
@@ -6390,6 +6481,10 @@ private:
     }
 
     void HandleDesktopLifecycleTimer(WPARAM timer) {
+        if (timer == kDesktopHostMigrationTimer) {
+            (void)CommitPendingDesktopHostMigration();
+            return;
+        }
         if (timer == kInteractionLayerRepairTimer) {
             KillTimer(
                 lifecycleWindow_,
@@ -6401,7 +6496,7 @@ private:
             if (initialized_ && !shuttingDown_ &&
                 !exitRequested_ && !failOpenActive_ &&
                 !desktopReconnectPending_) {
-                (void)AdoptExplorerDesktopHostMigration();
+                (void)QueueExplorerDesktopHostMigration();
                 if (const char* healthFailure =
                         DesktopSurfaceHealthFailure()) {
                     AppendRuntimeDiagnostic(healthFailure);
@@ -24047,11 +24142,14 @@ private:
         const std::optional<std::string> stateText = ReadUtf8File(stateFile_);
         if (stateText) {
             WorkspaceState loaded;
-            if (DeserializeState(*stateText, loaded)) {
+            bool automaticCoreNameMigrated = false;
+            if (DeserializeState(*stateText, loaded,
+                                 &automaticCoreNameMigrated)) {
                 const RelationValidationResult validation =
                     ValidateRelationState(loaded);
                 state_ = std::move(loaded);
                 if (validation.IsValid()) {
+                    dirty_ = automaticCoreNameMigrated;
                     NotifyPendingSessionEndRecovery();
                     return;
                 }
@@ -24084,7 +24182,9 @@ private:
             ReadUtf8File(stateFile_.wstring() + L".bak");
         if (backup) {
             WorkspaceState loaded;
-            if (DeserializeState(*backup, loaded)) {
+            bool automaticCoreNameMigrated = false;
+            if (DeserializeState(*backup, loaded,
+                                 &automaticCoreNameMigrated)) {
                 const RelationValidationResult validation =
                     ValidateRelationState(loaded);
                 state_ = std::move(loaded);
@@ -24274,6 +24374,7 @@ private:
     bool trayRebuildPending_ = false;
     bool shellHookRegistered_ = false;
     HWND desktopHost_ = nullptr;
+    HWND pendingDesktopHostMigration_ = nullptr;
     bool desktopChildHosted_ = false;
     bool desktopHostAttachmentAttempted_ = false;
     bool desktopReconnectPending_ = false;
@@ -24593,6 +24694,8 @@ bool RunSelfTest() {
     if (MigrateAutomaticCoreName(L"新核心 7") != L"文件核心 7" ||
         MigrateAutomaticCoreName(L"新核心设计") != L"新核心设计" ||
         MigrateAutomaticCoreName(L"文件核心 7") != L"文件核心 7" ||
+        MakeDisplayName(L"C:\\Desktop\\测试文件（引力桌面恢复 2）.txt", false)
+                .find(L"恢复") == std::wstring::npos ||
         !IsTransientDesktopArtifactName(
             L"C:\\Users\\test\\Desktop\\~$document.docx") ||
         !IsTransientDesktopArtifactName(
