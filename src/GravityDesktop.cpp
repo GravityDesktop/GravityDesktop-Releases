@@ -6210,11 +6210,8 @@ private:
             : x;
     }
 
-    bool IsDividerInteractionPoint(HWND source, int x, int y) const {
-        if (source != interactionWindow_ || !DividerEnabled()) {
-            return false;
-        }
-        const int centerX = interactionContentOffsetPixels_;
+    bool DividerTriangleContainsLocalPoint(
+        int x, int y, int centerX) const {
         const int tipY = std::min(
             DividerHandleHeightPixels() - 1,
             std::max(1, DipToPixels(46.0f)));
@@ -6227,6 +6224,30 @@ private:
             static_cast<float>(DividerHandleWidthPixels()) *
             0.5f * remaining;
         return std::abs(static_cast<float>(x - centerX)) <= halfWidth;
+    }
+
+    bool ScreenPointInsideDividerTriangle(POINT point) const {
+        if (!DividerEnabled() || dividerHandleWindow_ == nullptr ||
+            IsWindow(dividerHandleWindow_) == FALSE ||
+            IsWindowVisible(dividerHandleWindow_) == FALSE) {
+            return false;
+        }
+        RECT bounds{};
+        if (GetWindowRect(dividerHandleWindow_, &bounds) == FALSE) {
+            return false;
+        }
+        return DividerTriangleContainsLocalPoint(
+            point.x - bounds.left,
+            point.y - bounds.top,
+            DividerHandleWidthPixels() / 2);
+    }
+
+    bool IsDividerInteractionPoint(HWND source, int x, int y) const {
+        if (source != interactionWindow_ || !DividerEnabled()) {
+            return false;
+        }
+        return DividerTriangleContainsLocalPoint(
+            x, y, interactionContentOffsetPixels_);
     }
 
     void ApplyCompanionWorkspaceFrame() {
@@ -13577,12 +13598,24 @@ private:
             const std::wstring hint =
                 L"核心桌面：" + std::to_wstring(percent) + L"%";
             constexpr float hintWidth = 124.0f;
+            constexpr float handleRightEdge = 50.0f;
+            constexpr float hintGap = 8.0f;
+            float hintLeft = handleRightEdge + hintGap;
+            float hintTop = 4.0f;
+            // The divider handle is a separate child window above this
+            // canvas. Never paint the ratio card underneath its triangular
+            // strokes. On a very narrow workspace, place the card below the
+            // handle instead of allowing the two surfaces to overlap.
+            if (client.width < hintLeft + hintWidth + 4.0f) {
+                hintLeft = 8.0f;
+                hintTop = 54.0f;
+            }
             const D2D1_RECT_F hintRect = D2D1::RectF(
-                12.0f,
-                2.0f,
+                hintLeft,
+                hintTop,
                 std::min(client.width - 4.0f,
-                         12.0f + hintWidth),
-                26.0f);
+                         hintLeft + hintWidth),
+                hintTop + 24.0f);
             brush_->SetColor(D2D1::ColorF(0x172846, 0.74f));
             renderTarget_->FillRoundedRectangle(
                 D2D1::RoundedRect(hintRect, 6.0f, 6.0f), brush_.Get());
@@ -18733,15 +18766,28 @@ private:
 
     void OnPointerLeave(HWND source) {
         CancelPointerLeaveTracking(source);
+        POINT cursor{};
+        const bool keepDividerHover =
+            !draggingDivider_ && source == interactionWindow_ &&
+            GetCursorPos(&cursor) != FALSE &&
+            ScreenPointInsideDividerTriangle(cursor);
         if (workspaceChromeHovered_) {
             workspaceChromeHovered_ = false;
             Invalidate();
         }
         if (!draggingDivider_) {
-            const bool wasDividerHovered = dividerHovered_;
-            dividerHovered_ = false;
-            HideDividerTooltip();
-            if (wasDividerHovered) {
+            if (keepDividerHover) {
+                dividerHovered_ = true;
+                EnsurePointerLeaveTracking(source);
+            } else {
+                const bool wasDividerHovered = dividerHovered_;
+                dividerHovered_ = false;
+                HideDividerTooltip();
+                if (wasDividerHovered) {
+                    UpdateDividerHandleVisual();
+                }
+            }
+            if (keepDividerHover) {
                 UpdateDividerHandleVisual();
             }
         }
@@ -25503,6 +25549,23 @@ bool RunSelfTest() {
         IconFullyOutsideViewport(D2D1::Point2F(110.0f, 50.0f), 20.0f, viewport) ||
         !IconFullyOutsideViewport(D2D1::Point2F(-20.0f, 50.0f), 20.0f, viewport) ||
         !IconFullyOutsideViewport(D2D1::Point2F(120.0f, 50.0f), 20.0f, viewport)) {
+        return false;
+    }
+
+    GravityApp dividerGeometryApp;
+    dividerGeometryApp.dpi_ = 96.0f;
+    const int dividerCenter =
+        dividerGeometryApp.DividerHandleWidthPixels() / 2;
+    if (!dividerGeometryApp.DividerTriangleContainsLocalPoint(
+            dividerCenter, 1, dividerCenter) ||
+        !dividerGeometryApp.DividerTriangleContainsLocalPoint(
+            2, 1, dividerCenter) ||
+        !dividerGeometryApp.DividerTriangleContainsLocalPoint(
+            dividerCenter, 45, dividerCenter) ||
+        dividerGeometryApp.DividerTriangleContainsLocalPoint(
+            dividerCenter + 12, 45, dividerCenter) ||
+        dividerGeometryApp.DividerTriangleContainsLocalPoint(
+            dividerCenter, 48, dividerCenter)) {
         return false;
     }
 
