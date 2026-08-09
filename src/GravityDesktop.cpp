@@ -5070,6 +5070,7 @@ public:
             const int x = GET_X_LPARAM(lParam);
             const int y = GET_Y_LPARAM(lParam);
             if (IsDividerInteractionPoint(source, x, y)) {
+                PresentDividerHandleImmediately();
                 BeginDividerDrag(InteractionClientXToVisual(source, x), y);
                 return 0;
             }
@@ -5085,6 +5086,7 @@ public:
             const int x = GET_X_LPARAM(lParam);
             const int y = GET_Y_LPARAM(lParam);
             if (IsDividerInteractionPoint(source, x, y)) {
+                PresentDividerHandleImmediately();
                 ResetDividerToDefault();
                 return 0;
             }
@@ -5107,7 +5109,11 @@ public:
                 IsDividerInteractionPoint(source, x, y);
             if (!draggingDivider_ && dividerHovered_ != dividerHover) {
                 dividerHovered_ = dividerHover;
-                if (!dividerHovered_) HideDividerTooltip();
+                if (dividerHovered_) {
+                    PresentDividerHandleImmediately();
+                } else {
+                    HideDividerTooltip();
+                }
                 UpdateDividerHandleVisual();
                 Invalidate();
             }
@@ -6393,6 +6399,18 @@ private:
             return false;
         }
 
+        // Progman and WorkerW are two internal desktop bands owned by the
+        // same Explorer process. Win+D can move an existing child between
+        // them repeatedly without replacing the desktop session. Committing
+        // every such transition made the dependent divider child disappear
+        // while it was being reparented. Keep the stable host identity for
+        // the lifetime of this Explorer process; a real Explorer replacement
+        // is handled by the reconnect path when DesktopHostStillUsable fails.
+        if (DesktopHostStillUsable(desktopHost_)) {
+            CancelPendingDesktopHostMigration();
+            return false;
+        }
+
         // Win+D and Explorer transitions can briefly bounce a desktop child
         // between Progman and WorkerW.  Treat the first observation as a
         // candidate only; accepting it immediately made our visual, input and
@@ -6563,10 +6581,18 @@ private:
         if (!DesktopHostStillUsable(desktopHost_)) {
             return "desktop_health_host_replaced";
         }
+        HWND dividerExpectedHost = desktopHost_;
+        if (desktopChildHosted_ && window_ != nullptr &&
+            IsWindow(window_) != FALSE) {
+            const HWND visualHost = GetParent(window_);
+            if (IsCompatibleExplorerDesktopHost(visualHost)) {
+                dividerExpectedHost = visualHost;
+            }
+        }
         const bool dividerAttached =
             (GetWindowLongPtrW(
                  dividerHandleWindow_, GWL_STYLE) & WS_CHILD) != 0 &&
-            GetParent(dividerHandleWindow_) == desktopHost_;
+            GetParent(dividerHandleWindow_) == dividerExpectedHost;
         if (desktopChildHosted_) {
             if (GetParent(window_) != desktopHost_) {
                 // Explorer may move a desktop child between its two internal
@@ -13635,7 +13661,17 @@ private:
         // surfaces.  Do not call AttachToDesktopCompanionLayer() here: that
         // routine synchronizes this handle in turn and would recurse during
         // startup before the message loop is available.
-        HWND host = desktopChildHosted_ ? desktopHost_ : nullptr;
+        HWND host = nullptr;
+        if (desktopChildHosted_ && window_ != nullptr &&
+            IsWindow(window_) != FALSE) {
+            const HWND visualHost = GetParent(window_);
+            if (IsCompatibleExplorerDesktopHost(visualHost)) {
+                host = visualHost;
+            }
+        }
+        if (host == nullptr && desktopChildHosted_) {
+            host = desktopHost_;
+        }
         if (host == nullptr || IsWindow(host) == FALSE) {
             return;
         }
@@ -24713,6 +24749,33 @@ private:
             dividerHandleWindow_, RGB(255, 0, 255), alpha,
             LWA_COLORKEY | LWA_ALPHA);
         InvalidateRect(dividerHandleWindow_, nullptr, FALSE);
+    }
+
+    void PresentDividerHandleImmediately() {
+        if (!DividerEnabled() || state_.workspacePaused ||
+            !workspaceVisible_ || window_ == nullptr ||
+            IsWindow(window_) == FALSE) {
+            return;
+        }
+        if (dividerHandleWindow_ == nullptr ||
+            IsWindow(dividerHandleWindow_) == FALSE) {
+            dividerHandleWindow_ = nullptr;
+            if (!CreateDividerHandleWindow()) {
+                AppendRuntimeDiagnostic(
+                    "divider_handle_pointer_recreate_failed",
+                    HRESULT_FROM_WIN32(GetLastError()), GetLastError());
+                return;
+            }
+        } else {
+            SyncDividerHandleWindowFrame();
+        }
+        if (dividerHandleWindow_ != nullptr &&
+            IsWindow(dividerHandleWindow_) != FALSE) {
+            ShowWindow(dividerHandleWindow_, SW_SHOWNOACTIVATE);
+            RedrawWindow(
+                dividerHandleWindow_, nullptr, nullptr,
+                RDW_INVALIDATE | RDW_UPDATENOW | RDW_NOERASE);
+        }
     }
 
     void SyncDividerHandleWindowFrame() {
