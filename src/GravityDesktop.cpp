@@ -1124,6 +1124,26 @@ std::size_t AttachedFileCountAfterDissolve(
            AttachedFileCount(source);
 }
 
+// Only migrate names that were produced by the program itself.  A user name
+// such as "新核心设计" must remain untouched.
+std::wstring MigrateAutomaticCoreName(const std::wstring& name) {
+    constexpr std::wstring_view kLegacyPrefix = L"新核心";
+    constexpr std::wstring_view kCurrentPrefix = L"文件核心";
+    if (name.size() <= kLegacyPrefix.size() ||
+        name.compare(0, kLegacyPrefix.size(), kLegacyPrefix) != 0) {
+        return name;
+    }
+    std::size_t index = kLegacyPrefix.size();
+    while (index < name.size() && iswspace(name[index])) {
+        ++index;
+    }
+    if (index == name.size()) return name;
+    for (std::size_t digit = index; digit < name.size(); ++digit) {
+        if (!iswdigit(name[digit])) return name;
+    }
+    return std::wstring(kCurrentPrefix) + L" " + name.substr(index);
+}
+
 bool CoreBodyVisible(const Core& core) {
     return core.id != kUnclassifiedCoreId ||
            AttachedFileCount(core) > 0;
@@ -3242,6 +3262,7 @@ bool DeserializeState(const std::string& json, WorkspaceState& state) {
             core.layoutVersion = documentVersion >= 4 ? kLayoutVersion
                                                        : core.layoutVersion;
         }
+        core.name = MigrateAutomaticCoreName(core.name);
         loaded.cores.push_back(std::move(core));
     }
 
@@ -8071,7 +8092,8 @@ private:
             return;
         }
         if (core.iconKind == CoreIconKind::General ||
-            ContainsText(core.name, L"新核心")) {
+            ContainsText(core.name, L"新核心") ||
+            ContainsText(core.name, L"文件核心")) {
             core.iconKind = InferCoreIconKind(core);
             if (!core.themeColorCustomized) {
                 core.themeColor = DefaultCoreColor(core.iconKind);
@@ -20295,7 +20317,7 @@ private:
         WorkspaceState before = state_;
         Core core;
         core.id = state_.nextId++;
-        core.name = L"新核心 " + std::to_wstring(state_.cores.size());
+        core.name = L"文件核心 " + std::to_wstring(state_.cores.size());
         core.position = position;
         const D2D1_SIZE_F workspace = ClientDipSize();
         const D2D1_POINT_2F screen = WorldToScreen(position);
@@ -20359,6 +20381,7 @@ private:
         transaction.retainSystemCore = retainSystemCore;
         transaction.createdAt = UnixTimeNow();
         std::set<std::wstring> plannedDestinations;
+        int alternateDestinationCount = 0;
         for (const FileItem& item : source->files) {
             if (item.storageMode != FileStorageMode::Managed) {
                 continue;
@@ -20368,24 +20391,33 @@ private:
                 return;
             }
             const std::filesystem::path original(item.originalPath);
-            std::filesystem::path destination =
+            std::filesystem::path requestedDestination =
                 *desktop / FileDisplayName(
                     item.originalPath.empty() ? item.path : item.originalPath);
             if (!item.originalPath.empty() &&
                 PathEquals(
                     NormalizePath(original.parent_path().wstring()),
                     NormalizePath(desktop->wstring()))) {
-                destination = original;
+                requestedDestination = original;
+            }
+            const std::filesystem::path destination =
+                AvailableDesktopRestoreDestination(
+                    *desktop, requestedDestination, plannedDestinations);
+            if (destination.empty()) {
+                SetStatus(
+                    L"无法解散：无法为还原文件分配安全的桌面名称，未移动任何文件");
+                return;
             }
             const std::wstring normalizedDestination =
                 NormalizePath(destination.wstring());
-            if (!plannedDestinations.insert(normalizedDestination).second ||
-                (!PathEquals(item.path, destination.wstring()) &&
-                 FilePathExists(destination.wstring()))) {
+            if (!plannedDestinations.insert(normalizedDestination).second) {
                 SetStatus(
-                    L"无法解散：桌面已有同名文件，未移动任何文件。"
-                    L"请先处理同名文件后重试");
+                    L"无法解散：还原文件名称重复，未移动任何文件");
                 return;
+            }
+            if (!PathEquals(requestedDestination.wstring(),
+                            destination.wstring())) {
+                ++alternateDestinationCount;
             }
             if (PathEquals(item.path, destination.wstring())) {
                 continue;
@@ -20518,9 +20550,15 @@ private:
         iconShadowCache_.clear();
         layoutCache_.clear();
         layoutDirty_ = true;
-        SetStatus(retainSystemCore
+        std::wstring completionStatus = retainSystemCore
             ? L"未分类引用已清空；托管文件已还原到 Windows 桌面"
-            : L"核心已解散；托管文件已还原到 Windows 桌面");
+            : L"核心已解散；托管文件已还原到 Windows 桌面";
+        if (alternateDestinationCount > 0) {
+            completionStatus += L"；" +
+                std::to_wstring(alternateDestinationCount) +
+                L" 个同名文件已使用安全新名称";
+        }
+        SetStatus(completionStatus);
         Invalidate();
     }
 
@@ -23061,6 +23099,30 @@ private:
                    INVALID_FILE_ATTRIBUTES;
     }
 
+    static std::filesystem::path AvailableDesktopRestoreDestination(
+        const std::filesystem::path& desktop,
+        const std::filesystem::path& requested,
+        const std::set<std::wstring>& reservedDestinations) {
+        const std::filesystem::path original = desktop / requested.filename();
+        const auto available = [&reservedDestinations](
+                                   const std::filesystem::path& candidate) {
+            return !FilePathExists(candidate.wstring()) &&
+                   !reservedDestinations.contains(
+                       NormalizePath(candidate.wstring()));
+        };
+        if (available(original)) return original;
+
+        const std::wstring stem = requested.stem().wstring();
+        const std::wstring extension = requested.extension().wstring();
+        for (int index = 2; index <= 9999; ++index) {
+            const std::filesystem::path candidate = desktop /
+                (stem + L"（引力桌面还原 " + std::to_wstring(index) +
+                 L"）" + extension);
+            if (available(candidate)) return candidate;
+        }
+        return {};
+    }
+
     static void NotifyShellFileMove(
         const std::wstring& source,
         const std::wstring& destination) {
@@ -24512,6 +24574,12 @@ LRESULT CALLBACK SettingsContentWindowProcedure(
 }
 
 bool RunSelfTest() {
+    if (MigrateAutomaticCoreName(L"新核心 7") != L"文件核心 7" ||
+        MigrateAutomaticCoreName(L"新核心设计") != L"新核心设计" ||
+        MigrateAutomaticCoreName(L"文件核心 7") != L"文件核心 7") {
+        return false;
+    }
+
     // Registry mutation is deliberately excluded from the built-in tests: a
     // diagnostic run must never create a Windows login entry. These checks
     // cover the exact quoted command and reject a stale or incomplete entry.
@@ -24881,6 +24949,34 @@ bool RunSelfTest() {
             std::filesystem::remove_all(path, ignored);
         }
     } relationTestCleanup{relationTestDirectory};
+
+    const std::filesystem::path restoreDestinationDirectory =
+        relationTestDirectory / L"restore-destination";
+    std::filesystem::create_directories(
+        restoreDestinationDirectory, tempError);
+    if (tempError || !WriteUtf8Atomic(
+            restoreDestinationDirectory / L"duplicate.txt", "existing")) {
+        return false;
+    }
+    std::set<std::wstring> reservedRestoreDestinations;
+    const std::filesystem::path alternateRestoreDestination =
+        GravityApp::AvailableDesktopRestoreDestination(
+            restoreDestinationDirectory, L"duplicate.txt",
+            reservedRestoreDestinations);
+    if (alternateRestoreDestination.filename() !=
+            L"duplicate（引力桌面还原 2）.txt") {
+        return false;
+    }
+    reservedRestoreDestinations.insert(
+        NormalizePath(alternateRestoreDestination.wstring()));
+    const std::filesystem::path secondAlternateRestoreDestination =
+        GravityApp::AvailableDesktopRestoreDestination(
+            restoreDestinationDirectory, L"duplicate.txt",
+            reservedRestoreDestinations);
+    if (secondAlternateRestoreDestination.filename() !=
+            L"duplicate（引力桌面还原 3）.txt") {
+        return false;
+    }
 
     const std::filesystem::path historyDirectory =
         relationTestDirectory / L"backups";
