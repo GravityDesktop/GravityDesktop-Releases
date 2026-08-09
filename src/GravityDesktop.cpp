@@ -1531,6 +1531,16 @@ std::wstring MakeDisplayName(const std::wstring& path, bool isDirectory) {
     return Shorten(title, 12);
 }
 
+bool IsTransientDesktopArtifactName(const std::wstring& path) {
+    std::wstring name = FileDisplayName(path);
+    std::transform(name.begin(), name.end(), name.begin(),
+                   [](wchar_t character) {
+                       return static_cast<wchar_t>(std::towlower(character));
+                   });
+    return name.rfind(L"~$", 0) == 0 || name == L"desktop.ini" ||
+           name == L"thumbs.db";
+}
+
 int RingForSlot(int slot) {
     for (int ring = 0; ring < static_cast<int>(kRingCapacities.size()); ++ring) {
         if (slot >= kRingStarts[ring] &&
@@ -23461,6 +23471,12 @@ private:
             }
             return false;
         }
+        if (IsTransientDesktopArtifactName(normalized)) {
+            if (reason != nullptr) {
+                *reason = L"临时或系统桌面文件不能收纳";
+            }
+            return false;
+        }
         const DWORD attributes = GetFileAttributesW(normalized.c_str());
         if (attributes == INVALID_FILE_ATTRIBUTES) {
             if (reason != nullptr) *reason = L"源文件不存在";
@@ -24576,7 +24592,13 @@ LRESULT CALLBACK SettingsContentWindowProcedure(
 bool RunSelfTest() {
     if (MigrateAutomaticCoreName(L"新核心 7") != L"文件核心 7" ||
         MigrateAutomaticCoreName(L"新核心设计") != L"新核心设计" ||
-        MigrateAutomaticCoreName(L"文件核心 7") != L"文件核心 7") {
+        MigrateAutomaticCoreName(L"文件核心 7") != L"文件核心 7" ||
+        !IsTransientDesktopArtifactName(
+            L"C:\\Users\\test\\Desktop\\~$document.docx") ||
+        !IsTransientDesktopArtifactName(
+            L"C:\\Users\\test\\Desktop\\desktop.ini") ||
+        IsTransientDesktopArtifactName(
+            L"C:\\Users\\test\\Desktop\\ordinary.docx")) {
         return false;
     }
 
