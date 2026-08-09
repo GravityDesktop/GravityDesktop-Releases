@@ -4874,6 +4874,12 @@ public:
                     exitRequested_ || shuttingDown_
                         ? "visual_window_destroyed_for_exit"
                         : "visual_window_destroyed_unexpected");
+                // WM_DESTROY precedes WM_NCDESTROY. Clear timers while this
+                // HWND is still valid: clearing window_ here used to bypass
+                // the WM_NCDESTROY guard below and could leave the 32 ms
+                // selection poll attached to a destroyed visual surface.
+                CancelPointerLeaveTracking(source);
+                StopSelectionDismissTimer();
                 window_ = nullptr;
             }
             if (exitRequested_ || shuttingDown_) {
