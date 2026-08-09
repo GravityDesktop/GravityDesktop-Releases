@@ -1252,7 +1252,17 @@ struct ManagedFileTransaction {
 };
 
 struct ManagedUndoAction {
-    ManagedFileTransaction reverseTransaction;
+    std::vector<ManagedFileTransaction> reverseTransactions;
+};
+
+// A batch store/undo operation has one crash journal and one state commit.
+// The plan is durable before the first real file moves, so startup can roll
+// back every already-moved entry when state.json was not committed.
+struct ManagedBatchTransaction {
+    std::uint64_t id = 0;
+    ManagedTransactionStage stage = ManagedTransactionStage::Prepared;
+    std::int64_t createdAt = 0;
+    std::vector<ManagedFileTransaction> moves;
 };
 
 // A core dissolve can restore several managed files in one command.  Keep a
@@ -1320,6 +1330,63 @@ bool DeserializeManagedFileTransaction(
     const JsonValue::Object* object = root.AsObject();
     return object != nullptr &&
            DeserializeManagedFileTransactionObject(*object, transaction);
+}
+
+std::string SerializeManagedBatchTransaction(
+    const ManagedBatchTransaction& transaction) {
+    std::ostringstream output;
+    output.imbue(std::locale::classic());
+    output << "{\"version\":1,\"id\":" << transaction.id
+           << ",\"stage\":" << static_cast<int>(transaction.stage)
+           << ",\"created_at\":" << transaction.createdAt
+           << ",\"moves\":[";
+    for (std::size_t index = 0; index < transaction.moves.size(); ++index) {
+        if (index != 0) output << ',';
+        output << SerializeManagedFileTransaction(transaction.moves[index]);
+    }
+    output << "]}";
+    return output.str();
+}
+
+bool DeserializeManagedBatchTransaction(
+    const std::string& text, ManagedBatchTransaction& transaction) {
+    JsonValue rootValue;
+    JsonParser parser(text);
+    if (!parser.Parse(rootValue)) return false;
+    const JsonValue::Object* root = rootValue.AsObject();
+    if (root == nullptr ||
+        static_cast<int>(NumberMember(*root, "version", 0.0)) != 1) {
+        return false;
+    }
+    const JsonValue* movesValue = FindMember(*root, "moves");
+    const JsonValue::Array* moves =
+        movesValue == nullptr ? nullptr : movesValue->AsArray();
+    if (moves == nullptr || moves->empty()) return false;
+
+    ManagedBatchTransaction parsed;
+    parsed.id = static_cast<std::uint64_t>(
+        NumberMember(*root, "id", 0.0));
+    parsed.stage = static_cast<ManagedTransactionStage>(
+        std::clamp(static_cast<int>(NumberMember(
+            *root, "stage", 0.0)), 0, 4));
+    parsed.createdAt = static_cast<std::int64_t>(
+        NumberMember(*root, "created_at", 0.0));
+    std::set<std::uint64_t> itemIds;
+    for (const JsonValue& moveValue : *moves) {
+        const JsonValue::Object* move = moveValue.AsObject();
+        ManagedFileTransaction entry;
+        if (move == nullptr ||
+            !DeserializeManagedFileTransactionObject(*move, entry) ||
+            (entry.operation != ManagedTransactionOperation::Store &&
+             entry.operation != ManagedTransactionOperation::Undo) ||
+            !itemIds.insert(entry.itemId).second) {
+            return false;
+        }
+        parsed.moves.push_back(std::move(entry));
+    }
+    if (parsed.id == 0) return false;
+    transaction = std::move(parsed);
+    return true;
 }
 
 std::string SerializeCoreDissolveTransaction(
@@ -4950,6 +5017,7 @@ public:
         } else {
             LoadState();
             RecoverPendingManagedTransaction();
+            RecoverPendingManagedBatchTransaction();
             RecoverPendingCoreDissolveTransaction();
             ReconcileCompletedEmergencyRecovery();
             MigrateLegacyManagedLibraryItems();
@@ -20198,7 +20266,7 @@ private:
         dialog.pszWindowTitle = L"收纳已有桌面引用";
         dialog.pszContent = message.c_str();
         dialog.pszFooter =
-            L"每个文件均单独安全保存；若有失败，已成功收纳的文件保持可用，其余文件仍留在桌面。";
+            L"这些文件作为一个批次提交；任一项目失败时，整批回滚到操作前状态。";
         dialog.pszMainIcon = TD_WARNING_ICON;
         dialog.cButtons = static_cast<UINT>(
             sizeof(buttons) / sizeof(buttons[0]));
@@ -20243,21 +20311,158 @@ private:
             return;
         }
 
-        std::size_t completed = 0;
-        for (std::size_t index = 0; index < itemIds.size(); ++index) {
-            if (!StoreExistingDesktopReferenceInCore(
-                    coreId, itemIds[index], true)) {
-                const std::size_t remaining = itemIds.size() - index;
+        if (FilePathExists(ManagedTransactionPath().wstring()) ||
+            FilePathExists(ManagedBatchTransactionPath().wstring()) ||
+            FilePathExists(CoreDissolveTransactionPath().wstring())) {
+            SetStatus(L"已有文件事务尚未结束；本次未移动任何文件");
+            return;
+        }
+
+        ResetManagedCollectionConfirmationSession();
+        const WorkspaceState before = state_;
+        WorkspaceState candidate = state_;
+        ManagedBatchTransaction transaction;
+        transaction.id = itemIds.front();
+        transaction.stage = ManagedTransactionStage::Prepared;
+        transaction.createdAt = UnixTimeNow();
+        std::set<std::wstring> reservedDestinations;
+        std::set<std::wstring> reservedSources;
+        std::vector<ManagedFileTransaction> reverseTransactions;
+        reverseTransactions.reserve(itemIds.size());
+
+        for (const std::uint64_t itemId : itemIds) {
+            FileItem* candidateItem =
+                FindItemInState(candidate, coreId, itemId);
+            if (candidateItem == nullptr ||
+                candidateItem->storageMode != FileStorageMode::Reference) {
                 SetStatus(
-                    L"已收纳 " + std::to_wstring(completed) +
-                    L" 项；" + std::to_wstring(remaining) +
-                    L" 项未处理，原文件保持不变");
+                    L"批量收纳已取消：文件节点状态发生变化；未移动任何文件");
                 return;
             }
-            ++completed;
+            std::wstring eligibilityError;
+            if (!IsEligibleDesktopManagedFile(
+                    candidateItem->path, &eligibilityError)) {
+                SetStatus(
+                    L"批量收纳已取消：" + eligibilityError +
+                    L"；未移动任何文件");
+                return;
+            }
+            const std::wstring sourcePath = candidateItem->path;
+            if (!reservedSources.insert(
+                    NormalizePath(sourcePath)).second) {
+                SetStatus(
+                    L"批量收纳已取消：存在重复的真实文件路径；未移动任何文件");
+                return;
+            }
+            const std::filesystem::path destination =
+                AvailableManagedLibraryRootPath(
+                    FileDisplayName(sourcePath), reservedDestinations);
+            if (destination.empty()) {
+                SetStatus(
+                    L"批量收纳已取消：无法分配安全文件名；未移动任何文件");
+                return;
+            }
+            reservedDestinations.insert(
+                NormalizePath(destination.wstring()));
+
+            ManagedFileTransaction move;
+            move.id = itemId;
+            move.coreId = coreId;
+            move.itemId = itemId;
+            move.operation = ManagedTransactionOperation::Store;
+            move.stage = ManagedTransactionStage::Prepared;
+            move.sourcePath = sourcePath;
+            move.destinationPath = destination.wstring();
+            move.itemPresentAfter = true;
+            move.createdAt = transaction.createdAt;
+            transaction.moves.push_back(move);
+
+            candidateItem->path = move.destinationPath;
+            candidateItem->originalPath = move.sourcePath;
+            candidateItem->managedPath = move.destinationPath;
+            candidateItem->managedAt = transaction.createdAt;
+            candidateItem->storageMode = FileStorageMode::Managed;
+            candidateItem->missing = false;
+            if (candidateItem->originalName.empty()) {
+                candidateItem->originalName =
+                    FileDisplayName(move.sourcePath);
+            }
+
+            ManagedFileTransaction reverse;
+            reverse.id = itemId;
+            reverse.coreId = coreId;
+            reverse.itemId = itemId;
+            reverse.operation = ManagedTransactionOperation::Undo;
+            reverse.sourcePath = move.destinationPath;
+            reverse.destinationPath = move.sourcePath;
+            reverse.itemPresentAfter = true;
+            reverse.createdAt = transaction.createdAt;
+            reverseTransactions.push_back(std::move(reverse));
         }
-        SetStatus(L"已收纳 " + std::to_wstring(completed) +
-                  L" 项；桌面原图标已移除");
+
+        if (!ValidateRelationState(candidate).IsValid()) {
+            SetStatus(
+                L"批量收纳已取消：关系校验未通过；未移动任何文件");
+            return;
+        }
+        if (!PersistManagedBatchTransaction(transaction)) {
+            SetStatus(
+                L"批量收纳失败：无法写入事务日志；未移动任何文件");
+            return;
+        }
+
+        for (const ManagedFileTransaction& move : transaction.moves) {
+            std::wstring moveError;
+            if (!MoveFileWithoutReplacement(
+                    move.sourcePath, move.destinationPath, &moveError)) {
+                std::wstring rollbackError;
+                const bool rolledBack =
+                    RollBackManagedBatchFiles(transaction, &rollbackError);
+                if (rolledBack) ClearManagedBatchTransaction();
+                SetStatus(
+                    rolledBack
+                        ? L"批量收纳失败，已完整回滚；桌面文件保持不变"
+                        : L"批量收纳回滚未完成；真实文件未被删除，请检查文件库：" +
+                              rollbackError);
+                return;
+            }
+        }
+
+        transaction.stage = ManagedTransactionStage::FileMoved;
+        if (!PersistManagedBatchTransaction(transaction) ||
+            !WriteStateWithRelationshipManifest(candidate)) {
+            std::wstring rollbackError;
+            const bool rolledBack =
+                RollBackManagedBatchFiles(transaction, &rollbackError);
+            if (rolledBack) ClearManagedBatchTransaction();
+            SetStatus(
+                rolledBack
+                    ? L"批量收纳未提交，已完整回滚；桌面文件保持不变"
+                    : L"批量收纳回滚未完成；真实文件未被删除，请检查文件库：" +
+                          rollbackError);
+            return;
+        }
+
+        state_ = std::move(candidate);
+        dirty_ = false;
+        CreateHistoryBackup(false);
+        transaction.stage = ManagedTransactionStage::StateSaved;
+        (void)PersistManagedBatchTransaction(transaction);
+        transaction.stage = ManagedTransactionStage::Committed;
+        (void)PersistManagedBatchTransaction(transaction);
+        ClearManagedBatchTransaction();
+        managedUndoAction_ =
+            ManagedUndoAction{std::move(reverseTransactions)};
+        PushUndo(before);
+        MarkManagedCollectionSuccess();
+        iconCache_.clear();
+        iconShadowCache_.clear();
+        layoutCache_.clear();
+        layoutDirty_ = true;
+        SetStatus(
+            L"已原子收纳 " + std::to_wstring(itemIds.size()) +
+            L" 项；桌面原图标已移除");
+        Invalidate();
     }
 
     bool StoreExistingDesktopReferenceInCore(
@@ -20390,7 +20595,7 @@ private:
         reverse.destinationPath = transaction.sourcePath;
         reverse.itemPresentAfter = true;
         reverse.createdAt = UnixTimeNow();
-        managedUndoAction_ = ManagedUndoAction{std::move(reverse)};
+        managedUndoAction_ = ManagedUndoAction{{std::move(reverse)}};
         PushUndo(before);
         MarkManagedCollectionSuccess();
         iconCache_.clear();
@@ -20642,7 +20847,7 @@ private:
         reverse.destinationPath = transaction.sourcePath;
         reverse.itemPresentAfter = false;
         reverse.createdAt = UnixTimeNow();
-        managedUndoAction_ = ManagedUndoAction{std::move(reverse)};
+        managedUndoAction_ = ManagedUndoAction{{std::move(reverse)}};
         SetSelection({HitKind::Item, targetCoreId, itemId});
         MarkManagedCollectionSuccess();
         iconCache_.clear();
@@ -22721,7 +22926,7 @@ private:
         reverse.destinationPath = transaction.sourcePath;
         reverse.itemPresentAfter = true;
         reverse.createdAt = UnixTimeNow();
-        managedUndoAction_ = ManagedUndoAction{std::move(reverse)};
+        managedUndoAction_ = ManagedUndoAction{{std::move(reverse)}};
         iconCache_.clear();
         iconShadowCache_.clear();
         layoutCache_.clear();
@@ -23224,6 +23429,79 @@ private:
         return true;
     }
 
+    bool UndoManagedFileOperations(
+        const std::vector<ManagedFileTransaction>& reverseTransactions,
+        const WorkspaceState& restoredState) {
+        if (reverseTransactions.empty()) return false;
+        if (reverseTransactions.size() == 1) {
+            return UndoManagedFileOperation(
+                reverseTransactions.front(), restoredState);
+        }
+        if (stateRecoveryBlocked_) {
+            SetStatus(L"状态处于保护模式；未撤销真实文件移动");
+            return false;
+        }
+        ManagedBatchTransaction transaction;
+        transaction.id = reverseTransactions.front().itemId;
+        transaction.stage = ManagedTransactionStage::Prepared;
+        transaction.createdAt = UnixTimeNow();
+        transaction.moves = reverseTransactions;
+        std::set<std::wstring> sources;
+        std::set<std::wstring> destinations;
+        for (ManagedFileTransaction& move : transaction.moves) {
+            move.stage = ManagedTransactionStage::Prepared;
+            if (!FilePathExists(move.sourcePath) ||
+                FilePathExists(move.destinationPath) ||
+                !sources.insert(NormalizePath(move.sourcePath)).second ||
+                !destinations.insert(
+                    NormalizePath(move.destinationPath)).second) {
+                SetStatus(
+                    L"撤销失败：至少一个文件的源位置或目标位置已变化");
+                return false;
+            }
+        }
+        if (!PersistManagedBatchTransaction(transaction)) {
+            SetStatus(L"撤销失败：无法写入批量文件事务日志");
+            return false;
+        }
+        for (const ManagedFileTransaction& move : transaction.moves) {
+            std::wstring moveError;
+            if (!MoveFileWithoutReplacement(
+                    move.sourcePath, move.destinationPath, &moveError)) {
+                std::wstring rollbackError;
+                const bool rolledBack =
+                    RollBackManagedBatchFiles(transaction, &rollbackError);
+                if (rolledBack) ClearManagedBatchTransaction();
+                SetStatus(
+                    rolledBack
+                        ? L"撤销失败，已完整回滚真实文件"
+                        : L"撤销回滚未完成；真实文件未被删除：" +
+                              rollbackError);
+                return false;
+            }
+        }
+        transaction.stage = ManagedTransactionStage::FileMoved;
+        if (!PersistManagedBatchTransaction(transaction) ||
+            !WriteStateWithRelationshipManifest(restoredState)) {
+            std::wstring rollbackError;
+            const bool rolledBack =
+                RollBackManagedBatchFiles(transaction, &rollbackError);
+            if (rolledBack) ClearManagedBatchTransaction();
+            SetStatus(
+                rolledBack
+                    ? L"撤销未提交，已完整回滚真实文件"
+                    : L"撤销回滚未完成；真实文件未被删除：" +
+                          rollbackError);
+            return false;
+        }
+        transaction.stage = ManagedTransactionStage::StateSaved;
+        (void)PersistManagedBatchTransaction(transaction);
+        transaction.stage = ManagedTransactionStage::Committed;
+        (void)PersistManagedBatchTransaction(transaction);
+        ClearManagedBatchTransaction();
+        return true;
+    }
+
     void Undo() {
         EndRename(false);
         if (undoStack_.empty()) {
@@ -23232,8 +23510,8 @@ private:
         }
         if (managedUndoAction_.has_value()) {
             const WorkspaceState& restoredState = undoStack_.back();
-            if (!UndoManagedFileOperation(
-                    managedUndoAction_->reverseTransaction,
+            if (!UndoManagedFileOperations(
+                    managedUndoAction_->reverseTransactions,
                     restoredState)) {
                 return;
             }
@@ -23627,6 +23905,12 @@ private:
             stateFile_.wstring() + L".managed-file-transaction.json");
     }
 
+    std::filesystem::path ManagedBatchTransactionPath() const {
+        if (stateFile_.empty()) return {};
+        return std::filesystem::path(
+            stateFile_.wstring() + L".managed-batch-transaction.json");
+    }
+
     std::filesystem::path CoreDissolveTransactionPath() const {
         if (stateFile_.empty()) return {};
         return std::filesystem::path(
@@ -23659,9 +23943,19 @@ private:
 
     std::filesystem::path AvailableManagedLibraryRootPath(
         const std::wstring& preferredName) const {
+        const std::set<std::wstring> noReservations;
+        return AvailableManagedLibraryRootPath(
+            preferredName, noReservations);
+    }
+
+    std::filesystem::path AvailableManagedLibraryRootPath(
+        const std::wstring& preferredName,
+        const std::set<std::wstring>& reservedDestinations) const {
         const std::filesystem::path library = ManagedFilesPath();
         const std::filesystem::path requested = library / preferredName;
-        if (!FilePathExists(requested.wstring())) {
+        if (!FilePathExists(requested.wstring()) &&
+            !reservedDestinations.contains(
+                NormalizePath(requested.wstring()))) {
             return requested;
         }
         const std::filesystem::path namePath(preferredName);
@@ -23670,7 +23964,9 @@ private:
         for (int index = 2; index <= 9'999; ++index) {
             const std::filesystem::path candidate = library /
                 (stem + L" (" + std::to_wstring(index) + L")" + extension);
-            if (!FilePathExists(candidate.wstring())) {
+            if (!FilePathExists(candidate.wstring()) &&
+                !reservedDestinations.contains(
+                    NormalizePath(candidate.wstring()))) {
                 return candidate;
             }
         }
@@ -24138,6 +24434,20 @@ private:
         }
     }
 
+    bool PersistManagedBatchTransaction(
+        const ManagedBatchTransaction& transaction) const {
+        const std::filesystem::path path = ManagedBatchTransactionPath();
+        return !path.empty() && WriteUtf8Atomic(
+            path, SerializeManagedBatchTransaction(transaction));
+    }
+
+    void ClearManagedBatchTransaction() const {
+        const std::filesystem::path path = ManagedBatchTransactionPath();
+        if (!path.empty()) {
+            (void)DeleteFileW(path.c_str());
+        }
+    }
+
     bool PersistCoreDissolveTransaction(
         const CoreDissolveTransaction& transaction) const {
         const std::filesystem::path path = CoreDissolveTransactionPath();
@@ -24461,7 +24771,7 @@ private:
         reverse.destinationPath = transaction.sourcePath;
         reverse.itemPresentAfter = true;
         reverse.createdAt = UnixTimeNow();
-        managedUndoAction_ = ManagedUndoAction{std::move(reverse)};
+        managedUndoAction_ = ManagedUndoAction{{std::move(reverse)}};
         iconCache_.clear();
         iconShadowCache_.clear();
         layoutCache_.clear();
@@ -24549,6 +24859,10 @@ private:
         if (!transaction.itemPresentAfter) {
             return item == nullptr;
         }
+        if (transaction.operation == ManagedTransactionOperation::Undo) {
+            return item != nullptr && owner != nullptr &&
+                   PathEquals(item->path, transaction.destinationPath);
+        }
         if (transaction.operation == ManagedTransactionOperation::Rename ||
             transaction.operation ==
                 ManagedTransactionOperation::ReorganizeLibrary) {
@@ -24558,6 +24872,85 @@ private:
         return item != nullptr && owner != nullptr &&
                item->storageMode == FileStorageMode::Managed &&
                PathEquals(item->path, transaction.destinationPath);
+    }
+
+    bool RollBackManagedBatchFiles(
+        const ManagedBatchTransaction& transaction,
+        std::wstring* errorMessage = nullptr) {
+        for (auto iterator = transaction.moves.rbegin();
+             iterator != transaction.moves.rend(); ++iterator) {
+            const bool sourceExists = FilePathExists(iterator->sourcePath);
+            const bool destinationExists =
+                FilePathExists(iterator->destinationPath);
+            if (sourceExists && !destinationExists) {
+                continue;
+            }
+            if (!destinationExists || sourceExists) {
+                if (errorMessage != nullptr) {
+                    *errorMessage = L"源位置与目标位置状态不一致";
+                }
+                return false;
+            }
+            std::wstring moveError;
+            if (!MoveFileWithoutReplacement(
+                    iterator->destinationPath, iterator->sourcePath,
+                    &moveError)) {
+                if (errorMessage != nullptr) {
+                    *errorMessage = moveError;
+                }
+                return false;
+            }
+        }
+        return true;
+    }
+
+    void RecoverPendingManagedBatchTransaction() {
+        const std::filesystem::path journalPath =
+            ManagedBatchTransactionPath();
+        if (journalPath.empty()) return;
+        const std::optional<std::string> text = ReadUtf8File(journalPath);
+        if (!text.has_value()) return;
+        ManagedBatchTransaction transaction;
+        if (!DeserializeManagedBatchTransaction(*text, transaction)) {
+            SetStatus(
+                L"检测到无效的批量托管事务日志；未移动任何真实文件");
+            return;
+        }
+        if (stateRecoveryBlocked_) {
+            SetStatus(
+                L"状态处于保护模式；批量托管事务等待人工恢复");
+            return;
+        }
+        const bool stateCommitted = std::all_of(
+            transaction.moves.begin(), transaction.moves.end(),
+            [this](const ManagedFileTransaction& move) {
+                return StateMatchesManagedTransaction(move);
+            });
+        const bool allAtDestination = std::all_of(
+            transaction.moves.begin(), transaction.moves.end(),
+            [](const ManagedFileTransaction& move) {
+                return FilePathExists(move.destinationPath) &&
+                       !FilePathExists(move.sourcePath);
+            });
+        if (stateCommitted && allAtDestination) {
+            ClearManagedBatchTransaction();
+            SetStatus(L"已完成上次中断的批量文件事务");
+            return;
+        }
+        if (!stateCommitted) {
+            std::wstring rollbackError;
+            if (RollBackManagedBatchFiles(transaction, &rollbackError)) {
+                ClearManagedBatchTransaction();
+                SetStatus(L"已完整回滚上次中断的批量文件事务");
+            } else {
+                SetStatus(
+                    L"批量文件事务需要人工恢复；真实文件未被删除：" +
+                    rollbackError);
+            }
+            return;
+        }
+        SetStatus(
+            L"批量文件事务状态不一致；请通过文件库检查真实文件");
     }
 
     void RecoverPendingCoreDissolveTransaction() {
@@ -28440,6 +28833,62 @@ bool RunSelfTest() {
         GravityApp::FilePathExists(managedRecoveryDestination.wstring()) ||
         GravityApp::FilePathExists(
             managedRecoveryApp.ManagedTransactionPath().wstring())) {
+        return false;
+    }
+
+    // A batch journal covers every planned file before the first move. If a
+    // crash happens after only one file moved, startup must restore that file,
+    // leave the untouched file in place, and clear the complete plan.
+    GravityApp managedBatchRecoveryApp;
+    managedBatchRecoveryApp.stateFile_ =
+        relationTestDirectory / L"managed-batch-recovery-state.json";
+    ManagedBatchTransaction interruptedBatch;
+    interruptedBatch.id = 995;
+    interruptedBatch.createdAt = UnixTimeNow();
+    for (std::uint64_t index = 0; index < 2; ++index) {
+        ManagedFileTransaction move;
+        move.id = 995 + index;
+        move.coreId = 1;
+        move.itemId = 995 + index;
+        move.operation = ManagedTransactionOperation::Store;
+        move.sourcePath =
+            (relationTestDirectory /
+             (L"managed-batch-source-" + std::to_wstring(index) + L".txt"))
+                .wstring();
+        move.destinationPath =
+            (relationTestDirectory / L"managed-batch-library" /
+             (L"managed-batch-destination-" +
+              std::to_wstring(index) + L".txt"))
+                .wstring();
+        move.itemPresentAfter = true;
+        move.createdAt = interruptedBatch.createdAt;
+        if (!WriteUtf8Atomic(move.sourcePath, "batch recovery")) {
+            return false;
+        }
+        interruptedBatch.moves.push_back(std::move(move));
+    }
+    ManagedBatchTransaction parsedBatch;
+    if (!DeserializeManagedBatchTransaction(
+            SerializeManagedBatchTransaction(interruptedBatch),
+            parsedBatch) ||
+        parsedBatch.moves.size() != interruptedBatch.moves.size() ||
+        !managedBatchRecoveryApp.PersistManagedBatchTransaction(
+            interruptedBatch) ||
+        !managedBatchRecoveryApp.MoveFileWithoutReplacement(
+            interruptedBatch.moves.front().sourcePath,
+            interruptedBatch.moves.front().destinationPath,
+            &managedMoveError)) {
+        return false;
+    }
+    managedBatchRecoveryApp.RecoverPendingManagedBatchTransaction();
+    for (const ManagedFileTransaction& move : interruptedBatch.moves) {
+        if (!GravityApp::FilePathExists(move.sourcePath) ||
+            GravityApp::FilePathExists(move.destinationPath)) {
+            return false;
+        }
+    }
+    if (GravityApp::FilePathExists(
+            managedBatchRecoveryApp.ManagedBatchTransactionPath().wstring())) {
         return false;
     }
 
