@@ -13153,8 +13153,17 @@ private:
     }
 
     void AttachDividerHandleWindowToCompanionLayer() {
-        if (dividerHandleWindow_ == nullptr ||
-            interactionWindow_ == nullptr) {
+        if (dividerHandleWindow_ == nullptr) {
+            return;
+        }
+        // The handle deliberately shares the Explorer desktop host with the
+        // visual layer, rather than being a child of the short-lived input
+        // island.  Win+D may temporarily rebuild that island while the visual
+        // desktop child stays present; binding the painted triangle to the
+        // island made the triangle flash out on those transitions.
+        AttachToDesktopCompanionLayer();
+        HWND host = desktopChildHosted_ ? desktopHost_ : nullptr;
+        if (host == nullptr || IsWindow(host) == FALSE) {
             return;
         }
         const LONG_PTR style =
@@ -13167,12 +13176,8 @@ private:
                     static_cast<LONG_PTR>(WS_CHILD));
             frameChanged = true;
         }
-        // The handle is part of the interaction island, not an independent
-        // desktop popup.  Explorer can temporarily hide an owned popup during
-        // Win+D while leaving the island visible, which made only the triangle
-        // disappear.  A child follows the island as one lifecycle unit.
-        if (GetParent(dividerHandleWindow_) != interactionWindow_) {
-            SetParent(dividerHandleWindow_, interactionWindow_);
+        if (GetParent(dividerHandleWindow_) != host) {
+            SetParent(dividerHandleWindow_, host);
             frameChanged = true;
         }
         if (frameChanged) {
@@ -23921,13 +23926,24 @@ private:
         }
         const int width = DividerHandleWidthPixels();
         const int height = DividerHandleHeightPixels();
-        // interactionWindow_ starts exactly one handle half-width to the
-        // left of the visual workspace, so (0, 0) keeps the triangle centred
-        // on the same divider without a second screen-space positioning path.
+        RECT visualBounds{};
+        HWND host = GetParent(dividerHandleWindow_);
+        if (GetWindowRect(window_, &visualBounds) == FALSE ||
+            host == nullptr || IsWindow(host) == FALSE) {
+            return;
+        }
+        // Place this desktop-host child one half-width to the left of the
+        // visual workspace. Its centre is therefore exactly on the divider,
+        // while its lifecycle remains independent of interaction-window
+        // recreation.
+        POINT origin{
+            visualBounds.left - width / 2,
+            visualBounds.top};
+        ScreenToClient(host, &origin);
         SetWindowPos(
             dividerHandleWindow_,
             HWND_TOP,
-            0, 0,
+            origin.x, origin.y,
             width, height,
             SWP_NOACTIVATE |
             SWP_SHOWWINDOW);
