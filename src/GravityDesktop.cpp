@@ -6170,7 +6170,9 @@ private:
             return "desktop_health_host_replaced";
         }
         const bool dividerAttached =
-            GetParent(dividerHandleWindow_) == interactionWindow_;
+            (GetWindowLongPtrW(
+                 dividerHandleWindow_, GWL_STYLE) & WS_CHILD) != 0 &&
+            GetParent(dividerHandleWindow_) == desktopHost_;
         if (desktopChildHosted_) {
             if (GetParent(window_) != desktopHost_) {
                 // Explorer may move a desktop child between its two internal
@@ -13156,12 +13158,10 @@ private:
         if (dividerHandleWindow_ == nullptr) {
             return;
         }
-        // The handle deliberately shares the Explorer desktop host with the
-        // visual layer, rather than being a child of the short-lived input
-        // island.  Win+D may temporarily rebuild that island while the visual
-        // desktop child stays present; binding the painted triangle to the
-        // island made the triangle flash out on those transitions.
-        AttachToDesktopCompanionLayer();
+        // The caller establishes desktopHost_ before synchronizing dependent
+        // surfaces.  Do not call AttachToDesktopCompanionLayer() here: that
+        // routine synchronizes this handle in turn and would recurse during
+        // startup before the message loop is available.
         HWND host = desktopChildHosted_ ? desktopHost_ : nullptr;
         if (host == nullptr || IsWindow(host) == FALSE) {
             return;
