@@ -80,5 +80,10 @@
   <ItemGroup>
     <ResourceCompile Include="src\GravityDesktop.rc" />
   </ItemGroup>
+  <Target Name="CopyGravityDesktopRuntimeAssets" AfterTargets="Build">
+    <Copy SourceFiles="$(ProjectDir)src\GravityDesktopLibrary.ico"
+          DestinationFolder="$(OutDir)"
+          SkipUnchangedFiles="true" />
+  </Target>
   <Import Project="$(VCTargetsPath)\Microsoft.Cpp.targets" />
 </Project>

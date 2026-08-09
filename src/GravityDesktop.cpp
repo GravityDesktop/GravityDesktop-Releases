@@ -22621,10 +22621,12 @@ private:
     }
 
     void EnsureManagedLibrarySafetyCenter() {
-        const std::optional<std::filesystem::path> shortcutPath =
+        const std::optional<std::filesystem::path> libraryShortcutPath =
+            ManagedLibraryDesktopShortcutPath();
+        const std::optional<std::filesystem::path> legacySafetyShortcutPath =
             ManagedLibrarySafetyCenterShortcutPath();
-        if (!shortcutPath.has_value()) {
-            AppendRuntimeDiagnostic("managed_safety_center_desktop_unavailable");
+        if (!libraryShortcutPath.has_value()) {
+            AppendRuntimeDiagnostic("managed_library_desktop_unavailable");
             return;
         }
         const std::filesystem::path library = ManagedLibraryPath();
@@ -22641,6 +22643,11 @@ private:
             std::filesystem::path(CurrentExecutablePath()).parent_path() /
             L"GravityDesktopRecovery.exe";
         const std::filesystem::path durableRecovery = RecoveryToolPath();
+        const std::filesystem::path packagedLibraryIcon =
+            std::filesystem::path(CurrentExecutablePath()).parent_path() /
+            L"GravityDesktopLibrary.ico";
+        const std::filesystem::path durableLibraryIcon =
+            durableRecovery.parent_path() / L"GravityDesktopLibrary.ico";
         if (FilePathExists(sourceRecovery.wstring())) {
             std::filesystem::create_directories(
                 durableRecovery.parent_path(), error);
@@ -22676,13 +22683,66 @@ private:
             AppendRuntimeDiagnostic("recovery_tool_source_missing");
         }
 
-        const auto createShortcut = [this](
-            const std::filesystem::path& target,
-            const std::filesystem::path& destination,
-            const wchar_t* description) {
+        bool libraryIconAvailable =
+            FilePathExists(durableLibraryIcon.wstring());
+        if (FilePathExists(packagedLibraryIcon.wstring())) {
+            error.clear();
+            std::filesystem::create_directories(
+                durableLibraryIcon.parent_path(), error);
+            if (!error &&
+                CopyFileW(packagedLibraryIcon.c_str(),
+                          durableLibraryIcon.c_str(), FALSE) != FALSE) {
+                libraryIconAvailable = true;
+            } else if (!libraryIconAvailable) {
+                AppendRuntimeDiagnostic("managed_library_icon_copy_failed",
+                                        E_FAIL, GetLastError());
+            }
+        } else if (!libraryIconAvailable) {
+            AppendRuntimeDiagnostic("managed_library_icon_source_missing");
+        }
+
+        constexpr wchar_t kLibraryDescription[] =
+            L"引力桌面托管文件库（程序故障时仍可直接访问）";
+        constexpr wchar_t kLegacySafetyDescription[] =
+            L"打开引力桌面文件库和紧急恢复入口";
+        const auto isKnownManagedLibraryShortcut =
+            [&](const std::filesystem::path& shortcut) {
+            ComPtr<IShellLinkW> shellLink;
+            HRESULT result = CoCreateInstance(
+                CLSID_ShellLink, nullptr, CLSCTX_INPROC_SERVER,
+                IID_PPV_ARGS(shellLink.ReleaseAndGetAddressOf()));
+            ComPtr<IPersistFile> persist;
+            if (SUCCEEDED(result)) result = shellLink.As(&persist);
+            if (SUCCEEDED(result)) result = persist->Load(
+                shortcut.c_str(), STGM_READ);
+            std::array<wchar_t, 32768> target{};
+            std::array<wchar_t, 1024> description{};
+            if (SUCCEEDED(result)) result = shellLink->GetPath(
+                target.data(), static_cast<int>(target.size()), nullptr,
+                SLGP_RAWPATH);
+            if (SUCCEEDED(result)) result = shellLink->GetDescription(
+                description.data(), static_cast<int>(description.size()));
+            if (FAILED(result) || !PathEquals(
+                    NormalizePath(target.data()),
+                    NormalizePath(library.wstring()))) {
+                return false;
+            }
+            const std::wstring value(description.data());
+            return value == kLibraryDescription ||
+                   value == kLegacySafetyDescription;
+        };
+
+        const auto createOrUpdateShortcut =
+            [&](const std::filesystem::path& target,
+                const std::filesystem::path& destination,
+                const wchar_t* description,
+                bool updateKnownLibraryShortcut,
+                bool useLibraryIcon) {
             std::error_code existsError;
             if (std::filesystem::exists(destination, existsError) &&
-                !existsError) {
+                !existsError &&
+                (!updateKnownLibraryShortcut ||
+                 !isKnownManagedLibraryShortcut(destination))) {
                 return true; // Never overwrite a user-created shortcut.
             }
             ComPtr<IShellLinkW> shellLink;
@@ -22692,9 +22752,14 @@ private:
             if (SUCCEEDED(result)) result = shellLink->SetPath(target.c_str());
             if (SUCCEEDED(result)) result = shellLink->SetDescription(description);
             if (SUCCEEDED(result)) {
-                const std::wstring executable = CurrentExecutablePath();
-                if (!executable.empty()) {
-                    (void)shellLink->SetIconLocation(executable.c_str(), 0);
+                if (useLibraryIcon && libraryIconAvailable) {
+                    (void)shellLink->SetIconLocation(
+                        durableLibraryIcon.c_str(), 0);
+                } else if (!useLibraryIcon) {
+                    const std::wstring executable = CurrentExecutablePath();
+                    if (!executable.empty()) {
+                        (void)shellLink->SetIconLocation(executable.c_str(), 0);
+                    }
                 }
             }
             ComPtr<IPersistFile> persist;
@@ -22703,14 +22768,33 @@ private:
             return SUCCEEDED(result);
         };
 
-        if (!createShortcut(library, *shortcutPath,
-                            L"打开引力桌面文件库和紧急恢复入口")) {
-            AppendRuntimeDiagnostic("managed_safety_center_shortcut_failed",
+        const bool libraryShortcutReady = createOrUpdateShortcut(
+            library, *libraryShortcutPath, kLibraryDescription,
+            true, true);
+        if (!libraryShortcutReady) {
+            AppendRuntimeDiagnostic("managed_library_shortcut_failed",
                                     E_FAIL, GetLastError());
+        } else {
+            SHChangeNotify(SHCNE_UPDATEITEM, SHCNF_PATHW,
+                           libraryShortcutPath->c_str(), nullptr);
+        }
+        if (libraryShortcutReady && legacySafetyShortcutPath.has_value() &&
+            FilePathExists(legacySafetyShortcutPath->wstring()) &&
+            isKnownManagedLibraryShortcut(*legacySafetyShortcutPath)) {
+            if (DeleteFileW(legacySafetyShortcutPath->c_str()) == FALSE) {
+                AppendRuntimeDiagnostic(
+                    "managed_legacy_safety_shortcut_delete_failed",
+                    E_FAIL, GetLastError());
+            } else {
+                SHChangeNotify(SHCNE_DELETE, SHCNF_PATHW,
+                               legacySafetyShortcutPath->c_str(), nullptr);
+            }
         }
         if (FilePathExists(durableRecovery.wstring()) &&
-            !createShortcut(durableRecovery, RecoveryShortcutPath(),
-                            L"将所有引力桌面托管文件安全恢复到 Windows 桌面")) {
+            !createOrUpdateShortcut(
+                durableRecovery, RecoveryShortcutPath(),
+                L"将所有引力桌面托管文件安全恢复到 Windows 桌面",
+                false, false)) {
             AppendRuntimeDiagnostic("recovery_shortcut_create_failed", E_FAIL,
                                     GetLastError());
         }
