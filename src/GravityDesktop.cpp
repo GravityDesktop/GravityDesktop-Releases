@@ -312,6 +312,8 @@ enum MenuCommand : UINT {
     MenuSetCoreColorGray,
     MenuDeleteCore,
     MenuOpenItem,
+    MenuStoreItemReference,
+    MenuStoreCoreDesktopReferences,
     MenuTogglePinned,
     MenuToggleFavorite,
     MenuToggleInProgress,
@@ -18366,6 +18368,18 @@ private:
             AppendMenuW(menu, MF_STRING, MenuRenameCore, L"重命名核心\tF2");
             AppendMenuW(menu, MF_STRING, MenuCoreAppearanceSettings,
                         L"核心外观设置...");
+            const std::size_t collectableReferenceCount =
+                core != nullptr
+                    ? CollectableDesktopReferenceCount(*core)
+                    : 0;
+            if (collectableReferenceCount != 0) {
+                const std::wstring collectableReferenceLabel =
+                    L"收纳现有桌面引用（" +
+                    std::to_wstring(collectableReferenceCount) + L"项）...";
+                AppendMenuW(
+                    menu, MF_STRING, MenuStoreCoreDesktopReferences,
+                    collectableReferenceLabel.c_str());
+            }
             AppendMenuW(menu, MF_SEPARATOR, 0, nullptr);
             const bool layoutLocked = core != nullptr && core->layoutLocked;
             const UINT layoutCommandState =
@@ -18475,6 +18489,13 @@ private:
             AppendMenuW(menu, MF_STRING, MenuOpenContainingFolder, L"打开所在文件夹");
             AppendMenuW(menu, MF_STRING, MenuRevealInExplorer, L"在资源管理器中选中");
             AppendMenuW(menu, MF_STRING, MenuShowFullPath, L"查看完整路径");
+            if (item != nullptr &&
+                item->storageMode == FileStorageMode::Reference &&
+                IsEligibleDesktopManagedFile(item->path)) {
+                AppendMenuW(
+                    menu, MF_STRING, MenuStoreItemReference,
+                    L"收纳到当前核心（移出桌面）");
+            }
             AppendMenuW(menu, MF_SEPARATOR, 0, nullptr);
             AppendMenuW(menu, MF_STRING, MenuTogglePinned,
                         item != nullptr && item->pinned ? L"取消固定" : L"固定");
@@ -18577,6 +18598,13 @@ private:
             break;
         case MenuOpenItem:
             OpenItem(selected_.coreId, selected_.itemId);
+            break;
+        case MenuStoreItemReference:
+            StoreExistingDesktopReferenceInCore(
+                selected_.coreId, selected_.itemId);
+            break;
+        case MenuStoreCoreDesktopReferences:
+            StoreCoreDesktopReferences(selected_.coreId);
             break;
         case MenuOpenContainingFolder:
             OpenContainingFolder(selected_.coreId, selected_.itemId);
@@ -19171,8 +19199,118 @@ private:
     // storage was introduced. Converting that existing node must retain its
     // stable ID, relationship links and hand-tuned position; it is not a new
     // file and must never create a duplicate visual node.
+    std::vector<std::uint64_t> CollectableDesktopReferenceIds(
+        const Core& core) const {
+        std::vector<std::uint64_t> ids;
+        ids.reserve(core.files.size());
+        for (const FileItem& item : core.files) {
+            if (item.storageMode == FileStorageMode::Reference &&
+                IsEligibleDesktopManagedFile(item.path)) {
+                ids.push_back(item.id);
+            }
+        }
+        return ids;
+    }
+
+    std::size_t CollectableDesktopReferenceCount(const Core& core) const {
+        return CollectableDesktopReferenceIds(core).size();
+    }
+
+    bool ConfirmStoreCoreDesktopReferences(
+        const Core& core,
+        const std::vector<std::uint64_t>& itemIds) const {
+        std::size_t publicDesktopCount = 0;
+        for (const FileItem& item : core.files) {
+            if (std::find(itemIds.begin(), itemIds.end(), item.id) !=
+                    itemIds.end() &&
+                IsPublicDesktopManagedFile(item.path)) {
+                ++publicDesktopCount;
+            }
+        }
+        const std::wstring message =
+            L"将这 " + std::to_wstring(itemIds.size()) +
+            L" 个已有桌面引用收纳到“" + core.name +
+            L"”？收纳成功后，它们会从 Windows 桌面移走，并保存在引力桌面文件库中。" +
+            (publicDesktopCount == 0
+                 ? L""
+                 : L"\n\n其中 " + std::to_wstring(publicDesktopCount) +
+                       L" 项来自公共桌面，其他 Windows 用户也将不再看到它们。");
+        const TASKDIALOG_BUTTON buttons[] = {
+            {IDYES, L"收纳"},
+            {IDCANCEL, L"取消"},
+        };
+        TASKDIALOGCONFIG dialog{sizeof(dialog)};
+        dialog.hwndParent = window_;
+        dialog.dwFlags = TDF_ALLOW_DIALOG_CANCELLATION |
+                         TDF_SIZE_TO_CONTENT;
+        dialog.pszWindowTitle = L"收纳已有桌面引用";
+        dialog.pszContent = message.c_str();
+        dialog.pszFooter =
+            L"每个文件均单独安全保存；若有失败，已成功收纳的文件保持可用，其余文件仍留在桌面。";
+        dialog.pszMainIcon = TD_WARNING_ICON;
+        dialog.cButtons = static_cast<UINT>(
+            sizeof(buttons) / sizeof(buttons[0]));
+        dialog.pButtons = buttons;
+        dialog.nDefaultButton = IDCANCEL;
+        using TaskDialogIndirectProc = HRESULT (WINAPI*)(
+            const TASKDIALOGCONFIG*, int*, int*, BOOL*);
+        const HMODULE commonControls =
+            GetModuleHandleW(L"comctl32.dll");
+        const auto taskDialog = commonControls == nullptr
+            ? nullptr
+            : reinterpret_cast<TaskDialogIndirectProc>(
+                GetProcAddress(commonControls, "TaskDialogIndirect"));
+        int pressed = IDCANCEL;
+        if (taskDialog != nullptr &&
+            SUCCEEDED(taskDialog(&dialog, &pressed, nullptr, nullptr))) {
+            return pressed == IDYES;
+        }
+        return MessageBoxW(
+                   window_, message.c_str(), L"收纳已有桌面引用",
+                   MB_OKCANCEL | MB_ICONWARNING | MB_DEFBUTTON2) == IDOK;
+    }
+
+    void StoreCoreDesktopReferences(std::uint64_t coreId) {
+        if (stateRecoveryBlocked_) {
+            SetStatus(L"状态处于保护模式；未移动任何真实文件");
+            return;
+        }
+        const Core* core = FindCore(coreId);
+        if (core == nullptr) {
+            SetStatus(L"收纳失败：目标核心不存在");
+            return;
+        }
+        const std::vector<std::uint64_t> itemIds =
+            CollectableDesktopReferenceIds(*core);
+        if (itemIds.empty()) {
+            SetStatus(L"当前核心没有可收纳的桌面引用");
+            return;
+        }
+        if (!ConfirmStoreCoreDesktopReferences(*core, itemIds)) {
+            SetStatus(L"已取消收纳；桌面文件保持不变");
+            return;
+        }
+
+        std::size_t completed = 0;
+        for (std::size_t index = 0; index < itemIds.size(); ++index) {
+            if (!StoreExistingDesktopReferenceInCore(
+                    coreId, itemIds[index], true)) {
+                const std::size_t remaining = itemIds.size() - index;
+                SetStatus(
+                    L"已收纳 " + std::to_wstring(completed) +
+                    L" 项；" + std::to_wstring(remaining) +
+                    L" 项未处理，原文件保持不变");
+                return;
+            }
+            ++completed;
+        }
+        SetStatus(L"已收纳 " + std::to_wstring(completed) +
+                  L" 项；桌面原图标已移除");
+    }
+
     bool StoreExistingDesktopReferenceInCore(
-        std::uint64_t coreId, std::uint64_t itemId) {
+        std::uint64_t coreId, std::uint64_t itemId,
+        bool confirmationAlreadyGranted = false) {
         if (stateRecoveryBlocked_) {
             SetStatus(L"状态处于保护模式；未移动任何真实文件");
             return false;
@@ -19191,7 +19329,8 @@ private:
             SetStatus(L"未收纳：" + eligibilityError + L"；原文件保持不变");
             return false;
         }
-        if (!ConfirmManagedCollection(sourcePath, *core)) {
+        if (!confirmationAlreadyGranted &&
+            !ConfirmManagedCollection(sourcePath, *core)) {
             SetStatus(L"已取消收纳；真实文件仍保留在 Windows 桌面");
             return false;
         }
