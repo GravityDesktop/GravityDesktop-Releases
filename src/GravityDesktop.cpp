@@ -94,7 +94,10 @@ constexpr UINT_PTR kInteractionLayerRepairTimer = 12;
 constexpr UINT_PTR kDesktopVisibilityRestoreTimer = 13;
 constexpr UINT_PTR kDesktopHostMigrationTimer = 14;
 constexpr UINT_PTR kWorkspaceEnvironmentRefreshTimer = 15;
+constexpr UINT_PTR kRelationshipManifestRetryTimer = 16;
 constexpr std::array<UINT, 3> kSaveRetryDelaysMs{
+    1000, 3000, 10000};
+constexpr std::array<UINT, 3> kRelationshipManifestRetryDelaysMs{
     1000, 3000, 10000};
 constexpr auto kManagedCollectionConfirmationWindow =
     std::chrono::minutes(10);
@@ -4360,9 +4363,15 @@ public:
         // This second copy is deliberately outside LocalAppData.  The recovery
         // executable can work when the main program or its state directory is
         // unavailable, and it never needs to guess which files are managed.
+        const std::filesystem::path recoveryLibrary =
+            snapshot.managedLibraryPath.empty()
+                ? DefaultManagedLibraryPath()
+                : std::filesystem::path(snapshot.managedLibraryPath);
         const std::filesystem::path recoveryManifest =
-            ManagedLibraryPath() / L"恢复清单.json";
-        if (!WriteUtf8Atomic(recoveryManifest, serialized)) {
+            recoveryLibrary / L"恢复清单.json";
+        const bool recoverySaved =
+            WriteUtf8Atomic(recoveryManifest, serialized);
+        if (!recoverySaved) {
             AppendRuntimeDiagnostic(
                 "recovery_manifest_write_failed", E_FAIL, GetLastError());
         } else {
@@ -4377,7 +4386,54 @@ public:
             hideRecoveryMetadata(recoveryManifest);
             hideRecoveryMetadata(recoveryManifest.wstring() + L".bak");
         }
-        return localSaved;
+        return localSaved && recoverySaved;
+    }
+
+    void ScheduleRelationshipManifestRetry() {
+        relationshipManifestSyncPending_ = true;
+        if (shuttingDown_ || exitRequested_ || window_ == nullptr ||
+            relationshipManifestRetryAttempt_ >=
+                kRelationshipManifestRetryDelaysMs.size()) {
+            if (!shuttingDown_ && !exitRequested_ &&
+                relationshipManifestRetryAttempt_ >=
+                    kRelationshipManifestRetryDelaysMs.size()) {
+                AppendRuntimeDiagnostic(
+                    "relationship_manifest_retry_exhausted");
+                SetStatus(
+                    L"恢复清单尚未同步；真实文件仍安全保留在文件库中");
+            }
+            return;
+        }
+        const UINT delay = kRelationshipManifestRetryDelaysMs[
+            relationshipManifestRetryAttempt_++];
+        if (SetTimer(
+                window_, kRelationshipManifestRetryTimer,
+                delay, nullptr) == 0) {
+            AppendRuntimeDiagnostic(
+                "relationship_manifest_retry_timer_failed",
+                E_FAIL, GetLastError());
+        } else {
+            AppendRuntimeDiagnostic(
+                "relationship_manifest_retry_scheduled");
+        }
+    }
+
+    bool SynchronizeRelationshipManifest(
+        const WorkspaceState& snapshot,
+        bool resetRetryBudget = false) {
+        if (resetRetryBudget) {
+            relationshipManifestRetryAttempt_ = 0;
+        }
+        if (WriteRelationshipManifest(snapshot)) {
+            relationshipManifestSyncPending_ = false;
+            relationshipManifestRetryAttempt_ = 0;
+            if (window_ != nullptr) {
+                KillTimer(window_, kRelationshipManifestRetryTimer);
+            }
+            return true;
+        }
+        ScheduleRelationshipManifestRetry();
+        return false;
     }
 
     // The state file is authoritative.  A manifest write failure is logged but
@@ -4385,7 +4441,7 @@ public:
     // rollback: that would reduce real-file safety rather than improve it.
     bool WriteStateWithRelationshipManifest(
         const WorkspaceState& snapshot,
-        bool forceRelationshipManifestWrite = false) const {
+        bool forceRelationshipManifestWrite = false) {
         if (stateFile_.empty() ||
             !WriteUtf8Atomic(stateFile_, SerializeState(snapshot))) {
             return false;
@@ -4395,27 +4451,45 @@ public:
         // overwrite that record with the now-detached workspace state.
         if (forceRelationshipManifestWrite ||
             !preserveExistingRelationshipManifest_) {
-            (void)WriteRelationshipManifest(snapshot);
+            (void)SynchronizeRelationshipManifest(snapshot, true);
         }
         return true;
     }
 
     void DiscoverRelationshipRecoveryManifest() {
-        if (!freshWorkspaceWithoutState_ || stateRecoveryBlocked_) {
+        if (!freshWorkspaceWithoutState_ && !stateRecoveryBlocked_) {
             return;
         }
-        const std::filesystem::path manifestPath =
-            RelationshipManifestPath();
-        const std::optional<std::string> text =
-            manifestPath.empty() ? std::nullopt : ReadUtf8File(manifestPath);
-        RelationshipRecoveryManifest manifest;
-        if (!text || !DeserializeRelationshipRecoveryManifest(*text, manifest) ||
-            manifest.cores.empty()) {
+        const std::filesystem::path local = RelationshipManifestPath();
+        const std::filesystem::path external =
+            ManagedLibraryPath() / L"恢复清单.json";
+        const std::array<std::filesystem::path, 4> candidates{
+            local,
+            external,
+            local.empty()
+                ? std::filesystem::path{}
+                : std::filesystem::path(local.wstring() + L".bak"),
+            std::filesystem::path(external.wstring() + L".bak")};
+        for (std::size_t index = 0; index < candidates.size(); ++index) {
+            if (candidates[index].empty()) continue;
+            const std::optional<std::string> text =
+                ReadUtf8File(candidates[index]);
+            RelationshipRecoveryManifest manifest;
+            if (!text ||
+                !DeserializeRelationshipRecoveryManifest(*text, manifest) ||
+                manifest.cores.empty()) {
+                continue;
+            }
+            pendingRelationshipRecovery_ = std::move(manifest);
+            preserveExistingRelationshipManifest_ = true;
+            AppendRuntimeDiagnostic(
+                index == 0
+                    ? "relationship_recovery_manifest_discovered_local"
+                    : (index == 1
+                           ? "relationship_recovery_manifest_discovered_external"
+                           : "relationship_recovery_manifest_discovered_backup"));
             return;
         }
-        pendingRelationshipRecovery_ = std::move(manifest);
-        preserveExistingRelationshipManifest_ = true;
-        AppendRuntimeDiagnostic("relationship_recovery_manifest_discovered");
     }
 
     bool RestoreRelationshipRecoveryManifest(
@@ -4888,7 +4962,7 @@ public:
             EnsureManagedLibrarySafetyCenter();
             if (!stateRecoveryBlocked_ &&
                 !preserveExistingRelationshipManifest_) {
-                (void)WriteRelationshipManifest(state_);
+                (void)SynchronizeRelationshipManifest(state_, true);
             }
         }
         // Pause is a runtime tray state. An explicit process launch must not
@@ -4955,6 +5029,7 @@ public:
         if (window_ != nullptr) {
             KillTimer(window_, kCoreSelectionHaloTimer);
             KillTimer(window_, kSelectionDismissTimer);
+            KillTimer(window_, kRelationshipManifestRetryTimer);
         }
         if (!benchmarkMode_) {
             SaveState();
@@ -6782,6 +6857,10 @@ private:
         }
         if (dirty_) {
             SetTimer(window_, kSaveTimer, 600, nullptr);
+        }
+        if (relationshipManifestSyncPending_) {
+            relationshipManifestRetryAttempt_ = 0;
+            ScheduleRelationshipManifestRetry();
         }
         if (!status_.empty()) {
             SetTimer(window_, kStatusTimer, 3600, nullptr);
@@ -23235,6 +23314,11 @@ private:
             if (!SaveState()) {
                 ScheduleSaveRetry();
             }
+        } else if (timer == kRelationshipManifestRetryTimer) {
+            KillTimer(window_, kRelationshipManifestRetryTimer);
+            if (relationshipManifestSyncPending_) {
+                (void)SynchronizeRelationshipManifest(state_);
+            }
         } else if (timer == kStatusTimer) {
             KillTimer(window_, kStatusTimer);
             status_.clear();
@@ -25260,6 +25344,8 @@ private:
     std::filesystem::path stateFile_;
     bool dirty_ = false;
     std::size_t saveRetryAttempt_ = 0;
+    bool relationshipManifestSyncPending_ = false;
+    std::size_t relationshipManifestRetryAttempt_ = 0;
     bool benchmarkMode_ = false;
     bool autoStartMode_ = false;
     bool initialized_ = false;
@@ -27888,8 +27974,13 @@ bool RunSelfTest() {
     GravityApp manifestApp;
     manifestApp.stateFile_ = manifestStatePath;
     manifestApp.state_ = source;
-    if (!manifestApp.WriteStateWithRelationshipManifest(source) ||
-        !manifestApp.WriteRelationshipManifest(source) ||
+    WorkspaceState manifestSnapshot = source;
+    manifestSnapshot.managedLibraryPath =
+        (relationTestDirectory / L"managed-library").wstring();
+    manifestApp.state_.managedLibraryPath =
+        manifestSnapshot.managedLibraryPath;
+    if (!manifestApp.WriteStateWithRelationshipManifest(manifestSnapshot) ||
+        !manifestApp.WriteRelationshipManifest(manifestSnapshot) ||
         !manifestApp.CreateHistoryBackup(true)) {
         return false;
     }
@@ -27926,6 +28017,28 @@ bool RunSelfTest() {
         std::abs(parsedRecoveryManifest.cores.front().yRatio - core.yRatio) >
             0.0001f ||
         parsedRecoveryManifest.cores.front().monitorId != core.monitorId) {
+        return false;
+    }
+    GravityApp externalManifestDiscoveryApp;
+    externalManifestDiscoveryApp.stateFile_ =
+        relationTestDirectory / L"external-only" / L"state.json";
+    externalManifestDiscoveryApp.state_.managedLibraryPath =
+        manifestSnapshot.managedLibraryPath;
+    externalManifestDiscoveryApp.freshWorkspaceWithoutState_ = true;
+    externalManifestDiscoveryApp.DiscoverRelationshipRecoveryManifest();
+    if (!externalManifestDiscoveryApp.pendingRelationshipRecovery_.has_value() ||
+        externalManifestDiscoveryApp.pendingRelationshipRecovery_->cores.size() != 1 ||
+        !externalManifestDiscoveryApp.preserveExistingRelationshipManifest_) {
+        return false;
+    }
+    GravityApp blockedManifestDiscoveryApp;
+    blockedManifestDiscoveryApp.stateFile_ =
+        relationTestDirectory / L"blocked-state.json";
+    blockedManifestDiscoveryApp.state_.managedLibraryPath =
+        manifestSnapshot.managedLibraryPath;
+    blockedManifestDiscoveryApp.stateRecoveryBlocked_ = true;
+    blockedManifestDiscoveryApp.DiscoverRelationshipRecoveryManifest();
+    if (!blockedManifestDiscoveryApp.pendingRelationshipRecovery_.has_value()) {
         return false;
     }
     RelationshipRecoveryCore extraRecoveryCore;
@@ -28018,6 +28131,7 @@ bool RunSelfTest() {
         manifestFailureDirectory / L"state.json";
     if (manifestFailureError ||
         !manifestFailureApp.WriteStateWithRelationshipManifest(source) ||
+        !manifestFailureApp.relationshipManifestSyncPending_ ||
         !GravityApp::FilePathExists(
             manifestFailureApp.stateFile_.wstring())) {
         return false;
