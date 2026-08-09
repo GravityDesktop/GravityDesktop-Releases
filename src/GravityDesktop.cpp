@@ -9071,6 +9071,68 @@ private:
                                                      : found->second;
     }
 
+    D2D1_POINT_2F ClampDraggedCoreWorld(
+        const Core& core, D2D1_POINT_2F candidateWorld) const {
+        D2D1_POINT_2F center = WorldToScreen(candidateWorld);
+        const float radius = CoreScreenRadius(core);
+        const D2D1_RECT_F name =
+            CoreNameRectangle(core, center, radius);
+        const D2D1_RECT_F badge =
+            CoreCapacityBadgeRectangle(core, center, radius);
+        D2D1_RECT_F bounds = D2D1::RectF(
+            center.x - radius, center.y - radius,
+            center.x + radius, center.y + radius);
+        bounds.left = std::min(bounds.left,
+                               std::min(name.left, badge.left));
+        bounds.top = std::min(bounds.top,
+                              std::min(name.top, badge.top));
+        bounds.right = std::max(bounds.right,
+                                std::max(name.right, badge.right));
+        bounds.bottom = std::max(bounds.bottom,
+                                 std::max(name.bottom, badge.bottom));
+
+        const D2D1_SIZE_F client = ClientDipSize();
+        constexpr float margin = 8.0f;
+        if (bounds.left < margin) {
+            center.x += margin - bounds.left;
+        }
+        if (bounds.right > client.width - margin) {
+            center.x -= bounds.right - client.width + margin;
+        }
+        if (bounds.top < margin) {
+            center.y += margin - bounds.top;
+        }
+        if (bounds.bottom > client.height - margin) {
+            center.y -= bounds.bottom - client.height + margin;
+        }
+        return ScreenToWorld(center);
+    }
+
+    void TranslateDraggedCoreCache(
+        Core& core, D2D1_POINT_2F targetWorld) {
+        const D2D1_POINT_2F currentWorld = DisplayCoreWorld(core);
+        const D2D1_POINT_2F delta = D2D1::Point2F(
+            targetWorld.x - currentWorld.x,
+            targetWorld.y - currentWorld.y);
+        core.position = targetWorld;
+        coreDisplayPositions_[core.id] = targetWorld;
+
+        const auto found = layoutCache_.find(core.id);
+        if (found == layoutCache_.end()) {
+            return;
+        }
+        const float screenDeltaX = delta.x * state_.zoom;
+        const float screenDeltaY = delta.y * state_.zoom;
+        for (ItemLayout& entry : found->second) {
+            entry.position.x += delta.x;
+            entry.position.y += delta.y;
+            entry.labelRect.left += screenDeltaX;
+            entry.labelRect.right += screenDeltaX;
+            entry.labelRect.top += screenDeltaY;
+            entry.labelRect.bottom += screenDeltaY;
+        }
+    }
+
     D2D1_RECT_F StableLabelRectangle(D2D1_POINT_2F screen,
                                      FileSizeTier tier,
                                      float clusterScale = 1.0f) const {
@@ -10587,17 +10649,17 @@ private:
                                 center.y - radius,
                                 center.x + radius,
                                 center.y + radius),
-                            5.0f, true);
+                            6.0f, true);
                         AddInteractionShape(
                             shapes,
                             CoreCapacityBadgeRectangle(
                                 core, center, radius),
-                            5.0f);
+                            6.0f);
                         AddInteractionShape(
                             shapes,
                             CoreNameRectangle(
                                 core, center, radius),
-                            5.0f);
+                            6.0f);
                     }
                     const auto found = layouts.find(core.id);
                     if (found == layouts.end()) {
@@ -16091,21 +16153,21 @@ private:
             const float coreRadius =
                 CoreScreenRadius(*iterator);
             const float coreHitRadius =
-                coreRadius + 5.0f;
+                coreRadius + 6.0f;
             D2D1_RECT_F name =
                 CoreNameRectangle(
                     *iterator, center, coreRadius);
-            name.left -= 5.0f;
-            name.top -= 5.0f;
-            name.right += 5.0f;
-            name.bottom += 5.0f;
+            name.left -= 6.0f;
+            name.top -= 6.0f;
+            name.right += 6.0f;
+            name.bottom += 6.0f;
             D2D1_RECT_F badge =
                 CoreCapacityBadgeRectangle(
                     *iterator, center, coreRadius);
-            badge.left -= 5.0f;
-            badge.top -= 5.0f;
-            badge.right += 5.0f;
-            badge.bottom += 5.0f;
+            badge.left -= 6.0f;
+            badge.top -= 6.0f;
+            badge.right += 6.0f;
+            badge.bottom += 6.0f;
             if (DistanceSquared(screen, center) <=
                     coreHitRadius * coreHitRadius ||
                 PointInside(screen, name) ||
@@ -18503,7 +18565,10 @@ private:
             draggingCore_ = true;
             dragCoreId_ = hit.coreId;
             if (Core* core = FindCore(hit.coreId)) {
-                coreStartPosition_ = core->position;
+                // Start from the visible collision-resolved position. Using
+                // the persisted preference here caused a perceptible jump on
+                // the first move whenever those positions differed.
+                coreStartPosition_ = DisplayCoreWorld(*core);
             }
             SetCapture(window_);
         } else if (hit.kind == HitKind::Item) {
@@ -18585,6 +18650,9 @@ private:
         }
         const D2D1_POINT_2F world = ScreenToWorld(PixelToDip(x, y));
         if (draggingCore_ && dragMoved_) {
+            // Pointer moves translate only the active cluster cache. Run the
+            // expensive global collision resolver once, at commit time.
+            layoutDirty_ = true;
             StableLayouts();
             // Drag completion is an explicit transaction. Commit the dragged
             // core and any hard-body displacement here, with the caller's
@@ -19090,15 +19158,19 @@ private:
 
         const float moved = DistanceSquared(dip, pointerStartDip_);
         if (draggingCore_) {
-            if (moved > 9.0f) {
+            // A core is a large, explicit drag target. A 1.5 DIP threshold is
+            // enough to reject click jitter without making it feel sticky.
+            if (moved > 2.25f) {
                 dragMoved_ = true;
             }
             if (dragMoved_) {
                 if (Core* core = FindCore(dragCoreId_)) {
-                    core->position.x = coreStartPosition_.x + world.x - pointerStartWorld_.x;
-                    core->position.y = coreStartPosition_.y + world.y - pointerStartWorld_.y;
+                    const D2D1_POINT_2F requested = D2D1::Point2F(
+                        coreStartPosition_.x + world.x - pointerStartWorld_.x,
+                        coreStartPosition_.y + world.y - pointerStartWorld_.y);
+                    TranslateDraggedCoreCache(
+                        *core, ClampDraggedCoreWorld(*core, requested));
                 }
-                layoutDirty_ = true;
                 Invalidate();
             }
             return;
@@ -26484,11 +26556,48 @@ bool RunSelfTest() {
             safeDisplayPosition) <= 0.25f &&
         committedCacheCore.xRatio >= 0.0f &&
         committedCacheCore.xRatio <= 1.0f &&
-        committedCacheCore.yRatio >= 0.0f &&
-        committedCacheCore.yRatio <= 1.0f;
+         committedCacheCore.yRatio >= 0.0f &&
+         committedCacheCore.yRatio <= 1.0f;
+
+    GravityApp dragTranslationApp;
+    dragTranslationApp.state_.zoom = 1.25f;
+    Core dragTranslationCore;
+    dragTranslationCore.id = 21;
+    dragTranslationCore.position = D2D1::Point2F(100.0f, 80.0f);
+    FileItem dragTranslationItem;
+    dragTranslationItem.id = 22;
+    dragTranslationCore.files.push_back(dragTranslationItem);
+    dragTranslationApp.state_.cores.push_back(
+        std::move(dragTranslationCore));
+    Core& translatedCore = dragTranslationApp.state_.cores.front();
+    ItemLayout translatedEntry;
+    translatedEntry.item = &translatedCore.files.front();
+    translatedEntry.position = D2D1::Point2F(150.0f, 120.0f);
+    translatedEntry.labelRect =
+        D2D1::RectF(100.0f, 100.0f, 200.0f, 130.0f);
+    dragTranslationApp.layoutCache_[translatedCore.id].push_back(
+        translatedEntry);
+    dragTranslationApp.coreDisplayPositions_[translatedCore.id] =
+        translatedCore.position;
+    dragTranslationApp.layoutDirty_ = false;
+    dragTranslationApp.TranslateDraggedCoreCache(
+        translatedCore, D2D1::Point2F(130.0f, 90.0f));
+    const ItemLayout& movedEntry =
+        dragTranslationApp.layoutCache_[translatedCore.id].front();
+    const bool dragTranslationStayedRigid =
+        dragTranslationApp.DistanceSquared(
+            translatedCore.position,
+            D2D1::Point2F(130.0f, 90.0f)) <= 0.01f &&
+        dragTranslationApp.DistanceSquared(
+            movedEntry.position,
+            D2D1::Point2F(180.0f, 130.0f)) <= 0.01f &&
+        std::abs(movedEntry.labelRect.left - 137.5f) <= 0.01f &&
+        std::abs(movedEntry.labelRect.top - 112.5f) <= 0.01f &&
+        !dragTranslationApp.layoutDirty_;
     DestroyWindow(cacheVisual);
     if (!cacheWasPure ||
-        !explicitCommitWasPersistent) {
+        !explicitCommitWasPersistent ||
+        !dragTranslationStayedRigid) {
         return false;
     }
 
