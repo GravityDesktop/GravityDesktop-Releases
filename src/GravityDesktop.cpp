@@ -93,6 +93,7 @@ constexpr UINT_PTR kDesktopReconnectTimer = 11;
 constexpr UINT_PTR kInteractionLayerRepairTimer = 12;
 constexpr UINT_PTR kDesktopVisibilityRestoreTimer = 13;
 constexpr UINT_PTR kDesktopHostMigrationTimer = 14;
+constexpr UINT_PTR kWorkspaceEnvironmentRefreshTimer = 15;
 constexpr auto kManagedCollectionConfirmationWindow =
     std::chrono::minutes(10);
 constexpr UINT kDesktopHostWatchIntervalMs = 2000;
@@ -100,6 +101,8 @@ constexpr UINT kDesktopReconnectIntervalMs = 250;
 constexpr UINT kInteractionLayerRepairDelayMs = 600;
 constexpr UINT kDesktopVisibilityRestoreDelayMs = 180;
 constexpr UINT kDesktopHostMigrationSettleDelayMs = 450;
+constexpr std::array<UINT, 4> kWorkspaceEnvironmentRefreshDelaysMs{
+    120, 320, 700, 1400};
 constexpr int kDesktopReconnectAttemptLimit = 40;
 constexpr std::uintmax_t kRuntimeDiagnosticLogMaximumBytes =
     2U * 1024U * 1024U;
@@ -4642,6 +4645,8 @@ public:
                 lifecycleWindow_, kInteractionLayerRepairTimer);
             KillTimer(
                 lifecycleWindow_, kDesktopHostMigrationTimer);
+            KillTimer(
+                lifecycleWindow_, kWorkspaceEnvironmentRefreshTimer);
             if (shellHookRegistered_) {
                 DeregisterShellHookWindow(lifecycleWindow_);
                 shellHookRegistered_ = false;
@@ -5003,6 +5008,7 @@ public:
             AppendRuntimeDiagnostic("display_change");
             ApplyCompanionWorkspaceFrame();
             Resize();
+            ScheduleWorkspaceEnvironmentRefresh();
             return 0;
         case WM_EXITSIZEMOVE:
             RememberWorkspaceWidth();
@@ -5012,6 +5018,7 @@ public:
         case WM_DPICHANGED:
             AppendRuntimeDiagnostic("dpi_change");
             OnDpiChanged(wParam, lParam);
+            ScheduleWorkspaceEnvironmentRefresh();
             return 0;
         case WM_POWERBROADCAST:
             if (wParam == PBT_APMSUSPEND) {
@@ -5028,6 +5035,11 @@ public:
             iconCache_.clear();
             iconShadowCache_.clear();
             RefreshResponsiveMetrics(true);
+            if (message == WM_SETTINGCHANGE) {
+                // Explorer and the taskbar may publish their final work area
+                // after this notification. Re-read it after the shell settles.
+                ScheduleWorkspaceEnvironmentRefresh();
+            }
             Invalidate();
             return 0;
         case WM_SYSCOMMAND:
@@ -5956,6 +5968,77 @@ private:
         applyingWorkspaceFrame_ = false;
     }
 
+    bool WorkspaceEnvironmentRefreshBlockedByPointer() const {
+        return panning_ || draggingCore_ || draggingItem_ ||
+               draggingDivider_ || workspaceChromePointerPending_ ||
+               draggingWorkspaceChrome_ ||
+               draggingCoreDistancePanel_ ||
+               draggingCoreDistanceSlider_ ||
+               draggingCoreAppearancePanel_ ||
+               draggingCoreAppearanceSlider_;
+    }
+
+    void ArmWorkspaceEnvironmentRefreshTimer(UINT delay) {
+        if (lifecycleWindow_ == nullptr || shuttingDown_ || exitRequested_) {
+            return;
+        }
+        if (SetTimer(lifecycleWindow_, kWorkspaceEnvironmentRefreshTimer,
+                     delay, nullptr) == 0) {
+            const DWORD error = GetLastError();
+            AppendRuntimeDiagnostic(
+                "workspace_environment_refresh_timer_failed",
+                HRESULT_FROM_WIN32(error), error);
+        }
+    }
+
+    void ScheduleWorkspaceEnvironmentRefresh() {
+        if (lifecycleWindow_ == nullptr || shuttingDown_ || exitRequested_) {
+            return;
+        }
+        KillTimer(lifecycleWindow_, kWorkspaceEnvironmentRefreshTimer);
+        workspaceEnvironmentRefreshPass_ = 0;
+        ArmWorkspaceEnvironmentRefreshTimer(
+            kWorkspaceEnvironmentRefreshDelaysMs.front());
+    }
+
+    void RefreshWorkspaceEnvironmentAfterSystemChange() {
+        if (lifecycleWindow_ == nullptr) return;
+        KillTimer(lifecycleWindow_, kWorkspaceEnvironmentRefreshTimer);
+        if (window_ == nullptr || shuttingDown_ || exitRequested_ ||
+            failOpenActive_) {
+            workspaceEnvironmentRefreshPass_ = 0;
+            return;
+        }
+        if (WorkspaceEnvironmentRefreshBlockedByPointer()) {
+            // Never move the desktop frame underneath an active user drag.
+            ArmWorkspaceEnvironmentRefreshTimer(120);
+            return;
+        }
+
+        // WM_DISPLAYCHANGE can arrive before Explorer and the taskbar publish
+        // their final work area. Reacquire the live work area several times,
+        // remap from the saved logical ratios, and rebuild the input island.
+        // This is a view refresh only: it does not rewrite core ratios or
+        // persist an intermediate resolution as the user's layout.
+        ApplyCompanionWorkspaceFrame();
+        Resize();
+        EnsureInteractionWindowPresented();
+        const std::string event =
+            "workspace_environment_refreshed_" +
+            std::to_string(workspaceEnvironmentRefreshPass_ + 1);
+        AppendRuntimeDiagnostic(event.c_str());
+
+        ++workspaceEnvironmentRefreshPass_;
+        if (workspaceEnvironmentRefreshPass_ <
+            static_cast<int>(kWorkspaceEnvironmentRefreshDelaysMs.size())) {
+            ArmWorkspaceEnvironmentRefreshTimer(
+                kWorkspaceEnvironmentRefreshDelaysMs[
+                    workspaceEnvironmentRefreshPass_]);
+        } else {
+            workspaceEnvironmentRefreshPass_ = 0;
+        }
+    }
+
     bool IsCompatibleExplorerDesktopHost(HWND host) const {
         if (host == nullptr || IsWindow(host) == FALSE) {
             return false;
@@ -6482,6 +6565,10 @@ private:
     }
 
     void HandleDesktopLifecycleTimer(WPARAM timer) {
+        if (timer == kWorkspaceEnvironmentRefreshTimer) {
+            RefreshWorkspaceEnvironmentAfterSystemChange();
+            return;
+        }
         if (timer == kDesktopHostMigrationTimer) {
             (void)CommitPendingDesktopHostMigration();
             return;
@@ -24454,6 +24541,7 @@ private:
     bool desktopReconnectPending_ = false;
     bool desktopReconnectInProgress_ = false;
     int desktopReconnectAttempts_ = 0;
+    int workspaceEnvironmentRefreshPass_ = 0;
     bool interactionDropTargetRegistered_ = false;
     std::vector<InteractionShape> interactionShapes_;
     HDC interactionDeviceContext_ = nullptr;
