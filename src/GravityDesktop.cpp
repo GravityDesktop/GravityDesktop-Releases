@@ -94,6 +94,8 @@ constexpr UINT_PTR kInteractionLayerRepairTimer = 12;
 constexpr UINT_PTR kDesktopVisibilityRestoreTimer = 13;
 constexpr UINT_PTR kDesktopHostMigrationTimer = 14;
 constexpr UINT_PTR kWorkspaceEnvironmentRefreshTimer = 15;
+constexpr std::array<UINT, 3> kSaveRetryDelaysMs{
+    1000, 3000, 10000};
 constexpr auto kManagedCollectionConfirmationWindow =
     std::chrono::minutes(10);
 constexpr UINT kDesktopHostWatchIntervalMs = 2000;
@@ -23195,6 +23197,7 @@ private:
 
     void ScheduleSave(bool requireLayoutRebuild = true) {
         dirty_ = true;
+        saveRetryAttempt_ = 0;
         if (requireLayoutRebuild) {
             layoutDirty_ = true;
         }
@@ -23203,12 +23206,35 @@ private:
         }
     }
 
+    void ScheduleSaveRetry() {
+        if (!dirty_ || stateRecoveryBlocked_ || shuttingDown_ ||
+            exitRequested_ || window_ == nullptr ||
+            saveRetryAttempt_ >= kSaveRetryDelaysMs.size()) {
+            if (dirty_ && !stateRecoveryBlocked_ &&
+                saveRetryAttempt_ >= kSaveRetryDelaysMs.size()) {
+                AppendRuntimeDiagnostic("state_save_retry_exhausted");
+                SetStatus(
+                    L"状态保存仍未成功；当前修改保留在内存中，下一次修改时将重新尝试");
+            }
+            return;
+        }
+        const UINT delay = kSaveRetryDelaysMs[saveRetryAttempt_++];
+        if (SetTimer(window_, kSaveTimer, delay, nullptr) == 0) {
+            AppendRuntimeDiagnostic(
+                "state_save_retry_timer_failed", E_FAIL, GetLastError());
+        } else {
+            AppendRuntimeDiagnostic("state_save_retry_scheduled");
+        }
+    }
+
     void OnTimer(WPARAM timer) {
         if (timer == kDesktopVisibilityRestoreTimer) {
             RestoreDesktopVisibilityAfterShellTransition();
         } else if (timer == kSaveTimer) {
             KillTimer(window_, kSaveTimer);
-            SaveState();
+            if (!SaveState()) {
+                ScheduleSaveRetry();
+            }
         } else if (timer == kStatusTimer) {
             KillTimer(window_, kStatusTimer);
             status_.clear();
@@ -25160,6 +25186,7 @@ private:
         UpdateCoreRatios();
         if (WriteStateWithRelationshipManifest(state_)) {
             dirty_ = false;
+            saveRetryAttempt_ = 0;
             CreateHistoryBackup(false);
             return true;
         } else {
@@ -25232,6 +25259,7 @@ private:
         lastCoreLayouts_;
     std::filesystem::path stateFile_;
     bool dirty_ = false;
+    std::size_t saveRetryAttempt_ = 0;
     bool benchmarkMode_ = false;
     bool autoStartMode_ = false;
     bool initialized_ = false;
