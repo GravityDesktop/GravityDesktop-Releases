@@ -6564,6 +6564,7 @@ private:
         }
         ApplyCompanionWorkspaceFrame();
         RefreshResponsiveMetrics(true);
+        (void)ClampCoreClustersToWorkspace();
         ScheduleSave();
         AppendRuntimeDiagnostic(
             state_.fullScreenWorkMode
@@ -8434,6 +8435,50 @@ private:
                 0.0f, 1.0f);
             core.monitorId = monitorId;
         }
+    }
+
+    int ClampCoreClustersToWorkspace() {
+        // A divider resize changes the usable companion area but is not an
+        // automatic layout command. Keep every valid core exactly where it
+        // is, and move only a cluster whose saved footprint would otherwise
+        // leave the newly sized workspace.
+        const D2D1_SIZE_F workspace = ClientDipSize();
+        constexpr float margin = 10.0f;
+        const auto clampAxis = [margin](float value, float extent,
+                                        float length) {
+            const float usableHalf = std::max(0.0f, length * 0.5f - margin);
+            const float safeExtent = std::min(std::max(0.0f, extent),
+                                              usableHalf);
+            const float minimum = margin + safeExtent;
+            const float maximum = length - margin - safeExtent;
+            return minimum <= maximum
+                ? std::clamp(value, minimum, maximum)
+                : length * 0.5f;
+        };
+
+        int corrected = 0;
+        for (Core& core : state_.cores) {
+            if (core.archived || !CoreBodyVisible(core)) {
+                continue;
+            }
+            const D2D1_POINT_2F current = WorldToScreen(core.position);
+            const float footprintRadius = std::max(
+                metrics_.coreSize * CoreFormalLayoutScale(core) * 0.5f,
+                ClusterRadiusForCore(core)) * state_.zoom;
+            const D2D1_POINT_2F safe = D2D1::Point2F(
+                clampAxis(current.x, footprintRadius, workspace.width),
+                clampAxis(current.y, footprintRadius, workspace.height));
+            if (DistanceSquared(current, safe) <= 0.25f) {
+                continue;
+            }
+            core.position = ScreenToWorld(safe);
+            ++corrected;
+        }
+        if (corrected > 0) {
+            layoutDirty_ = true;
+            UpdateCoreRatios();
+        }
+        return corrected;
     }
 
     D2D1_SIZE_F ClientDipSize() const {
@@ -13194,9 +13239,11 @@ private:
         state_.dividerPosition = state_.workspaceWidthRatio;
         ApplyCompanionWorkspaceFrame();
         if (finalize) {
-            // Resizing the companion boundary is not a layout command. Keep
-            // every core and file at its current world position; only refresh
-            // the saved ratios used for a later restart or monitor change.
+            // The drag path intentionally defers layout work. Once the user
+            // releases the divider, refresh the responsive footprint and
+            // correct only clusters that genuinely crossed the new boundary.
+            RefreshResponsiveMetrics(true);
+            dividerBoundaryCorrectionCount_ = ClampCoreClustersToWorkspace();
             UpdateCoreRatios();
             ScheduleSave();
         }
@@ -13218,6 +13265,9 @@ private:
         if (!DividerEnabled()) return;
         HideDividerTooltip();
         UpdateCoreRatios();
+        dividerDragStartSnapshot_ = state_;
+        dividerDragStartSnapshotValid_ = true;
+        dividerBoundaryCorrectionCount_ = 0;
         dividerDragStartRatio_ = state_.workspaceWidthRatio;
         // The dedicated handle is centered on the boundary and deliberately
         // extends into the left desktop. Keep the signed client offset so the
@@ -13239,6 +13289,7 @@ private:
             ReleaseCapture();
         }
         SetWorkspaceRatio(restoreRatio, false);
+        dividerDragStartSnapshotValid_ = false;
         dividerDragPointerOffsetPixels_ = 0;
         UpdateDividerHandleVisual();
         SetStatus(L"已取消分界线调整");
@@ -13247,13 +13298,25 @@ private:
 
     void EndDividerDrag() {
         if (!draggingDivider_) return;
+        const bool ratioChanged = dividerDragStartSnapshotValid_ &&
+            std::abs(state_.workspaceWidthRatio -
+                     dividerDragStartSnapshot_.workspaceWidthRatio) > 0.0001f;
         SetWorkspaceRatio(state_.workspaceWidthRatio, true);
         draggingDivider_ = false;
         dividerHovered_ = false;
         dividerDragPointerOffsetPixels_ = 0;
         if (GetCapture() == window_) ReleaseCapture();
         UpdateDividerHandleVisual();
-        SetStatus(L"右侧工作区宽度已保存");
+        if (dividerDragStartSnapshotValid_ &&
+            (ratioChanged || dividerBoundaryCorrectionCount_ > 0)) {
+            PushUndo(std::move(dividerDragStartSnapshot_));
+        }
+        dividerDragStartSnapshotValid_ = false;
+        SetStatus(dividerBoundaryCorrectionCount_ > 0
+            ? L"右侧工作区宽度已保存；已将 " +
+                  std::to_wstring(dividerBoundaryCorrectionCount_) +
+                  L" 个越界文件核心移回可见区域"
+            : L"右侧工作区宽度已保存");
     }
 
     void ResetDividerToDefault() {
@@ -24488,6 +24551,9 @@ private:
     std::uint64_t dragItemId_ = 0;
     std::uint64_t dragTargetCoreId_ = 0;
     float dividerDragStartRatio_ = 0.50f;
+    WorkspaceState dividerDragStartSnapshot_;
+    bool dividerDragStartSnapshotValid_ = false;
+    int dividerBoundaryCorrectionCount_ = 0;
     int dividerDragPointerOffsetPixels_ = 0;
     int workspaceChromePendingButton_ = -1;
     bool workspaceChromeDragStartPositionValid_ = false;
