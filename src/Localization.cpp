@@ -187,6 +187,16 @@ bool StartsWith(std::wstring_view value, std::wstring_view prefix) {
         value.substr(0, prefix.size()) == prefix;
 }
 
+std::wstring ResolveRequestedLanguage(std::wstring requested) {
+    requested = Lowercase(std::move(requested));
+    if (requested == L"zh-cn" || requested == L"zh-sg" ||
+        requested == L"zh-hans" || StartsWith(requested, L"zh-hans-")) {
+        return L"zh-CN";
+    }
+    if (StartsWith(requested, L"en-")) return L"en-US";
+    return L"en-US";
+}
+
 std::filesystem::path ExecutableDirectory() {
     std::wstring path(MAX_PATH, L'\0');
     for (;;) {
@@ -368,12 +378,7 @@ std::wstring Localization::ResolveLanguage() const {
             }
         }
     }
-    if (requested == L"zh-cn" || requested == L"zh-sg" ||
-        requested == L"zh-hans" || StartsWith(requested, L"zh-hans-")) {
-        return L"zh-CN";
-    }
-    if (StartsWith(requested, L"en-")) return L"en-US";
-    return L"en-US";
+    return ResolveRequestedLanguage(std::move(requested));
 }
 
 void Localization::ResolveAndLoadLanguage() {
@@ -427,12 +432,19 @@ bool Localization::RunSelfTest() {
     Localization localization;
     localization.english_ = BuiltInEnglish();
     localization.active_ = localization.english_;
+    const auto parsed = ParseStringMap(
+        "{\"text\":\"Fran\\u00e7ais \\u00fc \\u65e5\\u672c\\u8a9e\"}");
     return localization.Text("toolbar.create_core") == L"Create Core" &&
         localization.Format("settings.language.current",
                             {{L"language", L"English"}}) ==
             L"Current language: English" &&
         localization.Text("missing.key") == L"missing.key" &&
-        DisplayName(L"zh-CN") == L"简体中文";
+        DisplayName(L"zh-CN") == L"简体中文" &&
+        ResolveRequestedLanguage(L"zh-SG") == L"zh-CN" &&
+        ResolveRequestedLanguage(L"en-GB") == L"en-US" &&
+        ResolveRequestedLanguage(L"zh-Hant") == L"en-US" &&
+        ResolveRequestedLanguage(L"ja-JP") == L"en-US" &&
+        parsed.has_value() && parsed->at("text") == L"Français ü 日本語";
 }
 
 } // namespace gravity::i18n

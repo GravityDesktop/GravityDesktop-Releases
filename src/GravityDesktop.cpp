@@ -11235,16 +11235,19 @@ private:
                                               client.width - 36.0f, client.height * 0.52f);
         const D2D1_RECT_F button = EmptyCreateButtonRectangle(client);
         brush_->SetColor(D2D1::ColorF(0x202020, 0.96f));
-        renderTarget_->DrawTextW(L"创建你的第一个核心", static_cast<UINT32>(wcslen(L"创建你的第一个核心")), coreFormat_.Get(), title,
+        const std::wstring emptyTitle = T("empty_workspace.title");
+        renderTarget_->DrawTextW(emptyTitle.c_str(), static_cast<UINT32>(emptyTitle.size()), coreFormat_.Get(), title,
                                  brush_.Get(), D2D1_DRAW_TEXT_OPTIONS_CLIP);
         brush_->SetColor(D2D1::ColorF(0x4A4A4A, 0.94f));
-        renderTarget_->DrawTextW(L"把左侧常用文件拖到这里，建立稳定的逻辑集合。", static_cast<UINT32>(wcslen(L"把左侧常用文件拖到这里，建立稳定的逻辑集合。")),
+        const std::wstring emptyBody = T("empty_workspace.body");
+        renderTarget_->DrawTextW(emptyBody.c_str(), static_cast<UINT32>(emptyBody.size()),
                                  bodyFormat_.Get(), body, brush_.Get(),
                                  D2D1_DRAW_TEXT_OPTIONS_CLIP);
         brush_->SetColor(D2D1::ColorF(0x2A7FB7, 0.94f));
         renderTarget_->FillRoundedRectangle(D2D1::RoundedRect(button, 10.0f, 10.0f), brush_.Get());
         brush_->SetColor(D2D1::ColorF(0xFFFFFF, 1.0f));
-        renderTarget_->DrawTextW(L"＋ 创建核心", static_cast<UINT32>(wcslen(L"＋ 创建核心")), bodyFormat_.Get(), button, brush_.Get(),
+        const std::wstring emptyCreate = T("empty_workspace.create");
+        renderTarget_->DrawTextW(emptyCreate.c_str(), static_cast<UINT32>(emptyCreate.size()), bodyFormat_.Get(), button, brush_.Get(),
                                  D2D1_DRAW_TEXT_OPTIONS_CLIP);
     }
 
@@ -12036,12 +12039,12 @@ private:
     std::wstring SettingsPageName(SettingsPage page) const {
         switch (page) {
         case SettingsPage::General: return T("settings.general");
-        case SettingsPage::Appearance: return L"外观与动效";
-        case SettingsPage::Workspace: return L"工作区";
-        case SettingsPage::Data: return L"数据与备份";
-        case SettingsPage::CoreManagement: return L"核心管理";
-        case SettingsPage::Help: return L"帮助";
-        case SettingsPage::Advanced: return L"高级";
+        case SettingsPage::Appearance: return T("settings.appearance");
+        case SettingsPage::Workspace: return T("settings.workspace");
+        case SettingsPage::Data: return T("settings.data");
+        case SettingsPage::CoreManagement: return T("settings.core_management");
+        case SettingsPage::Help: return T("settings.help");
+        case SettingsPage::Advanced: return T("settings.advanced");
         default: return T("toolbar.settings");
         }
     }
@@ -12327,7 +12330,15 @@ private:
             ? localization_.SetAutomatic()
             : localization_.SetExplicitLanguage(locale);
         if (!saved) {
-            SetStatus(L"无法保存语言设置");
+            SetStatus(T("status.language_save_failed"));
+            return;
+        }
+        if (WorkspaceEnvironmentRefreshBlockedByPointer() ||
+            editWindow_ != nullptr || coreShortLabelEditWindow_ != nullptr) {
+            // Preference persistence is safe during an active edit, but a
+            // control rebuild is not.  Keep the ongoing user operation intact
+            // and refresh all UI on the next safe startup instead.
+            SetStatus(T("settings.restart_required"));
             return;
         }
         RefreshSettingsWindowLanguage();
@@ -12465,7 +12476,7 @@ private:
             x, y, width, height, nullptr, nullptr,
             GetModuleHandleW(nullptr), this);
         if (settingsWindow_ == nullptr) {
-            SetStatus(L"无法打开设置窗口");
+            SetStatus(T("status.settings_open_failed"));
             return;
         }
         CreateSettingsFonts();
@@ -12678,7 +12689,7 @@ private:
                 (state_.coreSelectionEffect ==
                          CoreSelectionEffect::GentleRipple
                      ? MF_CHECKED : 0),
-            MenuCoreSelectionEffectRotate, L"柔和波纹扩散");
+            MenuCoreSelectionEffectRotate, T("settings.selection.ripple").c_str());
         AppendMenuW(
             selectionMenu,
             MF_STRING |
@@ -12686,7 +12697,7 @@ private:
                          CoreSelectionEffect::RippleOnceThenStatic
                      ? MF_CHECKED : 0),
             MenuCoreSelectionEffectOnce,
-            L"播放一次后保持静态");
+            T("settings.selection.once").c_str());
         AppendMenuW(
             selectionMenu,
             MF_STRING |
@@ -12694,36 +12705,37 @@ private:
                          CoreSelectionEffect::Static
                      ? MF_CHECKED : 0),
             MenuCoreSelectionEffectStatic,
-            L"仅显示静态光环");
+            T("settings.selection.static").c_str());
         AppendMenuW(
             appearanceMenu, MF_POPUP,
             reinterpret_cast<UINT_PTR>(selectionMenu),
-            L"核心选中效果");
+            T("menu.selection_effect").c_str());
         AppendMenuW(
             menu, MF_POPUP,
-            reinterpret_cast<UINT_PTR>(appearanceMenu), L"外观与动效");
+            reinterpret_cast<UINT_PTR>(appearanceMenu), T("settings.appearance").c_str());
 
         HMENU workspaceMenu = CreatePopupMenu();
-        AppendMenuW(workspaceMenu, MF_STRING, MenuResetView, L"复位视图");
+        AppendMenuW(workspaceMenu, MF_STRING, MenuResetView,
+                    T("menu.reset_view").c_str());
         AppendMenuW(
             menu, MF_POPUP,
-            reinterpret_cast<UINT_PTR>(workspaceMenu), L"工作区");
+            reinterpret_cast<UINT_PTR>(workspaceMenu), T("settings.workspace").c_str());
 
         HMENU dataMenu = CreatePopupMenu();
-        AppendMenuW(dataMenu, MF_STRING, MenuSaveNow, L"立即保存当前状态");
+        AppendMenuW(dataMenu, MF_STRING, MenuSaveNow, T("menu.save_now").c_str());
         AppendMenuW(dataMenu, MF_SEPARATOR, 0, nullptr);
         AppendMenuW(dataMenu, MF_STRING, MenuExportLayoutSnapshot,
-                    L"导出布局快照");
+                    T("menu.export_layout").c_str());
         AppendMenuW(dataMenu, MF_STRING, MenuImportLayoutSnapshot,
-                    L"恢复布局快照");
+                    T("menu.restore_layout").c_str());
         AppendMenuW(dataMenu, MF_SEPARATOR, 0, nullptr);
         AppendMenuW(dataMenu, MF_STRING, MenuExportWorkspaceBackup,
-                    L"导出完整工作区备份");
+                    T("menu.export_backup").c_str());
         AppendMenuW(dataMenu, MF_STRING, MenuImportWorkspaceBackup,
-                    L"恢复完整工作区备份...");
+                    T("menu.restore_backup").c_str());
         AppendMenuW(
             menu, MF_POPUP,
-            reinterpret_cast<UINT_PTR>(dataMenu), L"数据与备份");
+            reinterpret_cast<UINT_PTR>(dataMenu), T("settings.data").c_str());
 
         HMENU coreManagementMenu = CreatePopupMenu();
         HMENU archivedMenu = CreatePopupMenu();
@@ -12741,36 +12753,36 @@ private:
         if (archivedCoreIds.empty()) {
             AppendMenuW(
                 archivedMenu, MF_STRING | MF_GRAYED, 0,
-                L"没有归档核心");
+                T("menu.no_archived").c_str());
         }
         AppendMenuW(
             coreManagementMenu, MF_POPUP,
-            reinterpret_cast<UINT_PTR>(archivedMenu), L"恢复归档核心");
+            reinterpret_cast<UINT_PTR>(archivedMenu), T("menu.restore_archived").c_str());
         AppendMenuW(
             coreManagementMenu, MF_STRING, MenuRefreshReferences,
-            L"检查失效文件引用");
+            T("menu.check_references").c_str());
         AppendMenuW(
             menu, MF_POPUP,
-            reinterpret_cast<UINT_PTR>(coreManagementMenu), L"核心管理");
+            reinterpret_cast<UINT_PTR>(coreManagementMenu), T("settings.core_management").c_str());
 
         HMENU helpMenu = CreatePopupMenu();
         AppendMenuW(
             helpMenu, MF_STRING, MenuTrayTutorial,
-            L"重新打开使用教程");
+            T("menu.reopen_tutorial").c_str());
         AppendMenuW(
             menu, MF_POPUP,
-            reinterpret_cast<UINT_PTR>(helpMenu), L"帮助");
+            reinterpret_cast<UINT_PTR>(helpMenu), T("settings.help").c_str());
 
         HMENU advancedMenu = CreatePopupMenu();
         AppendMenuW(
             advancedMenu, MF_STRING, MenuOpenDataFolder,
-            L"打开程序数据文件夹");
+            T("menu.open_data_folder").c_str());
         AppendMenuW(
             advancedMenu, MF_STRING, MenuGenerateDiagnosticReport,
-            L"生成问题报告");
+            T("menu.create_report").c_str());
         AppendMenuW(
             menu, MF_POPUP,
-            reinterpret_cast<UINT_PTR>(advancedMenu), L"高级");
+            reinterpret_cast<UINT_PTR>(advancedMenu), T("settings.advanced").c_str());
 
         const D2D1_RECT_F button =
             WorkspaceControlRectangle(ClientDipSize(), 3);
@@ -12801,8 +12813,7 @@ private:
         const AutoStartRegistrationStatus before =
             ReadAutoStartRegistration();
         if (before.state == AutoStartRegistrationState::Unavailable) {
-            SetStatus(
-                L"无法设置开机启动，请检查系统权限或安全软件设置。");
+            SetStatus(T("status.autostart_failed"));
             return;
         }
         const bool shouldEnable =
@@ -12810,13 +12821,12 @@ private:
         if (!WriteAutoStartRegistration(shouldEnable)) {
             // Do not trust a stale UI checkmark. The next settings open reads
             // the actual Run value again, and this operation reports failure.
-            SetStatus(
-                L"无法设置开机启动，请检查系统权限或安全软件设置。");
+            SetStatus(T("status.autostart_failed"));
             return;
         }
-        SetStatus(shouldEnable
-            ? L"已设置：登录Windows后自动启动引力桌面"
-            : L"已关闭：登录Windows后不自动启动引力桌面");
+        SetStatus(T(shouldEnable
+            ? "status.autostart_enabled"
+            : "status.autostart_disabled"));
     }
 
     bool CorePlacementPointValid(
@@ -12852,8 +12862,7 @@ private:
         ScreenToClient(window_, &cursor);
         corePlacementPreviewDip_ =
             PixelToDip(cursor.x, cursor.y);
-        SetStatus(
-            L"单击空白位置放置核心；按 Esc 或右键取消");
+        SetStatus(T("status.place_core"));
         Invalidate();
     }
 
@@ -12862,13 +12871,13 @@ private:
             return;
         }
         corePlacementMode_ = false;
-        SetStatus(L"已取消创建核心");
+        SetStatus(T("status.place_core_cancelled"));
         Invalidate();
     }
 
     void CompleteCorePlacement(D2D1_POINT_2F point) {
         if (!CorePlacementPointValid(point)) {
-            SetStatus(L"此处过于靠近边缘或其他核心，请选择附近空位");
+            SetStatus(T("status.place_core_invalid"));
             corePlacementPreviewDip_ = point;
             Invalidate();
             return;
@@ -14731,15 +14740,15 @@ private:
         renderTarget_->DrawRoundedRectangle(D2D1::RoundedRect(card, 16.0f, 16.0f), brush_.Get(),
                                             1.0f);
 
-        static constexpr std::array<const wchar_t*, 3> titles{
-            L"欢迎使用引力桌面", L"把常用文件拖到核心上",
-            L"点击核心展开，双击文件打开"};
-        static constexpr std::array<const wchar_t*, 3> steps{
-            L"第1步：创建一个核心", L"第2步：建立稳定文件集合", L"第3步：展开并打开文件"};
-        static constexpr std::array<const wchar_t*, 3> bodies{
-            L"点击右侧空白区域或“＋”按钮，创建一个项目核心。\n\n引力桌面只创建文件引用，不会移动、删除或改名真实文件。",
-            L"从左侧 Windows 桌面或资源管理器中拖入文件。真实文件仍保留在原位置。",
-            L"单击核心查看关联文件；双击文件即可按原路径打开。"};
+        const std::array<std::wstring, 3> titles{
+            T("tutorial.welcome"), T("tutorial.drag_files"),
+            T("tutorial.expand_open")};
+        const std::array<std::wstring, 3> steps{
+            T("tutorial.step.create"), T("tutorial.step.collection"),
+            T("tutorial.step.open")};
+        const std::array<std::wstring, 3> bodies{
+            T("tutorial.body.create"), T("tutorial.body.collection"),
+            T("tutorial.body.open")};
         const int step = std::clamp(tutorialStep_, 0, 2);
         const D2D1_RECT_F titleRect = D2D1::RectF(card.left + 24.0f, card.top + 22.0f,
                                                    card.right - 24.0f, card.top + 68.0f);
@@ -14748,23 +14757,24 @@ private:
         const D2D1_RECT_F bodyRect = D2D1::RectF(card.left + 24.0f, card.top + 142.0f,
                                                   card.right - 24.0f, card.bottom - 112.0f);
         brush_->SetColor(D2D1::ColorF(0xF2F8FF, 1.0f));
-        renderTarget_->DrawTextW(titles[step], static_cast<UINT32>(wcslen(titles[step])),
+        renderTarget_->DrawTextW(titles[step].c_str(), static_cast<UINT32>(titles[step].size()),
                                  tutorialTitleFormat_.Get(), titleRect, brush_.Get(),
                                  D2D1_DRAW_TEXT_OPTIONS_CLIP);
         brush_->SetColor(D2D1::ColorF(0x75D9FF, 1.0f));
-        renderTarget_->DrawTextW(steps[step], static_cast<UINT32>(wcslen(steps[step])),
+        renderTarget_->DrawTextW(steps[step].c_str(), static_cast<UINT32>(steps[step].size()),
                                  tutorialStepFormat_.Get(), stepRect, brush_.Get(),
                                  D2D1_DRAW_TEXT_OPTIONS_CLIP);
         brush_->SetColor(D2D1::ColorF(0xD7E6F7, 1.0f));
-        renderTarget_->DrawTextW(bodies[step], static_cast<UINT32>(wcslen(bodies[step])),
+        renderTarget_->DrawTextW(bodies[step].c_str(), static_cast<UINT32>(bodies[step].size()),
                                  tutorialBodyFormat_.Get(), bodyRect, brush_.Get(),
                                  D2D1_DRAW_TEXT_OPTIONS_CLIP);
 
         brush_->SetColor(D2D1::ColorF(0x238FBD, 1.0f));
         renderTarget_->FillRoundedRectangle(D2D1::RoundedRect(primary, 10.0f, 10.0f), brush_.Get());
-        const wchar_t* primaryLabel = step == 2 ? L"开始使用" : L"下一步";
+        const std::wstring primaryLabel = T(
+            step == 2 ? "tutorial.start" : "tutorial.next");
         brush_->SetColor(D2D1::ColorF(0xFFFFFF, 1.0f));
-        renderTarget_->DrawTextW(primaryLabel, static_cast<UINT32>(wcslen(primaryLabel)),
+        renderTarget_->DrawTextW(primaryLabel.c_str(), static_cast<UINT32>(primaryLabel.size()),
                                  tutorialButtonFormat_.Get(), primary, brush_.Get(),
                                  D2D1_DRAW_TEXT_OPTIONS_CLIP);
 
@@ -14774,10 +14784,12 @@ private:
                                                   card.right - 24.0f, card.bottom - 76.0f);
         brush_->SetColor(D2D1::ColorF(0x9BB4CD, 0.96f));
         if (step > 0) {
-            renderTarget_->DrawTextW(L"上一步", 3, tutorialButtonFormat_.Get(), backRect,
+            const std::wstring backLabel = T("tutorial.back");
+            renderTarget_->DrawTextW(backLabel.c_str(), static_cast<UINT32>(backLabel.size()), tutorialButtonFormat_.Get(), backRect,
                                      brush_.Get(), D2D1_DRAW_TEXT_OPTIONS_CLIP);
         }
-        renderTarget_->DrawTextW(L"跳过", 2, tutorialButtonFormat_.Get(), skipRect,
+        const std::wstring skipLabel = T("tutorial.skip");
+        renderTarget_->DrawTextW(skipLabel.c_str(), static_cast<UINT32>(skipLabel.size()), tutorialButtonFormat_.Get(), skipRect,
                                  brush_.Get(), D2D1_DRAW_TEXT_OPTIONS_CLIP);
         const std::wstring progress = std::to_wstring(step + 1) + L" / 3";
         renderTarget_->DrawTextW(progress.c_str(), static_cast<UINT32>(progress.size()),
@@ -14805,7 +14817,7 @@ private:
         state_.tutorialCompleted = true;
         state_.firstRunCompleted = true;
         ScheduleSave();
-        SetStatus(skipped ? L"已跳过教程；可从系统托盘重新打开" : L"教程完成：开始整理你的工作区");
+        SetStatus(T(skipped ? "tutorial.skipped" : "tutorial.completed"));
     }
 
     bool HandleTutorialClick(D2D1_POINT_2F point) {
