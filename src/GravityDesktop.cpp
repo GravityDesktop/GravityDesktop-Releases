@@ -95,6 +95,8 @@ constexpr UINT_PTR kDesktopVisibilityRestoreTimer = 13;
 constexpr UINT_PTR kDesktopHostMigrationTimer = 14;
 constexpr UINT_PTR kWorkspaceEnvironmentRefreshTimer = 15;
 constexpr UINT_PTR kRelationshipManifestRetryTimer = 16;
+constexpr UINT_PTR kWorkspaceChromeAutoHideTimer = 17;
+constexpr UINT kWorkspaceChromeAutoHideDelayMs = 650;
 constexpr std::array<UINT, 3> kSaveRetryDelaysMs{
     1000, 3000, 10000};
 constexpr std::array<UINT, 3> kRelationshipManifestRetryDelaysMs{
@@ -1190,6 +1192,9 @@ struct WorkspaceState {
     float workspaceChromeYRatio = 0.04f;
     int workspaceChromeOrientation = 0;
     bool workspaceChromePinned = true;
+    // Auto-hide is armed only by an explicit edge drop.  A fresh control strip
+    // remains discoverable even though its default rectangle is near the top.
+    bool workspaceChromeDocked = false;
     bool settingsWindowPositionValid = false;
     float settingsWindowXRatio = 0.5f;
     float settingsWindowYRatio = 0.5f;
@@ -2456,6 +2461,8 @@ std::string SerializeState(const WorkspaceState& state) {
            << state.workspaceChromeOrientation
            << ", \"workspace_chrome_pinned\": "
            << (state.workspaceChromePinned ? "true" : "false")
+           << ", \"workspace_chrome_docked\": "
+           << (state.workspaceChromeDocked ? "true" : "false")
            << ", \"settings_window_position_valid\": "
            << (state.settingsWindowPositionValid ? "true" : "false")
            << ", \"settings_window_x_ratio\": "
@@ -3241,6 +3248,9 @@ bool DeserializeState(const std::string& json, WorkspaceState& state,
                 0, 1);
             loaded.workspaceChromePinned = BoolMember(
                 *settings, "workspace_chrome_pinned", true);
+            loaded.workspaceChromeDocked = BoolMember(
+                *settings, "workspace_chrome_docked",
+                loaded.workspaceChromePositionValid);
             loaded.settingsWindowPositionValid = BoolMember(
                 *settings, "settings_window_position_valid", false);
             loaded.settingsWindowXRatio = std::clamp(static_cast<float>(
@@ -11056,9 +11066,54 @@ private:
         return PointInside(PixelToDip(cursor.x, cursor.y), group);
     }
 
+    void CancelWorkspaceChromeAutoHideDelay() {
+        if (window_ != nullptr) {
+            KillTimer(window_, kWorkspaceChromeAutoHideTimer);
+        }
+        workspaceChromeAutoHideReady_ = false;
+    }
+
+    void ScheduleWorkspaceChromeAutoHide() {
+        CancelWorkspaceChromeAutoHideDelay();
+        if (!state_.workspaceChromeDocked ||
+            state_.workspaceChromePinned ||
+            draggingWorkspaceChrome_ || workspaceChromePointerPending_ ||
+            workspaceChromeMenuOpen_ || corePlacementMode_ ||
+            (settingsWindow_ != nullptr &&
+             IsWindowVisible(settingsWindow_) != FALSE) ||
+            WorkspaceChromePointerOverGroup(
+                WorkspaceChromeGroupRectangle(ClientDipSize())) ||
+            window_ == nullptr) {
+            return;
+        }
+        if (SetTimer(window_, kWorkspaceChromeAutoHideTimer,
+                     kWorkspaceChromeAutoHideDelayMs, nullptr) == 0) {
+            // A failed one-shot timer must not permanently disable auto-hide.
+            workspaceChromeAutoHideReady_ = true;
+            AppendRuntimeDiagnostic(
+                "workspace_chrome_autohide_timer_failed",
+                E_FAIL, GetLastError());
+        }
+    }
+
+    void SetWorkspaceChromeHovered(bool hovered) {
+        if (workspaceChromeHovered_ == hovered) {
+            return;
+        }
+        workspaceChromeHovered_ = hovered;
+        if (hovered) {
+            CancelWorkspaceChromeAutoHideDelay();
+        } else {
+            ScheduleWorkspaceChromeAutoHide();
+        }
+        Invalidate();
+    }
+
     bool WorkspaceChromeCollapsed(const D2D1_SIZE_F& client) const {
         const D2D1_RECT_F group = WorkspaceChromeGroupRectangle(client);
-        if (state_.workspaceChromePinned || workspaceChromeHovered_ ||
+        if (!state_.workspaceChromeDocked ||
+            !workspaceChromeAutoHideReady_ ||
+            state_.workspaceChromePinned || workspaceChromeHovered_ ||
             WorkspaceChromePointerOverGroup(group) ||
             draggingWorkspaceChrome_ || workspaceChromePointerPending_ ||
             workspaceChromeMenuOpen_ || corePlacementMode_ ||
@@ -11278,12 +11333,14 @@ private:
             static_cast<LONG>(std::lround(button.bottom + 3.0f))};
         ClientToScreen(window_, &screen);
         workspaceChromeMenuOpen_ = true;
+        CancelWorkspaceChromeAutoHideDelay();
         Invalidate();
         UpdateWindow(window_);
         const UINT command = TrackPopupMenuPreservingSelection(
             menu, TPM_RETURNCMD | TPM_RIGHTBUTTON,
             screen.x, screen.y);
         workspaceChromeMenuOpen_ = false;
+        ScheduleWorkspaceChromeAutoHide();
         DestroyMenu(menu);
         ExecuteMenuCommand(command);
         Invalidate();
@@ -11940,12 +11997,14 @@ private:
         case WM_KEYDOWN:
             if (source == settingsWindow_ && wParam == VK_ESCAPE) {
                 ShowWindow(source, SW_HIDE);
+                ScheduleWorkspaceChromeAutoHide();
                 return 0;
             }
             break;
         case WM_CLOSE:
             if (source == settingsWindow_) {
                 ShowWindow(source, SW_HIDE);
+                ScheduleWorkspaceChromeAutoHide();
                 return 0;
             }
             break;
@@ -12161,12 +12220,14 @@ private:
             static_cast<LONG>(std::lround(button.bottom + 3.0f))};
         ClientToScreen(window_, &screen);
         workspaceChromeMenuOpen_ = true;
+        CancelWorkspaceChromeAutoHideDelay();
         Invalidate();
         UpdateWindow(window_);
         const UINT command = TrackPopupMenuPreservingSelection(
             menu, TPM_RETURNCMD | TPM_RIGHTBUTTON,
             screen.x, screen.y);
         workspaceChromeMenuOpen_ = false;
+        ScheduleWorkspaceChromeAutoHide();
         DestroyMenu(menu);
         if (command >= firstRestoreCommand &&
             command < firstRestoreCommand + archivedCoreIds.size()) {
@@ -13634,6 +13695,11 @@ private:
         switch (index) {
         case 0:
             state_.workspaceChromePinned = !state_.workspaceChromePinned;
+            if (state_.workspaceChromePinned) {
+                CancelWorkspaceChromeAutoHideDelay();
+            } else {
+                ScheduleWorkspaceChromeAutoHide();
+            }
             ScheduleSave(false);
             SetStatus(state_.workspaceChromePinned
                 ? L"控制条已固定显示"
@@ -13693,6 +13759,9 @@ private:
         workspaceChromeDragStartYRatio_ = state_.workspaceChromeYRatio;
         workspaceChromeDragStartOrientation_ =
             state_.workspaceChromeOrientation;
+        workspaceChromeDragStartDocked_ =
+            state_.workspaceChromeDocked;
+        CancelWorkspaceChromeAutoHideDelay();
         SetCapture(window_);
         return true;
     }
@@ -13758,7 +13827,9 @@ private:
         if (stripTouchesEdge) {
             edge = contactedEdge;
         }
-        if (stripTouchesEdge || pointerDistances[edge] <= kEdgeSnapDistance) {
+        const bool docked =
+            stripTouchesEdge || pointerDistances[edge] <= kEdgeSnapDistance;
+        if (docked) {
             // Keep the pointer attached to the same relative point on the
             // strip.  The old code used the release point as the strip
             // centre, which made a handle drag jump the whole strip left.
@@ -13791,6 +13862,12 @@ private:
             state_.workspaceChromeYRatio = std::clamp(
                 centerY / std::max(1.0f, client.height), 0.0f, 1.0f);
         }
+        state_.workspaceChromeDocked = docked;
+        if (docked) {
+            ScheduleWorkspaceChromeAutoHide();
+        } else {
+            CancelWorkspaceChromeAutoHideDelay();
+        }
         if (GetCapture() == window_) ReleaseCapture();
         ScheduleSave(false);
         Invalidate();
@@ -13805,10 +13882,15 @@ private:
         state_.workspaceChromeXRatio = workspaceChromeDragStartXRatio_;
         state_.workspaceChromeYRatio = workspaceChromeDragStartYRatio_;
         state_.workspaceChromeOrientation = workspaceChromeDragStartOrientation_;
+        state_.workspaceChromeDocked = workspaceChromeDragStartDocked_;
         workspaceChromePointerPending_ = false;
         draggingWorkspaceChrome_ = false;
         workspaceChromePendingButton_ = -1;
         if (GetCapture() == window_) ReleaseCapture();
+        if (state_.workspaceChromeDocked &&
+            !state_.workspaceChromePinned) {
+            ScheduleWorkspaceChromeAutoHide();
+        }
         Invalidate();
     }
 
@@ -19025,8 +19107,7 @@ private:
             GetCursorPos(&cursor) != FALSE &&
             ScreenPointInsideDividerTriangle(cursor);
         if (workspaceChromeHovered_) {
-            workspaceChromeHovered_ = false;
-            Invalidate();
+            SetWorkspaceChromeHovered(false);
         }
         if (!draggingDivider_) {
             if (keepDividerHover) {
@@ -19082,10 +19163,7 @@ private:
         const D2D1_POINT_2F dip = PixelToDip(x, y);
         const bool workspaceChromeHovered = PointInside(
             dip, WorkspaceChromeInteractionRectangle(ClientDipSize()));
-        if (workspaceChromeHovered_ != workspaceChromeHovered) {
-            workspaceChromeHovered_ = workspaceChromeHovered;
-            Invalidate();
-        }
+        SetWorkspaceChromeHovered(workspaceChromeHovered);
         if (workspaceChromePointerPending_) {
             if (DistanceSquared(dip, workspaceChromePointerStartDip_) > 9.0f) {
                 workspaceChromePointerPending_ = false;
@@ -23669,6 +23747,22 @@ private:
             if (relationshipManifestSyncPending_) {
                 (void)SynchronizeRelationshipManifest(state_);
             }
+        } else if (timer == kWorkspaceChromeAutoHideTimer) {
+            KillTimer(window_, kWorkspaceChromeAutoHideTimer);
+            const D2D1_RECT_F group =
+                WorkspaceChromeGroupRectangle(ClientDipSize());
+            workspaceChromeAutoHideReady_ =
+                state_.workspaceChromeDocked &&
+                !state_.workspaceChromePinned &&
+                !workspaceChromeHovered_ &&
+                !WorkspaceChromePointerOverGroup(group) &&
+                !draggingWorkspaceChrome_ &&
+                !workspaceChromePointerPending_ &&
+                !workspaceChromeMenuOpen_ &&
+                !corePlacementMode_ &&
+                (settingsWindow_ == nullptr ||
+                 IsWindowVisible(settingsWindow_) == FALSE);
+            Invalidate();
         } else if (timer == kStatusTimer) {
             KillTimer(window_, kStatusTimer);
             status_.clear();
@@ -25916,6 +26010,7 @@ private:
     bool draggingWorkspaceChrome_ = false;
     bool workspaceChromeHovered_ = false;
     bool workspaceChromeMenuOpen_ = false;
+    bool workspaceChromeAutoHideReady_ = true;
     bool coreDistanceSliderActive_ = false;
     bool draggingCoreDistancePanel_ = false;
     bool draggingCoreDistanceSlider_ = false;
@@ -25946,6 +26041,7 @@ private:
     float workspaceChromeDragStartXRatio_ = 0.75f;
     float workspaceChromeDragStartYRatio_ = 0.04f;
     int workspaceChromeDragStartOrientation_ = 0;
+    bool workspaceChromeDragStartDocked_ = false;
     std::uint64_t externalDropCoreId_ = 0;
     std::uint64_t externalDropItemId_ = 0;
     std::uint64_t relationTargetItemId_ = 0;
@@ -28397,6 +28493,26 @@ bool RunSelfTest() {
         return false;
     }
 
+    GravityApp chromePolicyApp;
+    chromePolicyApp.state_.workspaceChromePinned = false;
+    chromePolicyApp.state_.workspaceChromeDocked = false;
+    chromePolicyApp.workspaceChromeAutoHideReady_ = true;
+    const D2D1_SIZE_F chromePolicyClient =
+        D2D1::SizeF(1280.0f, 720.0f);
+    const bool freshChromeRemainsVisible =
+        !chromePolicyApp.WorkspaceChromeCollapsed(chromePolicyClient);
+    chromePolicyApp.state_.workspaceChromeDocked = true;
+    const bool explicitlyDockedChromeCanCollapse =
+        chromePolicyApp.WorkspaceChromeCollapsed(chromePolicyClient);
+    chromePolicyApp.state_.workspaceChromePinned = true;
+    const bool pinnedChromeRemainsVisible =
+        !chromePolicyApp.WorkspaceChromeCollapsed(chromePolicyClient);
+    if (!freshChromeRemainsVisible ||
+        !explicitlyDockedChromeCanCollapse ||
+        !pinnedChromeRemainsVisible) {
+        return false;
+    }
+
     WorkspaceState source;
     source.nextId = 12;
     source.viewOffset = D2D1::Point2F(12.5f, -7.25f);
@@ -28409,6 +28525,12 @@ bool RunSelfTest() {
     source.managedLibraryPath =
         L"D:\\Gravity Desktop Files Test";
     source.workspaceWidthRatio = 0.41f;
+    source.workspaceChromePositionValid = true;
+    source.workspaceChromeXRatio = 0.62f;
+    source.workspaceChromeYRatio = 0.03f;
+    source.workspaceChromeOrientation = 0;
+    source.workspaceChromePinned = false;
+    source.workspaceChromeDocked = true;
     source.workspaceCollapsed = true;
     source.settingsWindowPositionValid = true;
     source.settingsWindowXRatio = 0.27f;
@@ -28839,6 +28961,12 @@ bool RunSelfTest() {
         std::abs(restored.connectionLineWidth - 1.47f) > 0.001f ||
         std::abs(restored.coreGlowIntensity - 1.32f) > 0.001f ||
         std::abs(restored.workspaceWidthRatio - 0.41f) > 0.001f ||
+        !restored.workspaceChromePositionValid ||
+        std::abs(restored.workspaceChromeXRatio - 0.62f) > 0.001f ||
+        std::abs(restored.workspaceChromeYRatio - 0.03f) > 0.001f ||
+        restored.workspaceChromeOrientation != 0 ||
+        restored.workspaceChromePinned ||
+        !restored.workspaceChromeDocked ||
         restored.managedLibraryPath != source.managedLibraryPath ||
         !restored.workspaceCollapsed || !restored.tutorialCompleted) {
         return false;
