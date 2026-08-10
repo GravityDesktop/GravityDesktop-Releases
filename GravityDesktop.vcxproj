@@ -76,6 +76,7 @@
   </ItemDefinitionGroup>
   <ItemGroup>
     <ClCompile Include="src\GravityDesktop.cpp" />
+    <ClCompile Include="src\Localization.cpp" />
   </ItemGroup>
   <ItemGroup>
     <ResourceCompile Include="src\GravityDesktop.rc" />
@@ -83,6 +84,12 @@
   <Target Name="CopyGravityDesktopRuntimeAssets" AfterTargets="Build">
     <Copy SourceFiles="$(ProjectDir)src\GravityDesktopLibrary.ico"
           DestinationFolder="$(OutDir)"
+          SkipUnchangedFiles="true" />
+    <ItemGroup>
+      <GravityDesktopLocalizationAssets Include="$(ProjectDir)src\locales\*.json" />
+    </ItemGroup>
+    <Copy SourceFiles="@(GravityDesktopLocalizationAssets)"
+          DestinationFolder="$(OutDir)locales\"
           SkipUnchangedFiles="true" />
   </Target>
   <Import Project="$(VCTargetsPath)\Microsoft.Cpp.targets" />

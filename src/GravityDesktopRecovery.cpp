@@ -1,6 +1,8 @@
 #include <windows.h>
 #include <shlobj.h>
 
+#include "Localization.h"
+
 #include <algorithm>
 #include <chrono>
 #include <cstdint>
@@ -603,6 +605,7 @@ bool RunRecovery(const std::filesystem::path& library, bool interactive,
 }
 
 bool RunSelfTest() {
+    if (!gravity::i18n::Localization::RunSelfTest()) return false;
     const std::filesystem::path root = std::filesystem::temp_directory_path() /
         (L"GravityDesktopRecoveryTest-" +
          std::to_wstring(static_cast<unsigned long long>(GetTickCount64())));

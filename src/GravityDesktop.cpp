@@ -14,6 +14,7 @@
 #include <wrl/client.h>
 
 #include "GravityDesktopResource.h"
+#include "Localization.h"
 
 #include <algorithm>
 #include <array>
@@ -409,6 +410,9 @@ enum MenuCommand : UINT {
     MenuArrangeAll,
     MenuSaveNow,
     MenuToggleAutoStart,
+    MenuLanguageAutomatic,
+    MenuLanguageChinese,
+    MenuLanguageEnglish,
     MenuOpenDataFolder,
     MenuGenerateDiagnosticReport,
     MenuAdjustCoreDistance,
@@ -5063,6 +5067,7 @@ public:
 
     bool Initialize(HWND window) {
         window_ = window;
+        localization_.Load();
         dpi_ = static_cast<float>(GetDpiForWindow(window_));
         RefreshWindowsVisualProfile();
         // The full-size window is now a visual-only layered surface.  File
@@ -11816,6 +11821,17 @@ private:
         case MenuToggleAutoStart:
             return ReadAutoStartRegistration().state ==
                 AutoStartRegistrationState::Enabled;
+        case MenuLanguageAutomatic:
+            return localization_.GetPreferences().languageMode ==
+                gravity::i18n::LanguageMode::Automatic;
+        case MenuLanguageChinese:
+            return localization_.GetPreferences().languageMode ==
+                    gravity::i18n::LanguageMode::Explicit &&
+                localization_.CurrentLocale() == L"zh-CN";
+        case MenuLanguageEnglish:
+            return localization_.GetPreferences().languageMode ==
+                    gravity::i18n::LanguageMode::Explicit &&
+                localization_.CurrentLocale() == L"en-US";
         case MenuDensityCompact:
             return state_.densityMode == DensityMode::Compact;
         case MenuDensityStandard:
@@ -11945,6 +11961,15 @@ private:
         SetTextColor(item.hDC, navigation && selected ? RGB(24, 76, 122) : text);
         DrawTextW(item.hDC, label, -1, &textBounds,
             DT_SINGLELINE | DT_VCENTER | DT_CENTER | DT_END_ELLIPSIS);
+        const bool languageChoice = command == MenuLanguageAutomatic ||
+            command == MenuLanguageChinese || command == MenuLanguageEnglish;
+        if (languageChoice && selected) {
+            RECT checkBounds{bounds.right - SettingsDipToPixels(20), bounds.top,
+                bounds.right - SettingsDipToPixels(5), bounds.bottom};
+            SetTextColor(item.hDC, accent);
+            DrawTextW(item.hDC, L"✓", -1, &checkBounds,
+                DT_SINGLELINE | DT_VCENTER | DT_CENTER);
+        }
         SelectObject(item.hDC, oldFont);
     }
 
@@ -11975,16 +12000,20 @@ private:
         EndPaint(source, &paint);
     }
 
-    const wchar_t* SettingsPageName(SettingsPage page) const {
+    std::wstring T(std::string_view key) const {
+        return localization_.Text(key);
+    }
+
+    std::wstring SettingsPageName(SettingsPage page) const {
         switch (page) {
-        case SettingsPage::General: return L"常规";
+        case SettingsPage::General: return T("settings.general");
         case SettingsPage::Appearance: return L"外观与动效";
         case SettingsPage::Workspace: return L"工作区";
         case SettingsPage::Data: return L"数据与备份";
         case SettingsPage::CoreManagement: return L"核心管理";
         case SettingsPage::Help: return L"帮助";
         case SettingsPage::Advanced: return L"高级";
-        default: return L"设置";
+        default: return T("toolbar.settings");
         }
     }
 
@@ -12005,14 +12034,36 @@ private:
             return;
         }
         ClearSettingsPageControls();
+        const std::wstring pageTitle = SettingsPageName(settingsPage_);
         CreateSettingsHeading(
-            settingsContentWindow_, SettingsPageName(settingsPage_),
+            settingsContentWindow_, pageTitle.c_str(),
             16, 14, 320, 30);
         switch (settingsPage_) {
         case SettingsPage::General: {
+            const std::wstring languageTitle = T("settings.language");
+            const std::wstring languageCurrent = localization_.Format(
+                "settings.language.current",
+                {{L"language", gravity::i18n::Localization::DisplayName(
+                    localization_.CurrentLocale())}});
+            const std::wstring automatic = T("settings.language.automatic");
+            const std::wstring followWindows = T("settings.language.follow_windows");
+            CreateSettingsText(settingsContentWindow_, languageTitle.c_str(),
+                16, 54, 180, 22);
+            CreateSettingsText(settingsContentWindow_, languageCurrent.c_str(),
+                16, 76, 330, 20);
+            CreateSettingsButton(settingsContentWindow_, automatic.c_str(),
+                16, 104, 108, 28, MenuLanguageAutomatic);
+            CreateSettingsButton(settingsContentWindow_, L"简体中文",
+                132, 104, 100, 28, MenuLanguageChinese);
+            CreateSettingsButton(settingsContentWindow_, L"English",
+                240, 104, 94, 28, MenuLanguageEnglish);
+            CreateSettingsText(settingsContentWindow_, followWindows.c_str(),
+                16, 136, 330, 20);
+
+            const std::wstring autoStartText = T("settings.autostart");
             HWND autoStart = CreateSettingsButton(
-                settingsContentWindow_, L"登录 Windows 后自动启动引力桌面",
-                16, 58, 330, 28, MenuToggleAutoStart, BS_AUTOCHECKBOX);
+                settingsContentWindow_, autoStartText.c_str(),
+                16, 172, 330, 28, MenuToggleAutoStart, BS_AUTOCHECKBOX);
             const AutoStartRegistrationStatus status =
                 ReadAutoStartRegistration();
             if (autoStart != nullptr) {
@@ -12024,12 +12075,12 @@ private:
                     EnableWindow(autoStart, FALSE);
                 }
             }
-            CreateSettingsText(
-                settingsContentWindow_,
+            const std::wstring autoStartDetail =
                 status.state == AutoStartRegistrationState::NeedsRepair
-                    ? L"当前启动项指向旧路径；重新勾选可修复。"
-                    : L"该设置只影响当前 Windows 用户。",
-                16, 94, 340, 34);
+                    ? T("settings.autostart.repair")
+                    : T("settings.autostart.current_user");
+            CreateSettingsText(settingsContentWindow_, autoStartDetail.c_str(),
+                16, 208, 340, 34);
             break;
         }
         case SettingsPage::Appearance: {
@@ -12205,6 +12256,21 @@ private:
         settingsContentScrollPixels_ = 0;
         RebuildSettingsWindow();
         InvalidateRect(settingsWindow_, nullptr, TRUE);
+    }
+
+    void SetApplicationLanguage(gravity::i18n::LanguageMode mode,
+                                std::wstring_view locale = {}) {
+        const bool saved = mode == gravity::i18n::LanguageMode::Automatic
+            ? localization_.SetAutomatic()
+            : localization_.SetExplicitLanguage(locale);
+        if (!saved) {
+            SetStatus(L"无法保存语言设置");
+            return;
+        }
+        // This page is rebuilt immediately. Remaining non-modal surfaces are
+        // migrated in later batches and will use the same instance on rebuild.
+        RebuildSettingsWindow();
+        Invalidate();
     }
 
     void RecordSettingsWindowPosition(bool save) {
@@ -20265,6 +20331,17 @@ private:
         case MenuToggleAutoStart:
             ToggleAutoStart();
             break;
+        case MenuLanguageAutomatic:
+            SetApplicationLanguage(gravity::i18n::LanguageMode::Automatic);
+            break;
+        case MenuLanguageChinese:
+            SetApplicationLanguage(gravity::i18n::LanguageMode::Explicit,
+                                   L"zh-CN");
+            break;
+        case MenuLanguageEnglish:
+            SetApplicationLanguage(gravity::i18n::LanguageMode::Explicit,
+                                   L"en-US");
+            break;
         case MenuOpenDataFolder:
             OpenDataFolder();
             break;
@@ -26260,6 +26337,7 @@ private:
     std::wstring desktopIconFontFamily_ = L"Segoe UI";
     float desktopIconSizeDip_ = 48.0f;
     float desktopFileFontSizeDip_ = 12.0f;
+    gravity::i18n::Localization localization_;
     WorkspaceState state_;
     ResponsiveMetrics metrics_;
     std::vector<WorkspaceState> undoStack_;
@@ -26620,7 +26698,8 @@ LRESULT CALLBACK SettingsContentWindowProcedure(
 }
 
 bool RunSelfTest() {
-    if (MigrateAutomaticCoreName(L"新核心 7") != L"文件核心 7" ||
+    if (!gravity::i18n::Localization::RunSelfTest() ||
+        MigrateAutomaticCoreName(L"新核心 7") != L"文件核心 7" ||
         MigrateAutomaticCoreName(L"新核心设计") != L"新核心设计" ||
         MigrateAutomaticCoreName(L"文件核心 7") != L"文件核心 7" ||
         MakeDisplayName(L"C:\\Desktop\\测试文件（引力桌面恢复 2）.txt", false)

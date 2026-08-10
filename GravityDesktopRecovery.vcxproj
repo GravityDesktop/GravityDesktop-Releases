@@ -22,6 +22,17 @@
   <PropertyGroup><OutDir>$(SolutionDir)out\$(Configuration)\</OutDir><IntDir>$(SolutionDir)out\obj\$(Configuration)\Recovery\</IntDir><TargetName>GravityDesktopRecovery</TargetName></PropertyGroup>
   <ItemDefinitionGroup Condition="'$(Configuration)|$(Platform)'=='Debug|x64'"><ClCompile><WarningLevel>Level4</WarningLevel><SDLCheck>true</SDLCheck><PreprocessorDefinitions>_DEBUG;UNICODE;_UNICODE;NOMINMAX;WIN32_LEAN_AND_MEAN;%(PreprocessorDefinitions)</PreprocessorDefinitions><ConformanceMode>true</ConformanceMode><LanguageStandard>stdcpp20</LanguageStandard><MultiProcessorCompilation>true</MultiProcessorCompilation><RuntimeLibrary>MultiThreadedDebug</RuntimeLibrary><AdditionalOptions>/utf-8 %(AdditionalOptions)</AdditionalOptions></ClCompile><Link><SubSystem>Windows</SubSystem><GenerateDebugInformation>true</GenerateDebugInformation></Link></ItemDefinitionGroup>
   <ItemDefinitionGroup Condition="'$(Configuration)|$(Platform)'=='Release|x64'"><ClCompile><WarningLevel>Level4</WarningLevel><SDLCheck>true</SDLCheck><PreprocessorDefinitions>NDEBUG;UNICODE;_UNICODE;NOMINMAX;WIN32_LEAN_AND_MEAN;%(PreprocessorDefinitions)</PreprocessorDefinitions><ConformanceMode>true</ConformanceMode><LanguageStandard>stdcpp20</LanguageStandard><MultiProcessorCompilation>true</MultiProcessorCompilation><RuntimeLibrary>MultiThreaded</RuntimeLibrary><Optimization>MaxSpeed</Optimization><FunctionLevelLinking>true</FunctionLevelLinking><IntrinsicFunctions>true</IntrinsicFunctions><AdditionalOptions>/utf-8 %(AdditionalOptions)</AdditionalOptions></ClCompile><Link><SubSystem>Windows</SubSystem><EnableCOMDATFolding>true</EnableCOMDATFolding><OptimizeReferences>true</OptimizeReferences><GenerateDebugInformation>false</GenerateDebugInformation></Link></ItemDefinitionGroup>
-  <ItemGroup><ClCompile Include="src\GravityDesktopRecovery.cpp" /></ItemGroup>
+  <ItemGroup>
+    <ClCompile Include="src\GravityDesktopRecovery.cpp" />
+    <ClCompile Include="src\Localization.cpp" />
+  </ItemGroup>
+  <Target Name="CopyGravityDesktopRecoveryLocalizationAssets" AfterTargets="Build">
+    <ItemGroup>
+      <GravityDesktopRecoveryLocalizationAssets Include="$(ProjectDir)src\locales\*.json" />
+    </ItemGroup>
+    <Copy SourceFiles="@(GravityDesktopRecoveryLocalizationAssets)"
+          DestinationFolder="$(OutDir)locales\"
+          SkipUnchangedFiles="true" />
+  </Target>
   <Import Project="$(VCTargetsPath)\Microsoft.Cpp.targets" />
 </Project>
