@@ -7453,7 +7453,8 @@ private:
         icon.hIcon = LoadGravityApplicationIcon(
             GetSystemMetrics(SM_CXSMICON),
             GetSystemMetrics(SM_CYSMICON));
-        wcsncpy_s(icon.szTip, L"引力桌面工作区", _TRUNCATE);
+        const std::wstring trayTip = T("tray.tooltip");
+        wcsncpy_s(icon.szTip, trayTip.c_str(), _TRUNCATE);
         trayIconAdded_ = Shell_NotifyIconW(NIM_ADD, &icon) != FALSE;
         if (trayIconAdded_) {
             trayIconOwner_ = owner;
@@ -7496,18 +7497,19 @@ private:
         const bool visible =
             window_ != nullptr &&
             IsWindowVisible(window_) != FALSE;
-        AppendMenuW(menu, MF_STRING, MenuTrayCreateCore, L"创建核心");
+        AppendMenuW(menu, MF_STRING, MenuTrayCreateCore,
+                    T("toolbar.create_core").c_str());
         AppendMenuW(menu, MF_SEPARATOR, 0, nullptr);
         AppendMenuW(menu, MF_STRING, MenuTrayShowHide,
-                    visible ? L"隐藏引力桌面" : L"显示引力桌面");
+                    visible ? T("tray.hide").c_str() : T("tray.show").c_str());
         AppendMenuW(menu, MF_STRING, MenuTrayPauseResume,
                     state_.workspacePaused
-                        ? L"恢复桌面交互"
-                        : L"暂停桌面交互");
-        AppendMenuW(menu, MF_STRING, MenuTraySettings, L"设置…");
-        AppendMenuW(menu, MF_STRING, MenuTrayTutorial, L"帮助与教程");
+                        ? T("tray.resume").c_str()
+                        : T("tray.pause").c_str());
+        AppendMenuW(menu, MF_STRING, MenuTraySettings, T("tray.settings").c_str());
+        AppendMenuW(menu, MF_STRING, MenuTrayTutorial, T("tray.help").c_str());
         AppendMenuW(menu, MF_SEPARATOR, 0, nullptr);
-        AppendMenuW(menu, MF_STRING, MenuTrayExit, L"退出引力桌面");
+        AppendMenuW(menu, MF_STRING, MenuTrayExit, T("tray.exit").c_str());
         POINT point{};
         GetCursorPos(&point);
         const UINT command = TrackPopupMenuPreservingSelection(menu,
@@ -11253,10 +11255,14 @@ private:
         static constexpr std::array<float, kWorkspaceControlCount> compactWidths{
             34.0f, 46.0f, 54.0f, 58.0f,
             54.0f, 54.0f, 62.0f, 46.0f};
+        static constexpr std::array<float, kWorkspaceControlCount> englishWidths{
+            34.0f, 112.0f, 66.0f, 116.0f,
+            72.0f, 108.0f, 172.0f, 52.0f};
         const auto& widths =
             client.width < 680.0f
                 ? compactWidths
-                : regularWidths;
+                : (localization_.CurrentLocale() == L"en-US"
+                    ? englishWidths : regularWidths);
         constexpr float gap = 2.0f;
         float horizontalWidth = 40.0f + gap * (kWorkspaceControlCount - 1);
         for (const float width : widths) {
@@ -11264,7 +11270,8 @@ private:
         }
         const bool vertical = WorkspaceChromeIsVertical();
         const float groupWidth = vertical
-            ? (client.width < 680.0f ? 108.0f : 164.0f)
+            ? (client.width < 680.0f ? 108.0f :
+                (localization_.CurrentLocale() == L"en-US" ? 196.0f : 164.0f))
             : horizontalWidth;
         const float groupHeight = vertical
             ? 40.0f + (kWorkspaceControlCount - 1) * 32.0f +
@@ -11306,7 +11313,12 @@ private:
         static constexpr std::array<float, kWorkspaceControlCount> compactWidths{
             34.0f, 46.0f, 54.0f, 58.0f,
             54.0f, 54.0f, 62.0f, 46.0f};
-        const auto& widths = client.width < 680.0f ? compactWidths : regularWidths;
+        static constexpr std::array<float, kWorkspaceControlCount> englishWidths{
+            34.0f, 112.0f, 66.0f, 116.0f,
+            72.0f, 108.0f, 172.0f, 52.0f};
+        const auto& widths = client.width < 680.0f ? compactWidths :
+            (localization_.CurrentLocale() == L"en-US"
+                ? englishWidths : regularWidths);
         constexpr float gap = 2.0f;
         const int safeIndex = std::clamp(index, 0, kWorkspaceControlCount - 1);
         const D2D1_RECT_F group = WorkspaceChromeGroupRectangle(client);
@@ -11600,17 +11612,20 @@ private:
         }
 
         const bool compact = client.width < 680.0f;
-        const std::array<const wchar_t*, kWorkspaceControlCount> labels{
-            L"图钉",
-            compact ? L"＋" : L"＋ 创建核心",
-            L"撤销",
-            compact ? L"整理" : L"整理工作区 ▾",
-            L"设置",
-            compact ? L"隐藏" : L"隐藏到托盘",
+        const std::array<std::wstring, kWorkspaceControlCount> labels{
+            L"",
+            compact ? L"＋" : L"＋ " + T("toolbar.create_core"),
+            T("toolbar.undo"),
+            compact ? T("toolbar.organize.short")
+                    : T("toolbar.organize") + L" ▾",
+            T("toolbar.settings"),
+            compact ? T("toolbar.hide.short") : T("toolbar.hide_to_tray"),
             state_.fullScreenWorkMode
-                ? (compact ? L"半屏" : L"退出全屏模式")
-                : (compact ? L"全屏" : L"全屏工作模式"),
-            L"退出"};
+                ? (compact ? T("toolbar.halfscreen.short")
+                           : T("toolbar.exit_fullscreen"))
+                : (compact ? T("toolbar.fullscreen.short")
+                           : T("toolbar.fullscreen")),
+            T("toolbar.exit")};
         for (int index = 0;
              index < kWorkspaceControlCount;
              ++index) {
@@ -11673,7 +11688,8 @@ private:
                     brush_.Get(), 1.4f);
             } else {
                 renderTarget_->DrawTextW(
-                    labels[index], static_cast<UINT32>(wcslen(labels[index])),
+                    labels[index].c_str(),
+                    static_cast<UINT32>(labels[index].size()),
                     hudFormat_.Get(), button, brush_.Get(),
                     D2D1_DRAW_TEXT_OPTIONS_CLIP);
             }
@@ -11687,13 +11703,13 @@ private:
         }
         AppendMenuW(
             menu, MF_STRING, MenuDisperseCores,
-            L"重新排列所有核心");
+            T("toolbar.arrange_cores").c_str());
         AppendMenuW(
             menu, MF_STRING, MenuOptimizeAll,
-            L"仅分开重叠核心");
+            T("toolbar.separate_cores").c_str());
         AppendMenuW(
             menu, MF_STRING, MenuArrangeAll,
-            L"重新排列全部内容…（核心＋文件）");
+            T("toolbar.arrange_all").c_str());
         const D2D1_RECT_F button =
             WorkspaceControlRectangle(ClientDipSize(), 3);
         POINT screen{
@@ -11722,6 +11738,13 @@ private:
             ? GetDpiForWindow(settingsWindow_)
             : 96;
         return MulDiv(value, static_cast<int>(dpi), 96);
+    }
+
+    int SettingsNavigationWidthDip() const {
+        // English navigation labels are materially longer than their Chinese
+        // counterparts. Keep the content pane stable and widen only the
+        // navigation rail when the selected language needs it.
+        return localization_.CurrentLocale() == L"en-US" ? 170 : 142;
     }
 
     void CreateSettingsFonts() {
@@ -11985,7 +12008,8 @@ private:
         FillRect(dc, &client, brush);
         DeleteObject(brush);
         if (!content) {
-            const int navigationWidth = SettingsDipToPixels(142);
+            const int navigationWidth =
+                SettingsDipToPixels(SettingsNavigationWidthDip());
             HBRUSH navigationBrush = CreateSolidBrush(RGB(241, 245, 249));
             RECT navigation{0, 0, navigationWidth + SettingsDipToPixels(8), client.bottom};
             FillRect(dc, &navigation, navigationBrush);
@@ -12084,71 +12108,97 @@ private:
             break;
         }
         case SettingsPage::Appearance: {
-            CreateSettingsText(settingsContentWindow_, L"布局密度", 16, 54, 180, 22);
-            const std::array<std::pair<const wchar_t*, UINT>, 3> density{{
-                {L"紧凑", MenuDensityCompact}, {L"标准", MenuDensityStandard},
-                {L"清晰", MenuDensityClear}}};
+            const std::wstring densityTitle = T("settings.density");
+            CreateSettingsText(settingsContentWindow_, densityTitle.c_str(),
+                16, 54, 180, 22);
+            const std::array<std::pair<std::wstring, UINT>, 3> density{{
+                {T("settings.density.compact"), MenuDensityCompact},
+                {T("settings.density.standard"), MenuDensityStandard},
+                {T("settings.density.clear"), MenuDensityClear}}};
             for (int index = 0; index < 3; ++index) {
                 HWND button = CreateSettingsButton(
-                    settingsContentWindow_, density[index].first,
+                    settingsContentWindow_, density[index].first.c_str(),
                     16 + index * 92, 78, 82, 28, density[index].second);
                 if (button != nullptr &&
                     static_cast<int>(state_.densityMode) == index) {
                     SendMessageW(button, BM_SETCHECK, BST_CHECKED, 0);
                 }
             }
-            CreateSettingsText(settingsContentWindow_, L"全局动画强度", 16, 122, 180, 22);
-            const std::array<std::pair<const wchar_t*, UINT>, 4> animation{{
-                {L"关闭", MenuAnimationOff}, {L"简洁", MenuAnimationSimple},
-                {L"标准", MenuAnimationStandard}, {L"柔和", MenuAnimationSoft}}};
+            const std::wstring animationTitle = T("settings.animation_strength");
+            CreateSettingsText(settingsContentWindow_, animationTitle.c_str(),
+                16, 122, 180, 22);
+            const std::array<std::pair<std::wstring, UINT>, 4> animation{{
+                {T("settings.animation.off"), MenuAnimationOff},
+                {T("settings.animation.simple"), MenuAnimationSimple},
+                {T("settings.animation.standard"), MenuAnimationStandard},
+                {T("settings.animation.soft"), MenuAnimationSoft}}};
             for (int index = 0; index < 4; ++index) {
-                CreateSettingsButton(settingsContentWindow_, animation[index].first,
+                CreateSettingsButton(settingsContentWindow_, animation[index].first.c_str(),
                     16 + index * 78, 146, 70, 28, animation[index].second);
             }
-            CreateSettingsText(settingsContentWindow_, L"核心选中效果", 16, 190, 180, 22);
-            CreateSettingsButton(settingsContentWindow_, L"柔和波纹扩散", 16, 214, 116, 28,
+            const std::wstring selectionTitle = T("settings.core_selection_effect");
+            const std::wstring selectionRipple = T("settings.selection.ripple");
+            const std::wstring selectionOnce = T("settings.selection.once");
+            const std::wstring selectionStatic = T("settings.selection.static");
+            CreateSettingsText(settingsContentWindow_, selectionTitle.c_str(),
+                16, 190, 180, 22);
+            CreateSettingsButton(settingsContentWindow_, selectionRipple.c_str(), 16, 214, 116, 28,
                                  MenuCoreSelectionEffectRotate);
-            CreateSettingsButton(settingsContentWindow_, L"播放一次后保持静态", 140, 214, 142, 28,
+            CreateSettingsButton(settingsContentWindow_, selectionOnce.c_str(), 140, 214, 142, 28,
                                  MenuCoreSelectionEffectOnce);
-            CreateSettingsButton(settingsContentWindow_, L"仅显示静态光环", 16, 250, 116, 28,
+            CreateSettingsButton(settingsContentWindow_, selectionStatic.c_str(), 16, 250, 116, 28,
                                  MenuCoreSelectionEffectStatic);
             break;
         }
-        case SettingsPage::Workspace:
-            CreateSettingsText(settingsContentWindow_,
-                L"复位视图只恢复画布缩放与视图偏移，不改变核心、文件或关系。",
+        case SettingsPage::Workspace: {
+            const std::wstring resetDescription = T("settings.workspace.reset_view.description");
+            const std::wstring resetLabel = T("settings.workspace.reset_view");
+            CreateSettingsText(settingsContentWindow_, resetDescription.c_str(),
                 16, 56, 340, 40);
-            CreateSettingsButton(settingsContentWindow_, L"复位视图", 16, 108, 130, 30,
+            CreateSettingsButton(settingsContentWindow_, resetLabel.c_str(), 16, 108, 130, 30,
                                  MenuResetView);
             break;
-        case SettingsPage::Data:
-            CreateSettingsText(settingsContentWindow_, L"布局快照", 16, 54, 180, 22);
-            CreateSettingsText(settingsContentWindow_,
-                L"只保存和恢复现有核心、文件的位置。新增内容保留，已删除内容不会回来。",
+        }
+        case SettingsPage::Data: {
+            const std::wstring layoutSnapshot = T("settings.data.layout_snapshot");
+            const std::wstring layoutSnapshotDescription = T("settings.data.layout_snapshot.description");
+            const std::wstring exportLayout = T("settings.data.export_layout");
+            const std::wstring restoreLayout = T("settings.data.restore_layout");
+            const std::wstring fullBackup = T("settings.data.full_backup");
+            const std::wstring fullBackupDescription = T("settings.data.full_backup.description");
+            const std::wstring exportBackup = T("settings.data.export_backup");
+            const std::wstring restoreBackup = T("settings.data.restore_backup");
+            const std::wstring saveNow = T("settings.data.save_now");
+            CreateSettingsText(settingsContentWindow_, layoutSnapshot.c_str(), 16, 54, 180, 22);
+            CreateSettingsText(settingsContentWindow_, layoutSnapshotDescription.c_str(),
                 16, 78, 340, 34);
-            CreateSettingsButton(settingsContentWindow_, L"导出布局快照", 16, 116, 154, 30,
+            CreateSettingsButton(settingsContentWindow_, exportLayout.c_str(), 16, 116, 154, 30,
                                  MenuExportLayoutSnapshot);
-            CreateSettingsButton(settingsContentWindow_, L"恢复布局快照", 180, 116, 154, 30,
+            CreateSettingsButton(settingsContentWindow_, restoreLayout.c_str(), 180, 116, 154, 30,
                                  MenuImportLayoutSnapshot);
-            CreateSettingsText(settingsContentWindow_, L"完整工作区备份", 16, 166, 220, 22);
-            CreateSettingsText(settingsContentWindow_,
-                L"用于恢复核心、文件引用和关系。恢复前显示差异，容量超过18项时创建延续核心。",
+            CreateSettingsText(settingsContentWindow_, fullBackup.c_str(), 16, 166, 220, 22);
+            CreateSettingsText(settingsContentWindow_, fullBackupDescription.c_str(),
                 16, 190, 340, 40);
-            CreateSettingsButton(settingsContentWindow_, L"导出完整备份", 16, 238, 154, 30,
+            CreateSettingsButton(settingsContentWindow_, exportBackup.c_str(), 16, 238, 154, 30,
                                  MenuExportWorkspaceBackup);
-            CreateSettingsButton(settingsContentWindow_, L"恢复完整备份...", 180, 238, 154, 30,
+            CreateSettingsButton(settingsContentWindow_, restoreBackup.c_str(), 180, 238, 154, 30,
                                  MenuImportWorkspaceBackup);
-            CreateSettingsButton(settingsContentWindow_, L"立即保存当前状态", 16, 286, 154, 30,
+            CreateSettingsButton(settingsContentWindow_, saveNow.c_str(), 16, 286, 154, 30,
                                  MenuSaveNow);
             break;
+        }
         case SettingsPage::CoreManagement: {
-            CreateSettingsText(settingsContentWindow_, L"文件引用检查", 16, 58, 220, 22);
-            CreateSettingsText(settingsContentWindow_,
-                L"检查核心中已经失效或找不到的文件引用。",
+            const std::wstring referenceCheck = T("settings.core.reference_check");
+            const std::wstring referenceCheckDescription = T("settings.core.reference_check.description");
+            const std::wstring checkReferences = T("settings.core.check_references");
+            const std::wstring archivedCores = T("settings.core.restore_archived");
+            const std::wstring restore = T("settings.core.restore");
+            CreateSettingsText(settingsContentWindow_, referenceCheck.c_str(), 16, 58, 220, 22);
+            CreateSettingsText(settingsContentWindow_, referenceCheckDescription.c_str(),
                 16, 82, 330, 24);
-            CreateSettingsButton(settingsContentWindow_, L"检查失效引用", 16, 112, 132, 30,
+            CreateSettingsButton(settingsContentWindow_, checkReferences.c_str(), 16, 112, 132, 30,
                                  MenuRefreshReferences);
-            CreateSettingsText(settingsContentWindow_, L"恢复归档核心", 16, 166, 220, 22);
+            CreateSettingsText(settingsContentWindow_, archivedCores.c_str(), 16, 166, 220, 22);
             int row = 0;
             for (const Core& core : state_.cores) {
                 if (!core.archived || row >= 6) {
@@ -12158,40 +12208,47 @@ private:
                 const int top = 194 + row * 48;
                 CreateSettingsText(settingsContentWindow_, core.name.c_str(),
                     16, top, 222, 22);
-                const std::wstring detail = std::to_wstring(core.files.size()) +
-                    L" 个文件";
+                const std::wstring detail = localization_.Format(
+                    "settings.core.file_count",
+                    {{L"count", std::to_wstring(core.files.size())}});
                 CreateSettingsText(settingsContentWindow_, detail.c_str(),
                     16, top + 21, 180, 18);
-                CreateSettingsButton(settingsContentWindow_, L"恢复",
+                CreateSettingsButton(settingsContentWindow_, restore.c_str(),
                     258, top + 8, 72, 28,
                     kSettingsArchivedCoreCommandBase +
                         static_cast<UINT>(settingsArchivedCoreIds_.size() - 1));
                 ++row;
             }
             if (settingsArchivedCoreIds_.empty()) {
-                CreateSettingsText(settingsContentWindow_, L"暂无归档核心", 16, 198, 220, 24);
+                const std::wstring noArchived = T("settings.core.no_archived");
+                CreateSettingsText(settingsContentWindow_, noArchived.c_str(), 16, 198, 220, 24);
             }
             break;
         }
-        case SettingsPage::Help:
-            CreateSettingsText(settingsContentWindow_,
-                L"重新打开三步使用教程；不会创建测试文件或改动现有布局。",
+        case SettingsPage::Help: {
+            const std::wstring tutorialDescription = T("settings.help.tutorial.description");
+            const std::wstring tutorial = T("settings.help.tutorial");
+            CreateSettingsText(settingsContentWindow_, tutorialDescription.c_str(),
                 16, 56, 340, 40);
-            CreateSettingsButton(settingsContentWindow_, L"重新打开使用教程", 16, 108, 160, 30,
+            CreateSettingsButton(settingsContentWindow_, tutorial.c_str(), 16, 108, 160, 30,
                                  MenuTrayTutorial);
             break;
-        case SettingsPage::Advanced:
-            CreateSettingsText(settingsContentWindow_,
-                L"程序数据文件夹包含状态、备份和日志。不要手动删除未知文件。",
+        }
+        case SettingsPage::Advanced: {
+            const std::wstring folderDescription = T("settings.advanced.data_folder.description");
+            const std::wstring openFolder = T("settings.advanced.open_data_folder");
+            const std::wstring reportDescription = T("settings.advanced.report.description");
+            const std::wstring report = T("settings.advanced.report");
+            CreateSettingsText(settingsContentWindow_, folderDescription.c_str(),
                 16, 56, 340, 40);
-            CreateSettingsButton(settingsContentWindow_, L"打开程序数据文件夹", 16, 108, 180, 30,
+            CreateSettingsButton(settingsContentWindow_, openFolder.c_str(), 16, 108, 180, 30,
                                  MenuOpenDataFolder);
-            CreateSettingsText(settingsContentWindow_,
-                L"问题报告只包含脱敏运行日志和窗口状态，不会上传。",
+            CreateSettingsText(settingsContentWindow_, reportDescription.c_str(),
                 16, 152, 340, 28);
-            CreateSettingsButton(settingsContentWindow_, L"生成问题报告", 16, 190, 150, 30,
+            CreateSettingsButton(settingsContentWindow_, report.c_str(), 16, 190, 150, 30,
                                  MenuGenerateDiagnosticReport);
             break;
+        }
         }
         LayoutSettingsWindow();
         InvalidateRect(settingsContentWindow_, nullptr, TRUE);
@@ -12236,7 +12293,8 @@ private:
         }
         RECT client{};
         GetClientRect(settingsWindow_, &client);
-        const int navigationWidth = SettingsDipToPixels(142);
+        const int navigationWidth =
+            SettingsDipToPixels(SettingsNavigationWidthDip());
         const int viewportHeight = std::max(1,
             static_cast<int>(client.bottom) - SettingsDipToPixels(20));
         const int contentHeight = std::max(
@@ -12267,10 +12325,54 @@ private:
             SetStatus(L"无法保存语言设置");
             return;
         }
-        // This page is rebuilt immediately. Remaining non-modal surfaces are
-        // migrated in later batches and will use the same instance on rebuild.
+        RefreshSettingsWindowLanguage();
+        RefreshTrayIconLanguage();
         RebuildSettingsWindow();
         Invalidate();
+    }
+
+    void RefreshSettingsWindowLanguage() {
+        if (settingsWindow_ == nullptr ||
+            IsWindow(settingsWindow_) == FALSE) {
+            return;
+        }
+        const std::wstring title = T("settings.title");
+        SetWindowTextW(settingsWindow_, title.c_str());
+        const std::array<std::wstring, 7> pages{{
+            T("settings.general"), T("settings.appearance"),
+            T("settings.workspace"), T("settings.data"),
+            T("settings.core_management"), T("settings.help"),
+            T("settings.advanced")}};
+        for (int index = 0; index < static_cast<int>(pages.size()); ++index) {
+            if (HWND control = GetDlgItem(settingsWindow_,
+                kSettingsPageCommandBase + static_cast<UINT>(index));
+                control != nullptr) {
+                SetWindowTextW(control, pages[index].c_str());
+            }
+        }
+        RECT bounds{};
+        GetWindowRect(settingsWindow_, &bounds);
+        const int desiredWidth = SettingsDipToPixels(
+            localization_.CurrentLocale() == L"en-US" ? 560 : 520);
+        SetWindowPos(settingsWindow_, nullptr, bounds.left, bounds.top,
+            desiredWidth, bounds.bottom - bounds.top,
+            SWP_NOZORDER | SWP_NOACTIVATE);
+        LayoutSettingsWindow();
+    }
+
+    void RefreshTrayIconLanguage() {
+        if (!trayIconAdded_ || trayIconOwner_ == nullptr ||
+            IsWindow(trayIconOwner_) == FALSE) {
+            return;
+        }
+        NOTIFYICONDATAW icon{};
+        icon.cbSize = sizeof(icon);
+        icon.hWnd = trayIconOwner_;
+        icon.uID = kTrayIconId;
+        icon.uFlags = NIF_TIP;
+        const std::wstring trayTip = T("tray.tooltip");
+        wcsncpy_s(icon.szTip, trayTip.c_str(), _TRUNCATE);
+        (void)Shell_NotifyIconW(NIM_MODIFY, &icon);
     }
 
     void RecordSettingsWindowPosition(bool save) {
@@ -12313,7 +12415,9 @@ private:
             return;
         }
         const UINT dpi = window_ != nullptr ? GetDpiForWindow(window_) : 96;
-        const int width = MulDiv(520, static_cast<int>(dpi), 96);
+        const int width = MulDiv(
+            localization_.CurrentLocale() == L"en-US" ? 560 : 520,
+            static_cast<int>(dpi), 96);
         const int height = MulDiv(430, static_cast<int>(dpi), 96);
         POINT cursor{};
         GetCursorPos(&cursor);
@@ -12333,8 +12437,9 @@ private:
             ? static_cast<int>(std::lround(availableHeight * state_.settingsWindowYRatio))
             : availableHeight / 2);
         const DWORD style = WS_OVERLAPPEDWINDOW & ~(WS_THICKFRAME | WS_MAXIMIZEBOX);
+        const std::wstring settingsTitle = T("settings.title");
         settingsWindow_ = CreateWindowExW(
-            WS_EX_APPWINDOW, kSettingsWindowClass, L"引力桌面设置", style,
+            WS_EX_APPWINDOW, kSettingsWindowClass, settingsTitle.c_str(), style,
             x, y, width, height, nullptr, nullptr,
             GetModuleHandleW(nullptr), this);
         if (settingsWindow_ == nullptr) {
@@ -12347,15 +12452,18 @@ private:
             WS_CHILD | WS_VISIBLE | WS_CLIPCHILDREN,
             0, 0, 1, 1, settingsWindow_, nullptr,
             GetModuleHandleW(nullptr), this);
-        static constexpr std::array<const wchar_t*, 7> pages{{
-            L"常规", L"外观与动效", L"工作区", L"数据与备份",
-            L"核心管理", L"帮助", L"高级"}};
+        const std::array<std::wstring, 7> pages{{
+            T("settings.general"), T("settings.appearance"),
+            T("settings.workspace"), T("settings.data"),
+            T("settings.core_management"), T("settings.help"),
+            T("settings.advanced")}};
         for (int index = 0; index < static_cast<int>(pages.size()); ++index) {
-            CreateSettingsButton(settingsWindow_, pages[index],
-                12, 14 + index * 38, 126, 30,
+            CreateSettingsButton(settingsWindow_, pages[index].c_str(),
+                12, 14 + index * 38, SettingsNavigationWidthDip() - 16, 30,
                 kSettingsPageCommandBase + static_cast<UINT>(index));
         }
-        CreateSettingsText(settingsWindow_, L"修改后立即预览，并自动保存。",
+        const std::wstring instantPreview = T("settings.instant_preview");
+        CreateSettingsText(settingsWindow_, instantPreview.c_str(),
             16, 304, 120, 36);
         LayoutSettingsWindow();
         RebuildSettingsWindow();
