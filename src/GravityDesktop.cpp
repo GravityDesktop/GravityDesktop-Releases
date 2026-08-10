@@ -2137,18 +2137,20 @@ std::int64_t UnixTimeNow() {
         .count();
 }
 
-std::wstring FormatTimestamp(std::int64_t timestamp) {
+std::wstring FormatTimestamp(std::int64_t timestamp,
+                             std::wstring_view neverUsed,
+                             std::wstring_view unknownTime) {
     if (timestamp <= 0) {
-        return L"从未使用";
+        return std::wstring(neverUsed);
     }
     const std::time_t value = static_cast<std::time_t>(timestamp);
     std::tm local{};
     if (localtime_s(&local, &value) != 0) {
-        return L"时间未知";
+        return std::wstring(unknownTime);
     }
     wchar_t buffer[64]{};
     if (wcsftime(buffer, std::size(buffer), L"%Y-%m-%d %H:%M", &local) == 0) {
-        return L"时间未知";
+        return std::wstring(unknownTime);
     }
     return buffer;
 }
@@ -12327,6 +12329,7 @@ private:
         }
         RefreshSettingsWindowLanguage();
         RefreshTrayIconLanguage();
+        RefreshDividerTooltipLanguage();
         RebuildSettingsWindow();
         Invalidate();
     }
@@ -12373,6 +12376,22 @@ private:
         const std::wstring trayTip = T("tray.tooltip");
         wcsncpy_s(icon.szTip, trayTip.c_str(), _TRUNCATE);
         (void)Shell_NotifyIconW(NIM_MODIFY, &icon);
+    }
+
+    void RefreshDividerTooltipLanguage() {
+        if (dividerTooltipWindow_ == nullptr ||
+            IsWindow(dividerTooltipWindow_) == FALSE ||
+            interactionWindow_ == nullptr) {
+            return;
+        }
+        dividerTooltipText_ = T("divider.drag_range");
+        TOOLINFOW tool{};
+        tool.cbSize = TTTOOLINFOW_V1_SIZE;
+        tool.hwnd = interactionWindow_;
+        tool.uId = 1;
+        tool.lpszText = const_cast<LPWSTR>(dividerTooltipText_.c_str());
+        SendMessageW(dividerTooltipWindow_, TTM_UPDATETIPTEXTW, 0,
+            reinterpret_cast<LPARAM>(&tool));
     }
 
     void RecordSettingsWindowPosition(bool save) {
@@ -15706,8 +15725,10 @@ private:
                 ? FileDisplayName(hovered->item->path)
                 : hovered->item->originalName, 42);
         const std::wstring path = Shorten(hovered->item->path, 54);
-        const std::wstring recent = L"最近使用：" +
-            FormatTimestamp(hovered->item->lastOpened);
+        const std::wstring recent = localization_.Format(
+            "tooltip.recent_used",
+            {{L"time", FormatTimestamp(hovered->item->lastOpened,
+                T("time.never"), T("time.unknown"))}});
         const D2D1_RECT_F nameRect = D2D1::RectF(
             tooltip.left + 12.0f, tooltip.top + 8.0f,
             tooltip.right - 12.0f, tooltip.top + 31.0f);
@@ -19921,18 +19942,18 @@ private:
         struct Preset {
             UINT command;
             UINT32 color;
-            const wchar_t* name;
+            const char* key;
         };
         constexpr std::array<Preset, 9> presets{{
-            {MenuSetCoreColorBlue,   0x3978D3, L"蓝"},
-            {MenuSetCoreColorPurple, 0x7E69DA, L"紫"},
-            {MenuSetCoreColorPink,   0xD86A9E, L"粉"},
-            {MenuSetCoreColorRed,    0xC8545E, L"红"},
-            {MenuSetCoreColorOrange, 0xD68A2C, L"橙"},
-            {MenuSetCoreColorYellow, 0xB99A27, L"黄"},
-            {MenuSetCoreColorGreen,  0x46966B, L"绿"},
-            {MenuSetCoreColorCyan,   0x2C9BA8, L"青"},
-            {MenuSetCoreColorGray,   0x778392, L"灰"},
+            {MenuSetCoreColorBlue,   0x3978D3, "color.blue"},
+            {MenuSetCoreColorPurple, 0x7E69DA, "color.purple"},
+            {MenuSetCoreColorPink,   0xD86A9E, "color.pink"},
+            {MenuSetCoreColorRed,    0xC8545E, "color.red"},
+            {MenuSetCoreColorOrange, 0xD68A2C, "color.orange"},
+            {MenuSetCoreColorYellow, 0xB99A27, "color.yellow"},
+            {MenuSetCoreColorGreen,  0x46966B, "color.green"},
+            {MenuSetCoreColorCyan,   0x2C9BA8, "color.cyan"},
+            {MenuSetCoreColorGray,   0x778392, "color.gray"},
         }};
         HMENU menu = CreatePopupMenu();
         if (menu == nullptr) {
@@ -19942,7 +19963,8 @@ private:
             const UINT flags = core->themeColor == preset.color
                 ? MF_STRING | MF_CHECKED
                 : MF_STRING;
-            AppendMenuW(menu, flags, preset.command, preset.name);
+            const std::wstring name = T(preset.key);
+            AppendMenuW(menu, flags, preset.command, name.c_str());
         }
         POINT point{};
         GetCursorPos(&point);
@@ -19971,39 +19993,39 @@ private:
             MF_STRING |
                 (current == ConnectionWidthPreset::Thin
                      ? MF_CHECKED : 0),
-            MenuConnectionStyleThin, L"细线");
+            MenuConnectionStyleThin, T("connection.thin").c_str());
         AppendMenuW(
             menu,
             MF_STRING |
                 (current == ConnectionWidthPreset::Standard
                      ? MF_CHECKED : 0),
-            MenuConnectionStyleStandard, L"标准");
+            MenuConnectionStyleStandard, T("connection.standard").c_str());
         AppendMenuW(
             menu,
             MF_STRING |
                 (current == ConnectionWidthPreset::Emphasis
                      ? MF_CHECKED : 0),
-            MenuConnectionStyleEmphasis, L"强调");
+            MenuConnectionStyleEmphasis, T("connection.emphasis").c_str());
         AppendMenuW(
             menu,
             MF_STRING | MF_GRAYED |
                 (current == ConnectionWidthPreset::Custom
                      ? MF_CHECKED : 0),
-            MenuConnectionStyleCustom, L"自定义");
+            MenuConnectionStyleCustom, T("connection.custom").c_str());
         return menu;
     }
 
     void SetConnectionLineWidthPreset(ConnectionWidthPreset preset) {
         float width = kConnectionLineWidthStandard;
-        const wchar_t* name = L"标准";
+        std::wstring name = T("connection.standard");
         switch (preset) {
         case ConnectionWidthPreset::Thin:
             width = kConnectionLineWidthThin;
-            name = L"细线";
+            name = T("connection.thin");
             break;
         case ConnectionWidthPreset::Emphasis:
             width = kConnectionLineWidthEmphasis;
-            name = L"强调";
+            name = T("connection.emphasis");
             break;
         case ConnectionWidthPreset::Standard:
             break;
@@ -20064,18 +20086,20 @@ private:
             const Core* core = FindCore(hit.coreId);
             SetSelection({HitKind::Core, hit.coreId, 0}, true);
             AppendMenuW(menu, MF_STRING, MenuToggleCore,
-                        core != nullptr && core->expanded ? L"收起核心" : L"展开核心");
-            AppendMenuW(menu, MF_STRING, MenuRenameCore, L"重命名核心\tF2");
+                        core != nullptr && core->expanded
+                            ? T("core.collapse").c_str()
+                            : T("core.expand").c_str());
+            AppendMenuW(menu, MF_STRING, MenuRenameCore, T("core.rename").c_str());
             AppendMenuW(menu, MF_STRING, MenuCoreAppearanceSettings,
-                        L"核心外观设置...");
+                        T("core.appearance").c_str());
             const std::size_t collectableReferenceCount =
                 core != nullptr
                     ? CollectableDesktopReferenceCount(*core)
                     : 0;
             if (collectableReferenceCount != 0) {
-                const std::wstring collectableReferenceLabel =
-                    L"收纳现有桌面引用（" +
-                    std::to_wstring(collectableReferenceCount) + L"项）...";
+                const std::wstring collectableReferenceLabel = localization_.Format(
+                    "core.store_existing_references",
+                    {{L"count", std::to_wstring(collectableReferenceCount)}});
                 AppendMenuW(
                     menu, MF_STRING, MenuStoreCoreDesktopReferences,
                     collectableReferenceLabel.c_str());
@@ -20085,35 +20109,33 @@ private:
             const UINT layoutCommandState =
                 MF_STRING | (layoutLocked ? MF_GRAYED : 0);
             AppendMenuW(menu, layoutCommandState, MenuOptimizeCore,
-                        L"恢复推荐布局");
+                        T("core.restore_recommended_layout").c_str());
             AppendMenuW(menu, layoutCommandState, MenuKeepAngles,
-                        L"按圈均匀排列");
+                        T("core.arrange_by_ring").c_str());
             AppendMenuW(menu, layoutCommandState, MenuSingleRing,
-                        L"单环均匀排列");
+                        T("core.single_ring").c_str());
             const std::size_t attachedCount =
                 core != nullptr ? AttachedFileCount(*core) : 0;
             const std::wstring compactLabel =
                 attachedCount > 15
-                    ? L"紧凑双环（内5＋外10，当前" +
-                          std::to_wstring(attachedCount) +
-                          L"项，最多15项）"
-                    : L"紧凑双环（内5＋外10）";
+                    ? localization_.Format("core.compact_double_full",
+                        {{L"count", std::to_wstring(attachedCount)}})
+                    : T("core.compact_double");
             AppendMenuW(
                 menu,
                 layoutCommandState | (attachedCount > 15 ? MF_GRAYED : 0),
                 MenuCompactDouble, compactLabel.c_str());
             const std::wstring extendedLabel =
                 attachedCount > 18
-                    ? L"扩展双环（内6＋外12，当前" +
-                          std::to_wstring(attachedCount) +
-                          L"项，最多18项）"
-                    : L"扩展双环（内6＋外12）";
+                    ? localization_.Format("core.extended_double_full",
+                        {{L"count", std::to_wstring(attachedCount)}})
+                    : T("core.extended_double");
             AppendMenuW(
                 menu,
                 layoutCommandState | (attachedCount > 18 ? MF_GRAYED : 0),
                 MenuHighCapacityDouble, extendedLabel.c_str());
             AppendMenuW(menu, layoutCommandState, MenuGrowToSpace,
-                        L"向空白处展开");
+                        T("core.grow_to_space").c_str());
             HMENU layoutAdjustmentMenu = CreatePopupMenu();
             HMENU connectionStyleMenu = CreateConnectionStyleMenu();
             if (layoutAdjustmentMenu != nullptr &&
@@ -20121,15 +20143,15 @@ private:
                 AppendMenuW(
                     layoutAdjustmentMenu, layoutCommandState,
                     MenuAdjustCoreDistance,
-                    L"打开布局调节面板...");
+                    T("core.open_layout_panel").c_str());
                 AppendMenuW(
                     layoutAdjustmentMenu, MF_POPUP,
                     reinterpret_cast<UINT_PTR>(connectionStyleMenu),
-                    L"调整连线样式");
+                    T("core.adjust_connection_style").c_str());
                 AppendMenuW(
                     menu, MF_POPUP,
                     reinterpret_cast<UINT_PTR>(layoutAdjustmentMenu),
-                    L"调整布局");
+                    T("core.adjust_layout").c_str());
             } else {
                 if (connectionStyleMenu != nullptr) {
                     DestroyMenu(connectionStyleMenu);
@@ -20139,87 +20161,94 @@ private:
                 }
                 AppendMenuW(
                     menu, layoutCommandState, MenuAdjustCoreDistance,
-                    L"调整布局...");
+                    T("core.open_layout_panel").c_str());
             }
             AppendMenuW(menu, MF_SEPARATOR, 0, nullptr);
             AppendMenuW(
                 menu, MF_STRING | (layoutLocked ? MF_CHECKED : 0), MenuToggleLayoutLock,
                 core != nullptr && core->layoutLocked
-                    ? L"解除核心与文件位置锁定"
-                    : L"锁定核心与文件位置");
+                    ? T("core.unlock_positions").c_str()
+                    : T("core.lock_positions").c_str());
             AppendMenuW(menu, MF_STRING, MenuSaveCoreBaseline,
-                        L"设为默认布局");
+                        T("core.save_layout").c_str());
             const bool hasSavedBaseline =
                 core != nullptr && !core->savedBaselineLayout.empty();
             AppendMenuW(menu,
                         layoutCommandState | (!hasSavedBaseline ? MF_GRAYED : 0),
                         MenuRestoreCoreBaseline,
                         hasSavedBaseline
-                            ? L"恢复默认布局"
-                            : L"恢复默认布局（尚未保存）");
+                            ? T("core.restore_layout").c_str()
+                            : T("core.restore_layout_unavailable").c_str());
             if (hit.coreId != kUnclassifiedCoreId) {
                 AppendMenuW(menu, MF_SEPARATOR, 0, nullptr);
                 AppendMenuW(menu, MF_STRING, MenuArchiveCore,
-                            L"归档核心");
+                            T("core.archive").c_str());
                 AppendMenuW(menu, MF_STRING, MenuDissolveCore,
-                            L"解散核心并还原文件到桌面");
+                            T("core.dissolve_restore").c_str());
                 AppendMenuW(menu, MF_STRING, MenuDeleteCore,
-                            L"移除核心及所有引用");
+                            T("core.remove_all").c_str());
             } else if (core != nullptr && !core->files.empty()) {
                 AppendMenuW(menu, MF_SEPARATOR, 0, nullptr);
                 AppendMenuW(menu, MF_STRING, MenuDissolveCore,
-                            L"还原未分类文件到桌面并清空引用");
+                            T("core.restore_uncategorized").c_str());
             }
         } else {
             FileItem* item = FindItem(hit.coreId, hit.itemId);
-            AppendMenuW(menu, MF_STRING, MenuOpenItem, L"打开");
+            AppendMenuW(menu, MF_STRING, MenuOpenItem, T("file.open").c_str());
             if (item != nullptr &&
                 item->storageMode == FileStorageMode::Managed) {
                 AppendMenuW(
                     menu, MF_STRING, MenuRenameItemRealFile,
-                    L"重命名文件\tF2");
+                    T("file.rename").c_str());
             } else {
                 AppendMenuW(
                     menu, MF_STRING, MenuRenameItemDisplay,
-                    L"修改显示名称\tF2");
+                    T("file.rename_display").c_str());
                 AppendMenuW(
                     menu, MF_STRING, MenuRenameItemRealFile,
-                    L"重命名真实文件…");
+                    T("file.rename_real").c_str());
             }
-            AppendMenuW(menu, MF_STRING, MenuOpenContainingFolder, L"打开所在文件夹");
-            AppendMenuW(menu, MF_STRING, MenuRevealInExplorer, L"在资源管理器中选中");
-            AppendMenuW(menu, MF_STRING, MenuShowFullPath, L"查看完整路径");
+            AppendMenuW(menu, MF_STRING, MenuOpenContainingFolder,
+                        T("file.open_folder").c_str());
+            AppendMenuW(menu, MF_STRING, MenuRevealInExplorer,
+                        T("file.reveal").c_str());
+            AppendMenuW(menu, MF_STRING, MenuShowFullPath,
+                        T("file.full_path").c_str());
             if (item != nullptr &&
                 item->storageMode == FileStorageMode::Reference &&
                 IsEligibleDesktopManagedFile(item->path)) {
                 AppendMenuW(
                     menu, MF_STRING, MenuStoreItemReference,
-                    L"收纳到当前核心（移出桌面）");
+                    T("file.store_in_core").c_str());
             }
             AppendMenuW(menu, MF_SEPARATOR, 0, nullptr);
             AppendMenuW(menu, MF_STRING, MenuTogglePinned,
-                        item != nullptr && item->pinned ? L"取消固定" : L"固定");
+                        item != nullptr && item->pinned
+                            ? T("file.unpin").c_str() : T("file.pin").c_str());
             AppendMenuW(menu, MF_STRING, MenuToggleFavorite,
-                        item != nullptr && item->favorite ? L"取消收藏" : L"收藏");
+                        item != nullptr && item->favorite
+                            ? T("file.unfavorite").c_str() : T("file.favorite").c_str());
             AppendMenuW(menu, MF_STRING, MenuToggleInProgress,
-                        item != nullptr && item->inProgress ? L"取消“进行中”"
-                                                          : L"标记为“进行中”");
-            AppendMenuW(menu, MF_STRING, MenuRelocateItem, L"重新定位");
+                        item != nullptr && item->inProgress
+                            ? T("file.unmark_in_progress").c_str()
+                            : T("file.mark_in_progress").c_str());
+            AppendMenuW(menu, MF_STRING, MenuRelocateItem,
+                        T("file.relocate").c_str());
             if (item != nullptr && !item->detachedFromUpper) {
                 AppendMenuW(menu, MF_STRING, MenuDetachParent,
-                            L"断开上层连接（保持独立）");
+                            T("file.detach_parent").c_str());
             }
             AppendMenuW(menu, MF_SEPARATOR, 0, nullptr);
             AppendMenuW(
                 menu, MF_STRING, MenuRemoveItem,
-                item != nullptr &&
+                    item != nullptr &&
                         item->storageMode == FileStorageMode::Managed &&
                         !FilePathExists(item->path)
-                    ? L"移除失效引用（文件已不在文件库）"
+                    ? T("file.remove_missing").c_str()
                     : item != nullptr &&
                           item->storageMode == FileStorageMode::Managed
-                    ? L"从核心移除并还原到桌面"
-                    : L"从核心移除引用");
+                    ? T("file.remove_restore").c_str()
+                    : T("file.remove_reference").c_str());
         }
 
         POINT screen{x, y};
@@ -26196,8 +26225,8 @@ private:
         tool.uFlags = TTF_SUBCLASS;
         tool.hwnd = interactionWindow_;
         tool.uId = 1;
-        tool.lpszText = const_cast<LPWSTR>(
-            L"拖动调整核心桌面范围");
+        dividerTooltipText_ = T("divider.drag_range");
+        tool.lpszText = const_cast<LPWSTR>(dividerTooltipText_.c_str());
         tool.rect = RECT{
             0, 0,
             DividerHandleWidthPixels(),
@@ -26439,6 +26468,7 @@ private:
     HWND interactionWindow_ = nullptr;
     HWND dividerHandleWindow_ = nullptr;
     HWND dividerTooltipWindow_ = nullptr;
+    std::wstring dividerTooltipText_;
     HWND lifecycleWindow_ = nullptr;
     float dpi_ = 96.0f;
     std::wstring systemUiFontFamily_ = L"Segoe UI";
