@@ -98,7 +98,7 @@ constexpr UINT_PTR kDesktopHostMigrationTimer = 14;
 constexpr UINT_PTR kWorkspaceEnvironmentRefreshTimer = 15;
 constexpr UINT_PTR kRelationshipManifestRetryTimer = 16;
 constexpr UINT_PTR kWorkspaceChromeAutoHideTimer = 17;
-constexpr UINT kWorkspaceChromeAutoHideDelayMs = 650;
+constexpr UINT kWorkspaceChromeAutoHideDelayMs = 280;
 constexpr std::array<UINT, 3> kSaveRetryDelaysMs{
     1000, 3000, 10000};
 constexpr std::array<UINT, 3> kRelationshipManifestRetryDelaysMs{
