@@ -113,9 +113,68 @@ constexpr UINT kDesktopHostMigrationSettleDelayMs = 450;
 constexpr std::array<UINT, 4> kWorkspaceEnvironmentRefreshDelaysMs{
     120, 320, 700, 1400};
 constexpr int kDesktopReconnectAttemptLimit = 40;
+constexpr float kCollisionEnterMarginDip = 6.0f;
+constexpr float kCollisionReleaseMarginDip = 12.0f;
+constexpr float kCollisionSpatialCellDip = 128.0f;
 constexpr std::uintmax_t kRuntimeDiagnosticLogMaximumBytes =
     2U * 1024U * 1024U;
 constexpr int kRuntimeDiagnosticLogFileCount = 5;
+
+struct CollisionFootprintRecord {
+    std::uint64_t coreId = 0;
+    D2D1_RECT_F bounds = D2D1::RectF();
+};
+
+class CollisionSpatialIndex {
+public:
+    void Add(std::uint64_t coreId, const D2D1_RECT_F& bounds) {
+        const std::size_t index = records_.size();
+        records_.push_back({coreId, bounds});
+        const auto [left, top] = CellFor(bounds.left, bounds.top);
+        const auto [right, bottom] = CellFor(bounds.right, bounds.bottom);
+        for (int x = left; x <= right; ++x) {
+            for (int y = top; y <= bottom; ++y) {
+                cells_[CellKey(x, y)].push_back(index);
+            }
+        }
+    }
+
+    std::vector<const CollisionFootprintRecord*> Query(
+        const D2D1_RECT_F& bounds) const {
+        std::set<std::size_t> indices;
+        const auto [left, top] = CellFor(bounds.left, bounds.top);
+        const auto [right, bottom] = CellFor(bounds.right, bounds.bottom);
+        for (int x = left; x <= right; ++x) {
+            for (int y = top; y <= bottom; ++y) {
+                const auto found = cells_.find(CellKey(x, y));
+                if (found == cells_.end()) continue;
+                indices.insert(found->second.begin(), found->second.end());
+            }
+        }
+        std::vector<const CollisionFootprintRecord*> result;
+        result.reserve(indices.size());
+        for (const std::size_t index : indices) {
+            result.push_back(&records_[index]);
+        }
+        return result;
+    }
+
+private:
+    static std::pair<int, int> CellFor(float x, float y) {
+        return {
+            static_cast<int>(std::floor(x / kCollisionSpatialCellDip)),
+            static_cast<int>(std::floor(y / kCollisionSpatialCellDip))};
+    }
+
+    static std::uint64_t CellKey(int x, int y) {
+        return (static_cast<std::uint64_t>(
+                    static_cast<std::uint32_t>(x)) << 32) |
+               static_cast<std::uint32_t>(y);
+    }
+
+    std::vector<CollisionFootprintRecord> records_;
+    std::map<std::uint64_t, std::vector<std::size_t>> cells_;
+};
 constexpr std::size_t kMaxRelationTraversalNodes = 4096;
 constexpr std::size_t kMaxRelationTraversalDepth = 256;
 constexpr std::size_t kHistoryRecentSnapshotCount = 48;
@@ -9270,6 +9329,14 @@ private:
         coreDisplayPositions_.clear();
         const D2D1_SIZE_F client = ClientDipSize();
         std::vector<std::pair<std::uint64_t, D2D1_RECT_F>> globalFootprints;
+        CollisionSpatialIndex collisionSpatialIndex;
+        std::unordered_set<std::uint64_t> collisionItemsSeen;
+        const auto addGlobalFootprint =
+            [&globalFootprints, &collisionSpatialIndex](
+                std::uint64_t coreId, const D2D1_RECT_F& bounds) {
+                globalFootprints.emplace_back(coreId, bounds);
+                collisionSpatialIndex.Add(coreId, bounds);
+            };
         struct CoreBoundary {
             std::uint64_t coreId = 0;
             D2D1_POINT_2F center = D2D1::Point2F();
@@ -9334,12 +9401,41 @@ private:
                 continue;
             }
             bool placed = false;
+            D2D1_POINT_2F preferredAway = D2D1::Point2F(1.0f, 0.0f);
+            D2D1_POINT_2F accumulatedAway = D2D1::Point2F();
+            for (const CoreBoundary& existing : coreBoundaries) {
+                const float required =
+                    coreCollisionRadius + existing.radius + 24.0f;
+                if (DistanceSquared(preferred, existing.center) >=
+                    required * required) {
+                    continue;
+                }
+                const D2D1_POINT_2F direction = NormalizeVector(
+                    D2D1::Point2F(preferred.x - existing.center.x,
+                                  preferred.y - existing.center.y),
+                    ((core.id ^ existing.coreId) & 1U) != 0
+                        ? D2D1::Point2F(1.0f, 0.35f)
+                        : D2D1::Point2F(-1.0f, -0.35f));
+                accumulatedAway.x += direction.x;
+                accumulatedAway.y += direction.y;
+            }
+            preferredAway = NormalizeVector(
+                accumulatedAway, preferredAway);
+            const float preferredAwayAngle =
+                std::atan2(preferredAway.y, preferredAway.x);
             for (int shell = 0; shell <= 50 && !placed; ++shell) {
                 const int directions = shell == 0 ? 1 : 24;
                 for (int direction = 0; direction < directions; ++direction) {
+                    const int branch = direction == 0
+                        ? 0
+                        : (direction % 2 == 1
+                               ? (direction + 1) / 2
+                               : -direction / 2);
                     const float angle =
-                        2.0f * kPi * static_cast<float>(direction) /
-                        static_cast<float>(directions);
+                        preferredAwayAngle +
+                        static_cast<float>(branch) *
+                            2.0f * kPi /
+                            static_cast<float>(directions);
                     const float distance = static_cast<float>(shell) * 12.0f;
                     const D2D1_POINT_2F candidate = clampCore(
                         D2D1::Point2F(preferred.x + std::cos(angle) * distance,
@@ -9375,7 +9471,17 @@ private:
         }
         std::stable_sort(
             orderedCores.begin(), orderedCores.end(),
-            [](const Core* first, const Core* second) {
+            [this](const Core* first, const Core* second) {
+                if (draggingCore_ && dragCoreId_ != 0) {
+                    if (first->id == dragCoreId_ &&
+                        second->id != dragCoreId_) {
+                        return true;
+                    }
+                    if (second->id == dragCoreId_ &&
+                        first->id != dragCoreId_) {
+                        return false;
+                    }
+                }
                 return first->id < second->id;
             });
 
@@ -9447,16 +9553,16 @@ private:
                     return screen;
                 };
             const auto collidesWithForeignCluster =
-                [this, core, &globalFootprints](
-                    const D2D1_RECT_F& bounds) {
+                [this, core, &collisionSpatialIndex](
+                    const D2D1_RECT_F& bounds, float margin) {
                     const D2D1_RECT_F safeBounds =
-                        InflateRectangle(bounds, 6.0f);
-                    for (const auto& [otherCoreId, otherBounds] :
-                         globalFootprints) {
-                        if (otherCoreId == core->id) continue;
+                        InflateRectangle(bounds, margin);
+                    for (const CollisionFootprintRecord* record :
+                         collisionSpatialIndex.Query(safeBounds)) {
+                        if (record->coreId == core->id) continue;
                         if (RectanglesIntersect(
                                 safeBounds,
-                                InflateRectangle(otherBounds, 6.0f))) {
+                                InflateRectangle(record->bounds, margin))) {
                             return true;
                         }
                     }
@@ -9479,6 +9585,49 @@ private:
                     }
                     return false;
                 };
+            const auto overlapArea = [](
+                const D2D1_RECT_F& first,
+                const D2D1_RECT_F& second) {
+                const float width = std::max(
+                    0.0f, std::min(first.right, second.right) -
+                              std::max(first.left, second.left));
+                const float height = std::max(
+                    0.0f, std::min(first.bottom, second.bottom) -
+                              std::max(first.top, second.top));
+                return width * height;
+            };
+            const auto foreignCollisionPenalty =
+                [this, core, &collisionSpatialIndex, &overlapArea](
+                    const D2D1_RECT_F& bounds, float margin) {
+                    const D2D1_RECT_F safeBounds =
+                        InflateRectangle(bounds, margin);
+                    float penalty = 0.0f;
+                    for (const CollisionFootprintRecord* record :
+                         collisionSpatialIndex.Query(safeBounds)) {
+                        if (record->coreId == core->id) continue;
+                        penalty += overlapArea(
+                            safeBounds,
+                            InflateRectangle(record->bounds, margin));
+                    }
+                    for (const Core& other : state_.cores) {
+                        if (other.archived || !CoreBodyVisible(other) ||
+                            other.id == core->id) {
+                            continue;
+                        }
+                        const D2D1_POINT_2F otherCenter =
+                            WorldToScreen(DisplayCoreWorld(other));
+                        const float half =
+                            metrics_.coreSize * state_.zoom / 2.0f + 8.0f;
+                        penalty += overlapArea(
+                            safeBounds,
+                            D2D1::RectF(
+                                otherCenter.x - half,
+                                otherCenter.y - half,
+                                otherCenter.x + half,
+                                otherCenter.y + half));
+                    }
+                    return penalty;
+                };
             const auto collidesWithOwnCluster =
                 [&occupied](const D2D1_RECT_F& bounds) {
                     return std::any_of(
@@ -9491,20 +9640,69 @@ private:
                 };
             const auto slideAwayFromForeignCluster =
                 [this, core, &clampFileToViewport,
-                 &collidesWithForeignCluster,
-                 &collidesWithOwnCluster](
-                    D2D1_POINT_2F preferred, FileSizeTier tier,
+                  &collidesWithForeignCluster,
+                  &foreignCollisionPenalty,
+                  &collidesWithOwnCluster,
+                  &collisionSpatialIndex,
+                  &collisionItemsSeen](
+                    std::uint64_t itemId, D2D1_POINT_2F preferred,
+                    FileSizeTier tier,
                     float scale, bool labelVisible) {
+                    collisionItemsSeen.insert(itemId);
                     preferred = clampFileToViewport(
                         preferred, tier, scale, labelVisible);
                     const D2D1_RECT_F preferredBounds =
                         StableFootprint(
                             preferred, tier, scale, labelVisible);
-                    if (!collidesWithForeignCluster(preferredBounds)) {
+                    const auto previousOffset =
+                        fileCollisionRuntimeOffsets_.find(itemId);
+                    const bool preferredCollides =
+                        collidesWithForeignCluster(
+                            preferredBounds, kCollisionEnterMarginDip);
+                    if (!preferredCollides) {
+                        if (previousOffset ==
+                            fileCollisionRuntimeOffsets_.end()) {
+                            return preferred;
+                        }
+                        if (!collidesWithForeignCluster(
+                                preferredBounds,
+                                kCollisionReleaseMarginDip)) {
+                            fileCollisionRuntimeOffsets_.erase(previousOffset);
+                            return preferred;
+                        }
+                        D2D1_POINT_2F previousCandidate = D2D1::Point2F(
+                            preferred.x + previousOffset->second.x,
+                            preferred.y + previousOffset->second.y);
+                        previousCandidate = clampFileToViewport(
+                            previousCandidate, tier, scale, labelVisible);
+                        const D2D1_RECT_F previousBounds = StableFootprint(
+                            previousCandidate, tier, scale, labelVisible);
+                        if (!collidesWithForeignCluster(
+                                previousBounds, kCollisionEnterMarginDip) &&
+                            !collidesWithOwnCluster(previousBounds)) {
+                            return previousCandidate;
+                        }
+                        fileCollisionRuntimeOffsets_.erase(previousOffset);
                         return preferred;
                     }
 
                     D2D1_POINT_2F away = D2D1::Point2F();
+                    for (const CollisionFootprintRecord* record :
+                         collisionSpatialIndex.Query(
+                             InflateRectangle(
+                                 preferredBounds,
+                                 kCollisionEnterMarginDip))) {
+                        if (record->coreId == core->id) continue;
+                        const D2D1_POINT_2F center = D2D1::Point2F(
+                            (record->bounds.left + record->bounds.right) / 2.0f,
+                            (record->bounds.top + record->bounds.bottom) / 2.0f);
+                        const D2D1_POINT_2F direction = NormalizeVector(
+                            D2D1::Point2F(preferred.x - center.x,
+                                          preferred.y - center.y),
+                            D2D1::Point2F(1.0f, 0.0f));
+                        away.x += direction.x;
+                        away.y += direction.y;
+                    }
                     for (const Core& other : state_.cores) {
                         if (other.archived ||
                             !CoreBodyVisible(other) ||
@@ -9519,7 +9717,9 @@ private:
                             otherCenter.x - half, otherCenter.y - half,
                             otherCenter.x + half, otherCenter.y + half);
                         if (RectanglesIntersect(
-                                InflateRectangle(preferredBounds, 6.0f),
+                                InflateRectangle(
+                                    preferredBounds,
+                                    kCollisionEnterMarginDip),
                                 body)) {
                             const D2D1_POINT_2F direction =
                                 NormalizeVector(
@@ -9541,8 +9741,41 @@ private:
                                 preferred.y - coreCenter.y),
                             D2D1::Point2F(1.0f, 0.0f)));
                     const float awayAngle = std::atan2(away.y, away.x);
-                    constexpr int directions = 24;
-                    for (int shell = 1; shell <= 32; ++shell) {
+                    D2D1_POINT_2F bestCandidate = preferred;
+                    float bestPenalty = foreignCollisionPenalty(
+                        preferredBounds, kCollisionEnterMarginDip);
+                    const auto rememberCandidate =
+                        [this, itemId, preferred, &bestCandidate,
+                         &bestPenalty](D2D1_POINT_2F candidate,
+                                       float penalty) {
+                            if (penalty >= bestPenalty) return;
+                            bestPenalty = penalty;
+                            bestCandidate = candidate;
+                            fileCollisionRuntimeOffsets_[itemId] =
+                                D2D1::Point2F(
+                                    candidate.x - preferred.x,
+                                    candidate.y - preferred.y);
+                        };
+                    if (previousOffset !=
+                        fileCollisionRuntimeOffsets_.end()) {
+                        D2D1_POINT_2F candidate = D2D1::Point2F(
+                            preferred.x + previousOffset->second.x,
+                            preferred.y + previousOffset->second.y);
+                        candidate = clampFileToViewport(
+                            candidate, tier, scale, labelVisible);
+                        const D2D1_RECT_F bounds = StableFootprint(
+                            candidate, tier, scale, labelVisible);
+                        if (!collidesWithOwnCluster(bounds)) {
+                            const float penalty = foreignCollisionPenalty(
+                                bounds, kCollisionEnterMarginDip);
+                            if (penalty <= 0.0f) {
+                                return candidate;
+                            }
+                            rememberCandidate(candidate, penalty);
+                        }
+                    }
+                    constexpr int directions = 16;
+                    for (int shell = 1; shell <= 24; ++shell) {
                         const float distance =
                             12.0f * static_cast<float>(shell);
                         for (int direction = 0;
@@ -9567,16 +9800,28 @@ private:
                             const D2D1_RECT_F bounds =
                                 StableFootprint(
                                     candidate, tier, scale, labelVisible);
-                            if (!collidesWithForeignCluster(bounds) &&
-                                !collidesWithOwnCluster(bounds)) {
+                            if (collidesWithOwnCluster(bounds)) {
+                                continue;
+                            }
+                            const float penalty = foreignCollisionPenalty(
+                                bounds, kCollisionEnterMarginDip);
+                            if (penalty <= 0.0f) {
+                                fileCollisionRuntimeOffsets_[itemId] =
+                                    D2D1::Point2F(
+                                        candidate.x - preferred.x,
+                                        candidate.y - preferred.y);
                                 return candidate;
                             }
+                            rememberCandidate(candidate, penalty);
                         }
                     }
-                    // A packed workspace may have no legal nearby slot.
-                    // Preserve the user's canonical position instead of
-                    // moving a core early or writing a destructive fallback.
-                    return preferred;
+                    // Packed workspaces may have no perfect slot. Keep the
+                    // least-overlapping deterministic candidate instead of
+                    // silently falling back to the fully colliding position.
+                    if (DistanceSquared(bestCandidate, preferred) <= 0.01f) {
+                        fileCollisionRuntimeOffsets_.erase(itemId);
+                    }
+                    return bestCandidate;
                 };
             const auto findRuntimeSlot =
                 [this, core, &activeCapacities, &assignedRuntimeSlots](
@@ -9677,12 +9922,13 @@ private:
                 // never feeds back into another file or a ring scale.
                 const D2D1_POINT_2F screen =
                     slideAwayFromForeignCluster(
-                        preferred, item->sizeTier, scale, labelVisible);
+                        item->id, preferred, item->sizeTier, scale,
+                        labelVisible);
                 const D2D1_RECT_F bounds =
                     StableFootprint(screen, item->sizeTier, scale,
                                     labelVisible);
                 occupied.push_back(bounds);
-                globalFootprints.emplace_back(core->id, bounds);
+                addGlobalFootprint(core->id, bounds);
                 assignedRuntimeSlots.insert(runtimeSlot);
                 ItemLayout entry{
                     item, ScreenToWorld(screen),
@@ -9708,7 +9954,7 @@ private:
                 appendChildren;
             appendChildren = [this, core, &appendChildren, &client,
                               &slideAwayFromForeignCluster, &occupied,
-                              &globalFootprints,
+                              &addGlobalFootprint,
                               &childTraversalGuard](
                                  std::uint64_t parentId,
                                  D2D1_POINT_2F parentWorld,
@@ -9744,13 +9990,13 @@ private:
                     screen.x = std::clamp(screen.x, half + 8.0f, client.width - half - 8.0f);
                     screen.y = std::clamp(screen.y, half + 8.0f, client.height - half - 24.0f);
                     screen = slideAwayFromForeignCluster(
-                        screen, FileSizeTier::Minor, 1.0f,
+                        child->id, screen, FileSizeTier::Minor, 1.0f,
                         ShouldShowFileLabel(*child));
                     const D2D1_RECT_F childBounds = StableFootprint(
                         screen, FileSizeTier::Minor, 1.0f,
                         ShouldShowFileLabel(*child));
                     occupied.push_back(childBounds);
-                    globalFootprints.emplace_back(core->id, childBounds);
+                    addGlobalFootprint(core->id, childBounds);
                     ItemLayout childEntry{child, ScreenToWorld(screen),
                         StableLabelRectangle(
                             screen, FileSizeTier::Minor, 1.0f),
@@ -9767,12 +10013,12 @@ private:
                 if (!item.detachedFromUpper || item.parentFileId != 0) continue;
                 const bool labelVisible = ShouldShowFileLabel(item);
                 const D2D1_POINT_2F screen = slideAwayFromForeignCluster(
-                    WorldToScreen(item.detachedWorldPosition),
+                    item.id, WorldToScreen(item.detachedWorldPosition),
                     item.sizeTier, 1.0f, labelVisible);
                 const D2D1_RECT_F bounds = StableFootprint(
                     screen, item.sizeTier, 1.0f, labelVisible);
                 occupied.push_back(bounds);
-                globalFootprints.emplace_back(core->id, bounds);
+                addGlobalFootprint(core->id, bounds);
                 ItemLayout independent{&item, ScreenToWorld(screen),
                     StableLabelRectangle(
                         screen, item.sizeTier, 1.0f),
@@ -9891,8 +10137,7 @@ private:
                 }
                 if (foundControlPosition) {
                     occupied.push_back(moreBounds);
-                    globalFootprints.emplace_back(
-                        core->id, moreBounds);
+                    addGlobalFootprint(core->id, moreBounds);
                     ItemLayout more{
                         nullptr, ScreenToWorld(moreScreen),
                         D2D1::RectF(), false, true, hidden};
@@ -9914,6 +10159,14 @@ private:
                     }
                     return first.item->slot < second.item->slot;
                 });
+        }
+        for (auto iterator = fileCollisionRuntimeOffsets_.begin();
+             iterator != fileCollisionRuntimeOffsets_.end();) {
+            if (!collisionItemsSeen.contains(iterator->first)) {
+                iterator = fileCollisionRuntimeOffsets_.erase(iterator);
+            } else {
+                ++iterator;
+            }
         }
         layoutDirty_ = false;
     }
@@ -26064,6 +26317,8 @@ private:
     bool layoutDirty_ = true;
     LayoutMap layoutCache_;
     std::map<std::uint64_t, D2D1_POINT_2F> coreDisplayPositions_;
+    std::unordered_map<std::uint64_t, D2D1_POINT_2F>
+        fileCollisionRuntimeOffsets_;
 
     ComPtr<ID2D1Factory> factory_;
     ComPtr<ID2D1RenderTarget> renderTarget_;
@@ -26870,9 +27125,11 @@ bool RunSelfTest() {
         secondFileLayout != fileCollisionLayouts.end() &&
         !firstFileLayout->second.empty() &&
         !secondFileLayout->second.empty();
+    D2D1_POINT_2F separatedSecondPosition = D2D1::Point2F();
     if (foreignFilesWereSeparated) {
         const ItemLayout& firstEntry = firstFileLayout->second.front();
         const ItemLayout& secondEntry = secondFileLayout->second.front();
+        separatedSecondPosition = secondEntry.position;
         const D2D1_RECT_F firstBounds = fileCollisionApp.StableFootprint(
             fileCollisionApp.WorldToScreen(firstEntry.position),
             firstEntry.item->sizeTier, 1.0f, firstEntry.showLabel);
@@ -26883,12 +27140,36 @@ bool RunSelfTest() {
             fileCollisionApp.InflateRectangle(firstBounds, 6.0f),
             fileCollisionApp.InflateRectangle(secondBounds, 6.0f));
     }
+    fileCollisionApp.layoutDirty_ = true;
+    const auto& repeatedFileCollisionLayouts =
+        fileCollisionApp.StableLayouts();
+    const auto repeatedSecondFileLayout =
+        repeatedFileCollisionLayouts.find(42);
+    const bool repeatedCollisionWasStable =
+        foreignFilesWereSeparated &&
+        fileCollisionApp.fileCollisionRuntimeOffsets_.contains(44) &&
+        repeatedSecondFileLayout != repeatedFileCollisionLayouts.end() &&
+        !repeatedSecondFileLayout->second.empty() &&
+        fileCollisionApp.DistanceSquared(
+            separatedSecondPosition,
+            repeatedSecondFileLayout->second.front().position) <= 0.01f;
+
+    CollisionSpatialIndex spatialIndex;
+    spatialIndex.Add(101, D2D1::RectF(0.0f, 0.0f, 32.0f, 32.0f));
+    spatialIndex.Add(102, D2D1::RectF(512.0f, 512.0f, 544.0f, 544.0f));
+    const auto nearSpatialRecords =
+        spatialIndex.Query(D2D1::RectF(8.0f, 8.0f, 40.0f, 40.0f));
+    const bool spatialIndexWasLocal =
+        nearSpatialRecords.size() == 1 &&
+        nearSpatialRecords.front()->coreId == 101;
     DestroyWindow(cacheVisual);
     if (!cacheWasPure ||
         !explicitCommitWasPersistent ||
         !dragTranslationStayedRigid ||
         !collisionRefreshWasBoundedAndEffective ||
-        !foreignFilesWereSeparated) {
+        !foreignFilesWereSeparated ||
+        !repeatedCollisionWasStable ||
+        !spatialIndexWasLocal) {
         return false;
     }
 
