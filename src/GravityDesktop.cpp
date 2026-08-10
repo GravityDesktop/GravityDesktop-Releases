@@ -5148,7 +5148,13 @@ public:
             // needlessly touches Explorer while users operate the taskbar.
             // TaskbarCreated and the 2-second health watch cover real shell
             // replacement; this hook remains only for a shell activation.
-            if (shellEvent == HSHELL_ACTIVATESHELLWINDOW) {
+            const bool desktopActivated =
+                shellEvent == HSHELL_ACTIVATESHELLWINDOW ||
+                ((shellEvent == HSHELL_WINDOWACTIVATED ||
+                  shellEvent == HSHELL_RUDEAPPACTIVATED) &&
+                 IsDesktopShellActivationWindow(
+                     reinterpret_cast<HWND>(lParam)));
+            if (desktopActivated) {
                 PostMessageW(
                     source, kRefreshInteractionLayerMessage,
                     0, 0);
@@ -5187,6 +5193,7 @@ public:
             return 0;
         case kRefreshInteractionLayerMessage:
             EnsureInteractionWindowPresented();
+            RefreshPointerStateAfterDesktopActivation();
             return 0;
         case WM_NCDESTROY:
             AppendRuntimeDiagnostic("lifecycle_window_destroyed");
@@ -7074,6 +7081,7 @@ private:
                 lifecycleWindow_,
                 kInteractionLayerRepairTimer);
             EnsureInteractionWindowPresented();
+            RefreshPointerStateAfterDesktopActivation();
             return;
         }
         if (timer == kDesktopHostWatchTimer) {
@@ -7209,6 +7217,7 @@ private:
             ShowWindow(interactionWindow_, SW_SHOWNOACTIVATE);
         }
         EnsureInteractionWindowPresented();
+        RefreshPointerStateAfterDesktopActivation();
         SyncDividerHandleWindowFrame();
         Invalidate();
     }
@@ -7229,6 +7238,7 @@ private:
                 ShowWindow(interactionWindow_, SW_SHOWNOACTIVATE);
             }
             EnsureInteractionWindowPresented();
+            RefreshPointerStateAfterDesktopActivation();
             SyncSelectionDismissTimer();
             SyncCoreSelectionRippleTimer();
             Invalidate();
@@ -11079,11 +11089,11 @@ private:
             state_.workspaceChromePinned ||
             draggingWorkspaceChrome_ || workspaceChromePointerPending_ ||
             workspaceChromeMenuOpen_ || corePlacementMode_ ||
+            window_ == nullptr ||
             (settingsWindow_ != nullptr &&
              IsWindowVisible(settingsWindow_) != FALSE) ||
             WorkspaceChromePointerOverGroup(
-                WorkspaceChromeGroupRectangle(ClientDipSize())) ||
-            window_ == nullptr) {
+                WorkspaceChromeGroupRectangle(ClientDipSize()))) {
             return;
         }
         if (SetTimer(window_, kWorkspaceChromeAutoHideTimer,
@@ -11106,6 +11116,87 @@ private:
         } else {
             ScheduleWorkspaceChromeAutoHide();
         }
+        Invalidate();
+    }
+
+    bool PointerCanRefreshDesktopCompanion(POINT screenPoint) const {
+        if (ScreenPointInsideInteractionIsland(screenPoint)) {
+            return true;
+        }
+        const HWND target = WindowFromPoint(screenPoint);
+        if (target == nullptr) {
+            return false;
+        }
+        if (target == window_ ||
+            (window_ != nullptr && IsChild(window_, target) != FALSE) ||
+            target == desktopHost_ ||
+            (desktopHost_ != nullptr &&
+             IsChild(desktopHost_, target) != FALSE)) {
+            return true;
+        }
+        const HWND root = GetAncestor(target, GA_ROOT);
+        wchar_t className[32]{};
+        if (root == nullptr ||
+            GetClassNameW(root, className,
+                          static_cast<int>(std::size(className))) <= 0) {
+            return false;
+        }
+        return wcscmp(className, L"Progman") == 0 ||
+               wcscmp(className, L"WorkerW") == 0;
+    }
+
+    bool IsDesktopShellActivationWindow(HWND candidate) const {
+        if (candidate == nullptr || IsWindow(candidate) == FALSE) {
+            return false;
+        }
+        const HWND root = GetAncestor(candidate, GA_ROOT);
+        if (candidate == desktopHost_ || root == desktopHost_) {
+            return true;
+        }
+        wchar_t className[32]{};
+        if (root == nullptr ||
+            GetClassNameW(root, className,
+                          static_cast<int>(std::size(className))) <= 0) {
+            return false;
+        }
+        return wcscmp(className, L"Progman") == 0 ||
+               wcscmp(className, L"WorkerW") == 0;
+    }
+
+    void RefreshPointerStateAfterDesktopActivation() {
+        if (!initialized_ || !workspaceVisible_ || state_.workspacePaused ||
+            failOpenActive_ || shuttingDown_ || exitRequested_ ||
+            window_ == nullptr || interactionWindow_ == nullptr ||
+            IsWindow(window_) == FALSE ||
+            IsWindow(interactionWindow_) == FALSE) {
+            return;
+        }
+        POINT screenPoint{};
+        if (GetCursorPos(&screenPoint) == FALSE ||
+            !PointerCanRefreshDesktopCompanion(screenPoint)) {
+            return;
+        }
+
+        POINT visualPoint = screenPoint;
+        if (ScreenToClient(window_, &visualPoint) == FALSE) {
+            return;
+        }
+        const bool chromeHovered = PointInside(
+            PixelToDip(visualPoint.x, visualPoint.y),
+            WorkspaceChromeInteractionRectangle(ClientDipSize()));
+        SetWorkspaceChromeHovered(chromeHovered);
+
+        if (ScreenPointInsideInteractionIsland(screenPoint)) {
+            EnsurePointerLeaveTracking(interactionWindow_);
+            SetInteractionCursor(interactionWindow_);
+        } else {
+            // Explorer can leave the cursor shape contributed by the previous
+            // foreground application until another mouse message arrives.
+            // Reset it only while the pointer belongs to the desktop band.
+            SetCursor(LoadCursorW(nullptr, IDC_ARROW));
+        }
+        // Rebuild the reveal island even when the hover flag was already true
+        // before a long foreground-app session.
         Invalidate();
     }
 
