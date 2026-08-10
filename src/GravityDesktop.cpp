@@ -4787,27 +4787,30 @@ public:
         for (const RelationshipRecoveryCore& core : manifest.cores) {
             fileCount += core.files.size();
         }
-        const std::wstring message =
-            L"发现以前的引力桌面工作关系。\n\n"
-            L"可恢复 " + std::to_wstring(manifest.cores.size()) +
-            L" 个核心、" + std::to_wstring(fileCount) +
-            L" 个文件引用。恢复只创建视觉关系，不会移动、复制或删除任何真实文件。";
+        const std::wstring message = localization_.Format(
+            "dialog.restore_relations.message",
+            {{L"coreCount", std::to_wstring(manifest.cores.size())},
+             {L"fileCount", std::to_wstring(fileCount)}});
 
         int choice = kKeepOrdinaryDesktop;
         bool taskDialogShown = false;
+        const std::wstring restoreAll = T("dialog.restore_relations.restore_all");
+        const std::wstring chooseSome = T("dialog.restore_relations.choose_some");
+        const std::wstring keepDesktop = T("dialog.restore_relations.keep_desktop");
         const TASKDIALOG_BUTTON buttons[] = {
-            {kRestoreAll, L"恢复全部核心"},
-            {kRestoreSelected, L"选择部分核心…"},
-            {kKeepOrdinaryDesktop, L"保持当前普通桌面"},
+            {kRestoreAll, restoreAll.c_str()},
+            {kRestoreSelected, chooseSome.c_str()},
+            {kKeepOrdinaryDesktop, keepDesktop.c_str()},
         };
+        const std::wstring restoreTitle = T("dialog.restore_relations.title");
+        const std::wstring restoreFooter = T("dialog.restore_relations.footer");
         TASKDIALOGCONFIG dialog{sizeof(dialog)};
         dialog.hwndParent = window_;
         dialog.dwFlags = TDF_ALLOW_DIALOG_CANCELLATION |
                          TDF_SIZE_TO_CONTENT;
-        dialog.pszWindowTitle = L"恢复以前的工作关系";
+        dialog.pszWindowTitle = restoreTitle.c_str();
         dialog.pszContent = message.c_str();
-        dialog.pszFooter =
-            L"默认保持普通桌面；任何选择都不会操作真实文件。";
+        dialog.pszFooter = restoreFooter.c_str();
         dialog.pszMainIcon = TD_INFORMATION_ICON;
         dialog.cButtons = static_cast<UINT>(
             sizeof(buttons) / sizeof(buttons[0]));
@@ -4829,7 +4832,7 @@ public:
         if (!taskDialogShown) {
             choice = MessageBoxW(
                          window_, message.c_str(),
-                         L"恢复以前的工作关系",
+                         restoreTitle.c_str(),
                          MB_YESNO | MB_ICONQUESTION | MB_DEFBUTTON2) == IDYES
                 ? kRestoreAll
                 : kKeepOrdinaryDesktop;
@@ -4838,21 +4841,21 @@ public:
         if (choice == kRestoreAll) {
             if (!RestoreRelationshipRecoveryManifest(manifest)) {
                 MessageBoxW(
-                    window_, L"恢复失败；当前普通桌面未被修改。",
-                    L"恢复以前的工作关系", MB_OK | MB_ICONWARNING);
+                    window_, T("dialog.restore_relations.failed").c_str(),
+                    restoreTitle.c_str(), MB_OK | MB_ICONWARNING);
             }
             return;
         }
         if (choice == kRestoreSelected) {
             std::set<std::uint64_t> selectedCoreIds;
             for (const RelationshipRecoveryCore& core : manifest.cores) {
-                const std::wstring corePrompt =
-                    L"是否恢复核心“" + core.name + L"”？\n\n"
-                    L"文件引用数量：" + std::to_wstring(core.files.size()) +
-                    L"\n不会移动任何真实文件。";
+                const std::wstring corePrompt = localization_.Format(
+                    "dialog.restore_relations.choose_message",
+                    {{L"core", core.name},
+                     {L"count", std::to_wstring(core.files.size())}});
                 if (MessageBoxW(
                         window_, corePrompt.c_str(),
-                        L"选择要恢复的核心",
+                        T("dialog.restore_relations.choose_title").c_str(),
                         MB_YESNO | MB_ICONQUESTION | MB_DEFBUTTON2) == IDYES) {
                     selectedCoreIds.insert(core.stableId);
                 }
@@ -4868,8 +4871,8 @@ public:
             AppendRuntimeDiagnostic("relationship_recovery_partial_selected");
             if (!RestoreRelationshipRecoveryManifest(selected)) {
                 MessageBoxW(
-                    window_, L"部分恢复失败；当前普通桌面未被修改。",
-                    L"恢复以前的工作关系", MB_OK | MB_ICONWARNING);
+                    window_, T("dialog.restore_relations.partial_failed").c_str(),
+                    restoreTitle.c_str(), MB_OK | MB_ICONWARNING);
             }
             return;
         }
@@ -20815,25 +20818,30 @@ private:
         if (!fromPublicDesktop && !ManagedCollectionConfirmationRequired()) {
             return true;
         }
-        const std::wstring message = fromPublicDesktop
-            ? L"将“" + FileDisplayName(sourcePath) + L"”收纳到“" +
-                  target.name +
-                  L"”？它会从公共桌面移走，其他 Windows 用户也将不再看到这个快捷方式；之后可随时恢复。"
-            : L"将“" + FileDisplayName(sourcePath) + L"”收纳到“" +
-                  target.name + L"”？它会从桌面移走，之后可随时恢复。";
+        const std::wstring message = localization_.Format(
+            fromPublicDesktop
+                ? "dialog.store.public_message"
+                : "dialog.store.message",
+            {{L"file", FileDisplayName(sourcePath)},
+             {L"core", target.name}});
+        const std::wstring store = T("dialog.store.confirm");
+        const std::wstring cancel = T("dialog.store.cancel");
         const TASKDIALOG_BUTTON buttons[] = {
-            {IDYES, L"收纳"},
-            {IDCANCEL, L"取消"},
+            {IDYES, store.c_str()},
+            {IDCANCEL, cancel.c_str()},
         };
+        const std::wstring title = T("dialog.store.title");
+        const std::wstring footer = T(
+            fromPublicDesktop
+                ? "dialog.store.public_footer"
+                : "dialog.store.footer");
         TASKDIALOGCONFIG dialog{sizeof(dialog)};
         dialog.hwndParent = window_;
         dialog.dwFlags = TDF_ALLOW_DIALOG_CANCELLATION |
                          TDF_SIZE_TO_CONTENT;
-        dialog.pszWindowTitle = L"收纳到核心";
+        dialog.pszWindowTitle = title.c_str();
         dialog.pszContent = message.c_str();
-        dialog.pszFooter = fromPublicDesktop
-            ? L"公共桌面项目每次收纳都会再次确认。"
-            : L"确认后，连续收纳文件时10分钟内不再询问。";
+        dialog.pszFooter = footer.c_str();
         dialog.pszMainIcon = TD_WARNING_ICON;
         dialog.cButtons = static_cast<UINT>(
             sizeof(buttons) / sizeof(buttons[0]));
@@ -20854,7 +20862,7 @@ private:
             return pressed == IDYES;
         }
         return MessageBoxW(
-                   window_, message.c_str(), L"收纳到核心",
+                   window_, message.c_str(), title.c_str(),
                    MB_OKCANCEL | MB_ICONWARNING | MB_DEFBUTTON2) == IDOK;
     }
 
@@ -20977,26 +20985,30 @@ private:
                 ++publicDesktopCount;
             }
         }
-        const std::wstring message =
-            L"将这 " + std::to_wstring(itemIds.size()) +
-            L" 个已有桌面引用收纳到“" + core.name +
-            L"”？收纳成功后，它们会从 Windows 桌面移走，并保存在引力桌面文件库中。" +
-            (publicDesktopCount == 0
-                 ? L""
-                 : L"\n\n其中 " + std::to_wstring(publicDesktopCount) +
-                       L" 项来自公共桌面，其他 Windows 用户也将不再看到它们。");
+        std::wstring message = localization_.Format(
+            "dialog.store_batch.message",
+            {{L"count", std::to_wstring(itemIds.size())},
+             {L"core", core.name}});
+        if (publicDesktopCount != 0) {
+            message += L"\n\n" + localization_.Format(
+                "dialog.store_batch.public_suffix",
+                {{L"count", std::to_wstring(publicDesktopCount)}});
+        }
+        const std::wstring store = T("dialog.store.confirm");
+        const std::wstring cancel = T("dialog.store.cancel");
         const TASKDIALOG_BUTTON buttons[] = {
-            {IDYES, L"收纳"},
-            {IDCANCEL, L"取消"},
+            {IDYES, store.c_str()},
+            {IDCANCEL, cancel.c_str()},
         };
+        const std::wstring title = T("dialog.store_batch.title");
+        const std::wstring footer = T("dialog.store_batch.footer");
         TASKDIALOGCONFIG dialog{sizeof(dialog)};
         dialog.hwndParent = window_;
         dialog.dwFlags = TDF_ALLOW_DIALOG_CANCELLATION |
                          TDF_SIZE_TO_CONTENT;
-        dialog.pszWindowTitle = L"收纳已有桌面引用";
+        dialog.pszWindowTitle = title.c_str();
         dialog.pszContent = message.c_str();
-        dialog.pszFooter =
-            L"这些文件作为一个批次提交；任一项目失败时，整批回滚到操作前状态。";
+        dialog.pszFooter = footer.c_str();
         dialog.pszMainIcon = TD_WARNING_ICON;
         dialog.cButtons = static_cast<UINT>(
             sizeof(buttons) / sizeof(buttons[0]));
@@ -21016,7 +21028,7 @@ private:
             return pressed == IDYES;
         }
         return MessageBoxW(
-                   window_, message.c_str(), L"收纳已有桌面引用",
+                   window_, message.c_str(), title.c_str(),
                    MB_OKCANCEL | MB_ICONWARNING | MB_DEFBUTTON2) == IDOK;
     }
 
@@ -22104,23 +22116,20 @@ private:
             transaction.moves.push_back(std::move(move));
         }
 
-        const std::wstring warning = retainSystemCore
-            ? L"将清空“未分类”中的 " +
-                  std::to_wstring(referenceCount) + L" 个文件引用。\n\n" +
-                  L"其中 " + std::to_wstring(managedCount) +
-                  L" 个托管文件将还原到 Windows 桌面；"
-                  L"其他引用仅移除右侧节点。真实文件不会被删除。"
-            : L"将解散核心“" + source->name + L"”。\n\n" +
-                  L"其中 " + std::to_wstring(managedCount) +
-                  L" 个托管文件将还原到 Windows 桌面；"
-                  L"其他文件仅移除右侧引用。\n"
-                  L"真实文件不会被删除。";
+        const std::wstring warning = localization_.Format(
+            retainSystemCore
+                ? "dialog.dissolve.unclassified_message"
+                : "dialog.dissolve.message",
+            {{L"core", source->name},
+             {L"referenceCount", std::to_wstring(referenceCount)},
+             {L"managedCount", std::to_wstring(managedCount)}});
+        const std::wstring title = T(
+            retainSystemCore
+                ? "dialog.dissolve.unclassified_title"
+                : "dialog.dissolve.title");
         if (requireConfirmation &&
             MessageBoxW(
-                window_, warning.c_str(),
-                retainSystemCore
-                    ? L"还原未分类文件到桌面"
-                    : L"解散核心并还原文件到桌面",
+                window_, warning.c_str(), title.c_str(),
                 MB_OKCANCEL | MB_ICONINFORMATION | MB_DEFBUTTON2) != IDOK) {
             return;
         }
@@ -22246,13 +22255,10 @@ private:
                 return item.storageMode == FileStorageMode::Managed;
             });
         if (containsManagedFiles) {
-            const std::wstring warning =
-                L"此核心包含已收纳的真实文件。\n\n"
-                L"为保证文件始终有正常桌面入口，不能直接丢弃这些引用。\n"
-                L"选择“确定”将解散核心，并把全部托管文件还原到 Windows 桌面；\n"
-                L"选择“取消”则保留当前核心。";
+            const std::wstring warning = T("dialog.managed_protection.message");
             if (MessageBoxW(
-                    window_, warning.c_str(), L"托管文件保护",
+                    window_, warning.c_str(),
+                    T("dialog.managed_protection.title").c_str(),
                     MB_OKCANCEL | MB_ICONWARNING | MB_DEFBUTTON2) == IDOK) {
                 DissolveCore(id);
             } else {
@@ -22260,14 +22266,13 @@ private:
             }
             return;
         }
-        const std::wstring warning =
-            L"将从引力桌面中移除核心“" + source->name +
-            L"”及其中 " +
-            std::to_wstring(source->files.size()) +
-            L" 个文件引用。\n\n"
-            L"真实文件不会受到影响。";
+        const std::wstring warning = localization_.Format(
+            "dialog.delete_core.message",
+            {{L"core", source->name},
+             {L"count", std::to_wstring(source->files.size())}});
         if (MessageBoxW(
-                window_, warning.c_str(), L"移除核心及所有引用",
+                window_, warning.c_str(),
+                T("dialog.delete_core.title").c_str(),
                 MB_OKCANCEL | MB_ICONWARNING | MB_DEFBUTTON2) != IDOK) {
             return;
         }
