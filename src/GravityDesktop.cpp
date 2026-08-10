@@ -82,6 +82,8 @@ constexpr UINT_PTR kSaveTimer = 1;
 constexpr UINT_PTR kStatusTimer = 2;
 constexpr UINT_PTR kAnimationTimer = 3;
 constexpr UINT kCoreExpansionFrameIntervalMs = 33;
+constexpr auto kCoreDragCollisionFrameInterval =
+    std::chrono::milliseconds(16);
 constexpr UINT_PTR kMarqueeTimer = 4;
 constexpr UINT_PTR kRelationPreviewTimer = 5;
 constexpr UINT_PTR kReferenceCheckTimer = 6;
@@ -9151,6 +9153,23 @@ private:
             entry.labelRect.top += screenDeltaY;
             entry.labelRect.bottom += screenDeltaY;
         }
+    }
+
+    bool RefreshDraggedCoreCollisionsIfDue(
+        std::chrono::steady_clock::time_point now,
+        bool force = false) {
+        if (!force &&
+            now - coreDragCollisionRefreshedAt_ <
+                kCoreDragCollisionFrameInterval) {
+            return false;
+        }
+        // Fast cache translation keeps pointer tracking responsive. The
+        // bounded refresh restores live file-to-file and core-to-core
+        // collision response without rebuilding once per raw mouse packet.
+        layoutDirty_ = true;
+        StableLayouts();
+        coreDragCollisionRefreshedAt_ = now;
+        return true;
     }
 
     D2D1_RECT_F StableLabelRectangle(D2D1_POINT_2F screen,
@@ -18737,6 +18756,9 @@ private:
             }
             draggingCore_ = true;
             dragCoreId_ = hit.coreId;
+            coreDragCollisionRefreshedAt_ =
+                std::chrono::steady_clock::now() -
+                kCoreDragCollisionFrameInterval;
             if (Core* core = FindCore(hit.coreId)) {
                 // Start from the visible collision-resolved position. Using
                 // the persisted preference here caused a perceptible jump on
@@ -18823,10 +18845,8 @@ private:
         }
         const D2D1_POINT_2F world = ScreenToWorld(PixelToDip(x, y));
         if (draggingCore_ && dragMoved_) {
-            // Pointer moves translate only the active cluster cache. Run the
-            // expensive global collision resolver once, at commit time.
-            layoutDirty_ = true;
-            StableLayouts();
+            RefreshDraggedCoreCollisionsIfDue(
+                std::chrono::steady_clock::now(), true);
             // Drag completion is an explicit transaction. Commit the dragged
             // core and any hard-body displacement here, with the caller's
             // single undo snapshot, instead of writing model coordinates
@@ -19339,6 +19359,8 @@ private:
                         coreStartPosition_.y + world.y - pointerStartWorld_.y);
                     TranslateDraggedCoreCache(
                         *core, ClampDraggedCoreWorld(*core, requested));
+                    RefreshDraggedCoreCollisionsIfDue(
+                        std::chrono::steady_clock::now());
                 }
                 Invalidate();
             }
@@ -26139,6 +26161,8 @@ private:
     std::uint64_t relationTargetCoreId_ = 0;
     std::chrono::steady_clock::time_point relationHoverStarted_ =
         std::chrono::steady_clock::now();
+    std::chrono::steady_clock::time_point coreDragCollisionRefreshedAt_ =
+        std::chrono::steady_clock::now();
     D2D1_POINT_2F pointerStartDip_ = D2D1::Point2F();
     D2D1_POINT_2F workspaceChromePointerStartDip_ = D2D1::Point2F();
     D2D1_POINT_2F workspaceChromeDragLastDip_ = D2D1::Point2F();
@@ -26781,10 +26805,90 @@ bool RunSelfTest() {
         std::abs(movedEntry.labelRect.left - 137.5f) <= 0.01f &&
         std::abs(movedEntry.labelRect.top - 112.5f) <= 0.01f &&
         !dragTranslationApp.layoutDirty_;
+
+    GravityApp liveCollisionApp;
+    liveCollisionApp.AttachWindow(cacheVisual);
+    Core firstCollisionCore;
+    firstCollisionCore.id = 31;
+    firstCollisionCore.position = D2D1::Point2F(300.0f, 260.0f);
+    Core secondCollisionCore;
+    secondCollisionCore.id = 32;
+    secondCollisionCore.position = firstCollisionCore.position;
+    liveCollisionApp.state_.cores.push_back(firstCollisionCore);
+    liveCollisionApp.state_.cores.push_back(secondCollisionCore);
+    const auto collisionFrame = std::chrono::steady_clock::now();
+    liveCollisionApp.coreDragCollisionRefreshedAt_ =
+        collisionFrame - kCoreDragCollisionFrameInterval;
+    const bool collisionFrameRan =
+        liveCollisionApp.RefreshDraggedCoreCollisionsIfDue(collisionFrame);
+    const D2D1_POINT_2F firstCollisionPosition =
+        liveCollisionApp.DisplayCoreWorld(
+            liveCollisionApp.state_.cores[0]);
+    const D2D1_POINT_2F secondCollisionPosition =
+        liveCollisionApp.DisplayCoreWorld(
+            liveCollisionApp.state_.cores[1]);
+    const float resolvedCoreDistance = std::sqrt(
+        liveCollisionApp.DistanceSquared(
+            firstCollisionPosition, secondCollisionPosition));
+    const float requiredCoreDistance =
+        liveCollisionApp.metrics_.coreSize + 40.0f;
+    const bool collisionRefreshWasBoundedAndEffective =
+        collisionFrameRan &&
+        !liveCollisionApp.RefreshDraggedCoreCollisionsIfDue(
+            collisionFrame) &&
+        resolvedCoreDistance + 0.5f >= requiredCoreDistance;
+
+    GravityApp fileCollisionApp;
+    fileCollisionApp.AttachWindow(cacheVisual);
+    Core firstFileCore;
+    firstFileCore.id = 41;
+    firstFileCore.position = D2D1::Point2F(230.0f, 260.0f);
+    FileItem firstCollisionFile;
+    firstCollisionFile.id = 43;
+    firstCollisionFile.slot = GlobalSlot(1, 0);
+    firstCollisionFile.ring = 1;
+    firstCollisionFile.ringSlot = 0;
+    firstCollisionFile.angleDegrees = 0.0f;
+    firstFileCore.files.push_back(firstCollisionFile);
+    Core secondFileCore;
+    secondFileCore.id = 42;
+    secondFileCore.position = D2D1::Point2F(500.0f, 260.0f);
+    FileItem secondCollisionFile = firstCollisionFile;
+    secondCollisionFile.id = 44;
+    secondCollisionFile.angleDegrees = 180.0f;
+    secondFileCore.files.push_back(secondCollisionFile);
+    fileCollisionApp.state_.cores.push_back(firstFileCore);
+    fileCollisionApp.state_.cores.push_back(secondFileCore);
+    fileCollisionApp.RefreshDraggedCoreCollisionsIfDue(
+        std::chrono::steady_clock::now(), true);
+    const auto& fileCollisionLayouts =
+        fileCollisionApp.StableLayouts();
+    const auto firstFileLayout = fileCollisionLayouts.find(41);
+    const auto secondFileLayout = fileCollisionLayouts.find(42);
+    bool foreignFilesWereSeparated =
+        firstFileLayout != fileCollisionLayouts.end() &&
+        secondFileLayout != fileCollisionLayouts.end() &&
+        !firstFileLayout->second.empty() &&
+        !secondFileLayout->second.empty();
+    if (foreignFilesWereSeparated) {
+        const ItemLayout& firstEntry = firstFileLayout->second.front();
+        const ItemLayout& secondEntry = secondFileLayout->second.front();
+        const D2D1_RECT_F firstBounds = fileCollisionApp.StableFootprint(
+            fileCollisionApp.WorldToScreen(firstEntry.position),
+            firstEntry.item->sizeTier, 1.0f, firstEntry.showLabel);
+        const D2D1_RECT_F secondBounds = fileCollisionApp.StableFootprint(
+            fileCollisionApp.WorldToScreen(secondEntry.position),
+            secondEntry.item->sizeTier, 1.0f, secondEntry.showLabel);
+        foreignFilesWereSeparated = !fileCollisionApp.RectanglesIntersect(
+            fileCollisionApp.InflateRectangle(firstBounds, 6.0f),
+            fileCollisionApp.InflateRectangle(secondBounds, 6.0f));
+    }
     DestroyWindow(cacheVisual);
     if (!cacheWasPure ||
         !explicitCommitWasPersistent ||
-        !dragTranslationStayedRigid) {
+        !dragTranslationStayedRigid ||
+        !collisionRefreshWasBoundedAndEffective ||
+        !foreignFilesWereSeparated) {
         return false;
     }
 
