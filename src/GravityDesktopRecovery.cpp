@@ -26,8 +26,6 @@ constexpr wchar_t kRecoveryMutex[] =
     L"Local\\GravityDesktop.EmergencyRecovery.9D19E743";
 constexpr wchar_t kMainMutex[] =
     L"Local\\GravityDesktop.SingleInstance.9D19E743";
-constexpr wchar_t kTitle[] = L"引力桌面紧急恢复";
-
 struct ManagedEntry {
     std::uint64_t id = 0;
     std::wstring source;
@@ -450,46 +448,54 @@ std::string BuildJournal(const std::vector<std::tuple<ManagedEntry,
     return output.str();
 }
 
-std::wstring ResultText(const RecoveryResult& result) {
+std::wstring ResultText(const gravity::i18n::Localization& localization,
+                        const RecoveryResult& result) {
     std::wostringstream output;
-    output << (result.failed == 0 && result.conflicts == 0
-                   ? L"恢复完成"
-                   : L"恢复未完全完成")
-           << L"\n\n本次成功恢复：" << result.restored;
+    const auto format = [&localization](std::string_view key, int value) {
+        return localization.Format(
+            key, {{L"count", std::to_wstring(value)}});
+    };
+    output << localization.Text(
+                  result.failed == 0 && result.conflicts == 0
+                      ? "recovery.result.complete"
+                      : "recovery.result.incomplete")
+           << L"\n\n" << format("recovery.result.restored", result.restored);
     if (result.alreadyRestored > 0) {
-        output << L"\n此前已恢复：" << result.alreadyRestored;
+        output << L"\n" << format("recovery.result.already", result.alreadyRestored);
     }
-    output
-           << L"\n存在冲突：" << result.conflicts
-           << L"\n源文件缺失：" << result.missing
-           << L"\n恢复失败：" << result.failed;
+    output << L"\n" << format("recovery.result.conflicts", result.conflicts)
+           << L"\n" << format("recovery.result.missing", result.missing)
+           << L"\n" << format("recovery.result.failed", result.failed);
     return output.str();
 }
 
 bool RunRecovery(const std::filesystem::path& library, bool interactive,
+                 const gravity::i18n::Localization& localization,
                  RecoveryResult& result) {
     const std::filesystem::path manifest = library / L"恢复清单.json";
     std::vector<ManagedEntry> entries;
     if (!ReadManagedEntries(manifest, entries)) {
         if (interactive) {
-            MessageBoxW(nullptr,
-                        L"无法读取恢复清单。未移动任何文件。\n\n"
-                        L"请确认“引力桌面文件库”仍完整保留。",
-                        kTitle, MB_OK | MB_ICONERROR);
+            MessageBoxW(nullptr, localization.Text("recovery.manifest_error").c_str(),
+                        localization.Text("recovery.title").c_str(),
+                        MB_OK | MB_ICONERROR);
         }
         return false;
     }
     if (entries.empty()) {
         if (interactive) {
-            MessageBoxW(nullptr, L"没有发现需要恢复的托管文件。", kTitle,
+            MessageBoxW(nullptr, localization.Text("recovery.no_files").c_str(),
+                        localization.Text("recovery.title").c_str(),
                         MB_OK | MB_ICONINFORMATION);
         }
         return true;
     }
     const auto desktop = CurrentDesktopPath();
     if (!desktop) {
-        if (interactive) MessageBoxW(nullptr, L"无法读取当前 Windows 桌面路径。",
-                                     kTitle, MB_OK | MB_ICONERROR);
+        if (interactive) MessageBoxW(nullptr,
+                                     localization.Text("recovery.desktop_error").c_str(),
+                                     localization.Text("recovery.title").c_str(),
+                                     MB_OK | MB_ICONERROR);
         return false;
     }
     const std::filesystem::path journalPath = library / L"恢复事务.json";
@@ -507,17 +513,17 @@ bool RunRecovery(const std::filesystem::path& library, bool interactive,
     }
     if (pendingEntryCount == 0) {
         if (interactive) {
-            MessageBoxW(nullptr, L"所有已托管文件都已恢复到 Windows 桌面。", kTitle,
+            MessageBoxW(nullptr, localization.Text("recovery.already_restored").c_str(),
+                        localization.Text("recovery.title").c_str(),
                         MB_OK | MB_ICONINFORMATION);
         }
         return true;
     }
     if (interactive) {
-        const std::wstring prompt = L"发现 " + std::to_wstring(pendingEntryCount) +
-            L" 个由引力桌面托管的文件。\n\n"
-            L"是否将它们恢复到 Windows 桌面？\n"
-            L"核心关系记录会继续保留，以后可以重新导入。";
-        if (MessageBoxW(nullptr, prompt.c_str(), kTitle,
+        const std::wstring prompt = localization.Format(
+            "recovery.prompt", {{L"count", std::to_wstring(pendingEntryCount)}});
+        if (MessageBoxW(nullptr, prompt.c_str(),
+                        localization.Text("recovery.title").c_str(),
                         MB_OKCANCEL | MB_ICONWARNING | MB_DEFBUTTON2) != IDOK) {
             return true;
         }
@@ -568,8 +574,10 @@ bool RunRecovery(const std::filesystem::path& library, bool interactive,
     }
 
     if (!WriteUtf8Atomic(journalPath, BuildJournal(journal))) {
-        if (interactive) MessageBoxW(nullptr, L"无法写入恢复事务日志；未移动任何文件。",
-                                     kTitle, MB_OK | MB_ICONERROR);
+        if (interactive) MessageBoxW(nullptr,
+                                     localization.Text("recovery.journal_error").c_str(),
+                                     localization.Text("recovery.title").c_str(),
+                                     MB_OK | MB_ICONERROR);
         return false;
     }
     HideRecoveryMetadata(journalPath);
@@ -598,8 +606,10 @@ bool RunRecovery(const std::filesystem::path& library, bool interactive,
         std::chrono::system_clock::now());
     const std::filesystem::path report = library / L"恢复报告" /
         (L"恢复结果-" + std::to_wstring(static_cast<long long>(now)) + L".txt");
-    (void)WriteUtf8Atomic(report, WideToUtf8(ResultText(result)));
-    if (interactive) MessageBoxW(nullptr, ResultText(result).c_str(), kTitle,
+    const std::wstring summary = ResultText(localization, result);
+    (void)WriteUtf8Atomic(report, WideToUtf8(summary));
+    if (interactive) MessageBoxW(nullptr, summary.c_str(),
+                                 localization.Text("recovery.title").c_str(),
                                  MB_OK | MB_ICONINFORMATION);
     return true;
 }
@@ -657,6 +667,8 @@ int APIENTRY wWinMain(HINSTANCE, HINSTANCE, PWSTR commandLine, int) {
     }
     const HRESULT com = OleInitialize(nullptr);
     if (FAILED(com)) return 1;
+    gravity::i18n::Localization localization;
+    (void)localization.Load();
     HANDLE mutex = CreateMutexW(nullptr, FALSE, kRecoveryMutex);
     if (mutex == nullptr || GetLastError() == ERROR_ALREADY_EXISTS) {
         if (mutex != nullptr) CloseHandle(mutex);
@@ -667,15 +679,15 @@ int APIENTRY wWinMain(HINSTANCE, HINSTANCE, PWSTR commandLine, int) {
     if (main != nullptr) {
         CloseHandle(main);
         MessageBoxW(nullptr,
-                    L"引力桌面仍在运行。请先安全退出引力桌面，再执行紧急恢复。\n"
-                    L"未移动任何文件。",
-                    kTitle, MB_OK | MB_ICONWARNING);
+                    localization.Text("recovery.main_running").c_str(),
+                    localization.Text("recovery.title").c_str(),
+                    MB_OK | MB_ICONWARNING);
         CloseHandle(mutex);
         OleUninitialize();
         return 0;
     }
     RecoveryResult result;
-    (void)RunRecovery(RunningLibraryPath(), true, result);
+    (void)RunRecovery(RunningLibraryPath(), true, localization, result);
     CloseHandle(mutex);
     OleUninitialize();
     return 0;

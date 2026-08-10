@@ -248,6 +248,20 @@ std::unordered_map<std::string, std::wstring> BuiltInEnglish() {
         {"recovery.file_conflict", L"File conflict"},
         {"recovery.retry", L"Retry"},
         {"recovery.skip", L"Skip"},
+        {"recovery.manifest_error", L"The recovery manifest could not be read. No files were moved.\n\nMake sure the Gravity Desktop library is still intact."},
+        {"recovery.no_files", L"No managed files need to be restored."},
+        {"recovery.desktop_error", L"The current Windows Desktop location could not be read."},
+        {"recovery.already_restored", L"All managed files have already been restored to the Windows Desktop."},
+        {"recovery.prompt", L"Found {count} file(s) managed by Gravity Desktop.\n\nRestore them to the Windows Desktop?\nCore relationship records will be kept and can be imported again later."},
+        {"recovery.journal_error", L"The recovery transaction log could not be written. No files were moved."},
+        {"recovery.result.complete", L"Recovery complete"},
+        {"recovery.result.incomplete", L"Recovery incomplete"},
+        {"recovery.result.restored", L"Restored this time: {count}"},
+        {"recovery.result.already", L"Previously restored: {count}"},
+        {"recovery.result.conflicts", L"Conflicts: {count}"},
+        {"recovery.result.missing", L"Source files missing: {count}"},
+        {"recovery.result.failed", L"Restore failures: {count}"},
+        {"recovery.main_running", L"Gravity Desktop is still running. Exit it safely before emergency recovery.\nNo files were moved."},
     };
 }
 

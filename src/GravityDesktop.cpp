@@ -24991,6 +24991,11 @@ private:
             std::filesystem::path(CurrentExecutablePath()).parent_path() /
             L"GravityDesktopRecovery.exe";
         const std::filesystem::path durableRecovery = RecoveryToolPath();
+        const std::filesystem::path sourceLocales =
+            std::filesystem::path(CurrentExecutablePath()).parent_path() /
+            L"locales";
+        const std::filesystem::path durableLocales =
+            durableRecovery.parent_path() / L"locales";
         const std::filesystem::path packagedLibraryIcon =
             std::filesystem::path(CurrentExecutablePath()).parent_path() /
             L"GravityDesktopLibrary.ico";
@@ -25029,6 +25034,25 @@ private:
             }
         } else {
             AppendRuntimeDiagnostic("recovery_tool_source_missing");
+        }
+
+        // The durable recovery tool is intentionally independent from the
+        // main executable.  Copy only its two current language packs beside
+        // it, so it can still honor the user's language preference when the
+        // main application cannot start.
+        for (const wchar_t* locale : {L"en-US.json", L"zh-CN.json"}) {
+            const std::filesystem::path source = sourceLocales / locale;
+            const std::filesystem::path destination = durableLocales / locale;
+            if (!FilePathExists(source.wstring())) continue;
+            error.clear();
+            std::filesystem::create_directories(durableLocales, error);
+            if (error ||
+                CopyFileW(source.c_str(), destination.c_str(), FALSE) == FALSE) {
+                if (!FilePathExists(destination.wstring())) {
+                    AppendRuntimeDiagnostic("recovery_locale_copy_failed",
+                                            E_FAIL, GetLastError());
+                }
+            }
         }
 
         bool libraryIconAvailable =
