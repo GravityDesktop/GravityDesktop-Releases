@@ -11812,7 +11812,11 @@ private:
         // English navigation labels are materially longer than their Chinese
         // counterparts. Keep the content pane stable and widen only the
         // navigation rail when the selected language needs it.
-        return localization_.CurrentLocale() == L"en-US" ? 170 : 142;
+        return localization_.CurrentLocale() == L"en-US" ? 190 : 142;
+    }
+
+    int SettingsContentWidthDip() const {
+        return localization_.CurrentLocale() == L"en-US" ? 390 : 340;
     }
 
     void CreateSettingsFonts() {
@@ -12116,6 +12120,11 @@ private:
         while (HWND child = GetWindow(settingsContentWindow_, GW_CHILD)) {
             DestroyWindow(child);
         }
+        // Static controls have transparent backgrounds. Explicitly clear the
+        // old page before creating its replacement so wrapped text cannot
+        // remain visible beneath the new page.
+        RedrawWindow(settingsContentWindow_, nullptr, nullptr,
+            RDW_INVALIDATE | RDW_ERASE | RDW_UPDATENOW);
         settingsArchivedCoreIds_.clear();
     }
 
@@ -12126,10 +12135,12 @@ private:
             return;
         }
         ClearSettingsPageControls();
+        const bool english = localization_.CurrentLocale() == L"en-US";
+        const int contentWidth = SettingsContentWidthDip();
         const std::wstring pageTitle = SettingsPageName(settingsPage_);
         CreateSettingsHeading(
             settingsContentWindow_, pageTitle.c_str(),
-            16, 14, 320, 30);
+            16, 14, contentWidth, 30);
         switch (settingsPage_) {
         case SettingsPage::General: {
             const std::wstring languageTitle = T("settings.language");
@@ -12141,7 +12152,7 @@ private:
             CreateSettingsText(settingsContentWindow_, languageTitle.c_str(),
                 16, 54, 180, 22);
             CreateSettingsText(settingsContentWindow_, languageCurrent.c_str(),
-                16, 76, 330, 20);
+                16, 76, contentWidth, 20);
             const std::array<std::wstring, 7> languageOptions{{
                 T("settings.language.automatic_option"), L"简体中文", L"English",
                 T("settings.language.japanese_pending"),
@@ -12153,7 +12164,7 @@ private:
                 WS_CHILD | WS_VISIBLE | WS_TABSTOP | CBS_DROPDOWNLIST |
                     WS_VSCROLL,
                 SettingsDipToPixels(16), SettingsDipToPixels(104),
-                SettingsDipToPixels(330), SettingsDipToPixels(190),
+                SettingsDipToPixels(contentWidth), SettingsDipToPixels(190),
                 settingsContentWindow_, reinterpret_cast<HMENU>(
                     static_cast<UINT_PTR>(MenuLanguagePicker)),
                 GetModuleHandleW(nullptr), nullptr);
@@ -12171,12 +12182,12 @@ private:
                 SendMessageW(languagePicker, CB_SETCURSEL, selection, 0);
             }
             CreateSettingsText(settingsContentWindow_, followWindows.c_str(),
-                16, 136, 330, 20);
+                16, 136, contentWidth, 20);
 
             const std::wstring autoStartText = T("settings.autostart");
             HWND autoStart = CreateSettingsButton(
                 settingsContentWindow_, autoStartText.c_str(),
-                16, 172, 330, 28, MenuToggleAutoStart, BS_AUTOCHECKBOX);
+                16, 172, contentWidth, 28, MenuToggleAutoStart, BS_AUTOCHECKBOX);
             const AutoStartRegistrationStatus status =
                 ReadAutoStartRegistration();
             if (autoStart != nullptr) {
@@ -12193,7 +12204,7 @@ private:
                     ? T("settings.autostart.repair")
                     : T("settings.autostart.current_user");
             CreateSettingsText(settingsContentWindow_, autoStartDetail.c_str(),
-                16, 208, 340, 34);
+                16, 208, contentWidth, english ? 48 : 34);
             break;
         }
         case SettingsPage::Appearance: {
@@ -12205,9 +12216,11 @@ private:
                 {T("settings.density.standard"), MenuDensityStandard},
                 {T("settings.density.clear"), MenuDensityClear}}};
             for (int index = 0; index < 3; ++index) {
+                const int densityButtonWidth = english ? 118 : 82;
                 HWND button = CreateSettingsButton(
                     settingsContentWindow_, density[index].first.c_str(),
-                    16 + index * 92, 78, 82, 28, density[index].second);
+                    16 + index * (densityButtonWidth + 10), 78,
+                    densityButtonWidth, 28, density[index].second);
                 if (button != nullptr &&
                     static_cast<int>(state_.densityMode) == index) {
                     SendMessageW(button, BM_SETCHECK, BST_CHECKED, 0);
@@ -12222,8 +12235,10 @@ private:
                 {T("settings.animation.standard"), MenuAnimationStandard},
                 {T("settings.animation.soft"), MenuAnimationSoft}}};
             for (int index = 0; index < 4; ++index) {
+                const int animationButtonWidth = english ? 88 : 70;
                 CreateSettingsButton(settingsContentWindow_, animation[index].first.c_str(),
-                    16 + index * 78, 146, 70, 28, animation[index].second);
+                    16 + index * (animationButtonWidth + 8), 146,
+                    animationButtonWidth, 28, animation[index].second);
             }
             const std::wstring selectionTitle = T("settings.core_selection_effect");
             const std::wstring selectionRipple = T("settings.selection.ripple");
@@ -12231,20 +12246,30 @@ private:
             const std::wstring selectionStatic = T("settings.selection.static");
             CreateSettingsText(settingsContentWindow_, selectionTitle.c_str(),
                 16, 190, 180, 22);
-            CreateSettingsButton(settingsContentWindow_, selectionRipple.c_str(), 16, 214, 116, 28,
-                                 MenuCoreSelectionEffectRotate);
-            CreateSettingsButton(settingsContentWindow_, selectionOnce.c_str(), 140, 214, 142, 28,
-                                 MenuCoreSelectionEffectOnce);
-            CreateSettingsButton(settingsContentWindow_, selectionStatic.c_str(), 16, 250, 116, 28,
-                                 MenuCoreSelectionEffectStatic);
+            if (english) {
+                CreateSettingsButton(settingsContentWindow_, selectionRipple.c_str(),
+                    16, 214, contentWidth, 28, MenuCoreSelectionEffectRotate);
+                CreateSettingsButton(settingsContentWindow_, selectionOnce.c_str(),
+                    16, 250, contentWidth, 28, MenuCoreSelectionEffectOnce);
+                CreateSettingsButton(settingsContentWindow_, selectionStatic.c_str(),
+                    16, 286, contentWidth, 28, MenuCoreSelectionEffectStatic);
+            } else {
+                CreateSettingsButton(settingsContentWindow_, selectionRipple.c_str(), 16, 214, 116, 28,
+                                     MenuCoreSelectionEffectRotate);
+                CreateSettingsButton(settingsContentWindow_, selectionOnce.c_str(), 140, 214, 142, 28,
+                                     MenuCoreSelectionEffectOnce);
+                CreateSettingsButton(settingsContentWindow_, selectionStatic.c_str(), 16, 250, 116, 28,
+                                     MenuCoreSelectionEffectStatic);
+            }
             break;
         }
         case SettingsPage::Workspace: {
             const std::wstring resetDescription = T("settings.workspace.reset_view.description");
             const std::wstring resetLabel = T("settings.workspace.reset_view");
             CreateSettingsText(settingsContentWindow_, resetDescription.c_str(),
-                16, 56, 340, 40);
-            CreateSettingsButton(settingsContentWindow_, resetLabel.c_str(), 16, 108, 130, 30,
+                16, 56, contentWidth, english ? 60 : 40);
+            CreateSettingsButton(settingsContentWindow_, resetLabel.c_str(), 16,
+                                 english ? 128 : 108, english ? 190 : 130, 30,
                                  MenuResetView);
             break;
         }
@@ -12258,22 +12283,43 @@ private:
             const std::wstring exportBackup = T("settings.data.export_backup");
             const std::wstring restoreBackup = T("settings.data.restore_backup");
             const std::wstring saveNow = T("settings.data.save_now");
-            CreateSettingsText(settingsContentWindow_, layoutSnapshot.c_str(), 16, 54, 180, 22);
-            CreateSettingsText(settingsContentWindow_, layoutSnapshotDescription.c_str(),
-                16, 78, 340, 34);
-            CreateSettingsButton(settingsContentWindow_, exportLayout.c_str(), 16, 116, 154, 30,
-                                 MenuExportLayoutSnapshot);
-            CreateSettingsButton(settingsContentWindow_, restoreLayout.c_str(), 180, 116, 154, 30,
-                                 MenuImportLayoutSnapshot);
-            CreateSettingsText(settingsContentWindow_, fullBackup.c_str(), 16, 166, 220, 22);
-            CreateSettingsText(settingsContentWindow_, fullBackupDescription.c_str(),
-                16, 190, 340, 40);
-            CreateSettingsButton(settingsContentWindow_, exportBackup.c_str(), 16, 238, 154, 30,
-                                 MenuExportWorkspaceBackup);
-            CreateSettingsButton(settingsContentWindow_, restoreBackup.c_str(), 180, 238, 154, 30,
-                                 MenuImportWorkspaceBackup);
-            CreateSettingsButton(settingsContentWindow_, saveNow.c_str(), 16, 286, 154, 30,
-                                 MenuSaveNow);
+            if (english) {
+                CreateSettingsText(settingsContentWindow_, layoutSnapshot.c_str(),
+                    16, 54, contentWidth, 22);
+                CreateSettingsText(settingsContentWindow_, layoutSnapshotDescription.c_str(),
+                    16, 78, contentWidth, 54);
+                CreateSettingsButton(settingsContentWindow_, exportLayout.c_str(),
+                    16, 140, contentWidth, 30, MenuExportLayoutSnapshot);
+                CreateSettingsButton(settingsContentWindow_, restoreLayout.c_str(),
+                    16, 178, contentWidth, 30, MenuImportLayoutSnapshot);
+                CreateSettingsText(settingsContentWindow_, fullBackup.c_str(),
+                    16, 224, contentWidth, 22);
+                CreateSettingsText(settingsContentWindow_, fullBackupDescription.c_str(),
+                    16, 248, contentWidth, 70);
+                CreateSettingsButton(settingsContentWindow_, exportBackup.c_str(),
+                    16, 326, contentWidth, 30, MenuExportWorkspaceBackup);
+                CreateSettingsButton(settingsContentWindow_, restoreBackup.c_str(),
+                    16, 364, contentWidth, 30, MenuImportWorkspaceBackup);
+                CreateSettingsButton(settingsContentWindow_, saveNow.c_str(),
+                    16, 402, contentWidth, 30, MenuSaveNow);
+            } else {
+                CreateSettingsText(settingsContentWindow_, layoutSnapshot.c_str(), 16, 54, 180, 22);
+                CreateSettingsText(settingsContentWindow_, layoutSnapshotDescription.c_str(),
+                    16, 78, 340, 34);
+                CreateSettingsButton(settingsContentWindow_, exportLayout.c_str(), 16, 116, 154, 30,
+                                     MenuExportLayoutSnapshot);
+                CreateSettingsButton(settingsContentWindow_, restoreLayout.c_str(), 180, 116, 154, 30,
+                                     MenuImportLayoutSnapshot);
+                CreateSettingsText(settingsContentWindow_, fullBackup.c_str(), 16, 166, 220, 22);
+                CreateSettingsText(settingsContentWindow_, fullBackupDescription.c_str(),
+                    16, 190, 340, 40);
+                CreateSettingsButton(settingsContentWindow_, exportBackup.c_str(), 16, 238, 154, 30,
+                                     MenuExportWorkspaceBackup);
+                CreateSettingsButton(settingsContentWindow_, restoreBackup.c_str(), 180, 238, 154, 30,
+                                     MenuImportWorkspaceBackup);
+                CreateSettingsButton(settingsContentWindow_, saveNow.c_str(), 16, 286, 154, 30,
+                                     MenuSaveNow);
+            }
             break;
         }
         case SettingsPage::CoreManagement: {
@@ -12282,35 +12328,40 @@ private:
             const std::wstring checkReferences = T("settings.core.check_references");
             const std::wstring archivedCores = T("settings.core.restore_archived");
             const std::wstring restore = T("settings.core.restore");
-            CreateSettingsText(settingsContentWindow_, referenceCheck.c_str(), 16, 58, 220, 22);
+            CreateSettingsText(settingsContentWindow_, referenceCheck.c_str(), 16, 58, contentWidth, 22);
             CreateSettingsText(settingsContentWindow_, referenceCheckDescription.c_str(),
-                16, 82, 330, 24);
-            CreateSettingsButton(settingsContentWindow_, checkReferences.c_str(), 16, 112, 132, 30,
+                16, 82, contentWidth, english ? 54 : 24);
+            CreateSettingsButton(settingsContentWindow_, checkReferences.c_str(), 16,
+                                 english ? 144 : 112, english ? 210 : 132, 30,
                                  MenuRefreshReferences);
-            CreateSettingsText(settingsContentWindow_, archivedCores.c_str(), 16, 166, 220, 22);
+            const int archivedTop = english ? 194 : 166;
+            CreateSettingsText(settingsContentWindow_, archivedCores.c_str(),
+                16, archivedTop, contentWidth, 22);
             int row = 0;
             for (const Core& core : state_.cores) {
                 if (!core.archived || row >= 6) {
                     continue;
                 }
                 settingsArchivedCoreIds_.push_back(core.id);
-                const int top = 194 + row * 48;
+                const int top = archivedTop + 28 + row * (english ? 52 : 48);
                 CreateSettingsText(settingsContentWindow_, core.name.c_str(),
-                    16, top, 222, 22);
+                    16, top, english ? contentWidth - 94 : 222, 22);
                 const std::wstring detail = localization_.Format(
                     "settings.core.file_count",
                     {{L"count", std::to_wstring(core.files.size())}});
                 CreateSettingsText(settingsContentWindow_, detail.c_str(),
-                    16, top + 21, 180, 18);
+                    16, top + 21, english ? contentWidth - 94 : 180, 18);
                 CreateSettingsButton(settingsContentWindow_, restore.c_str(),
-                    258, top + 8, 72, 28,
+                    english ? contentWidth - 76 : 258, top + 8,
+                    english ? 76 : 72, 28,
                     kSettingsArchivedCoreCommandBase +
                         static_cast<UINT>(settingsArchivedCoreIds_.size() - 1));
                 ++row;
             }
             if (settingsArchivedCoreIds_.empty()) {
                 const std::wstring noArchived = T("settings.core.no_archived");
-                CreateSettingsText(settingsContentWindow_, noArchived.c_str(), 16, 198, 220, 24);
+                CreateSettingsText(settingsContentWindow_, noArchived.c_str(),
+                    16, archivedTop + 28, contentWidth, 24);
             }
             break;
         }
@@ -12318,8 +12369,9 @@ private:
             const std::wstring tutorialDescription = T("settings.help.tutorial.description");
             const std::wstring tutorial = T("settings.help.tutorial");
             CreateSettingsText(settingsContentWindow_, tutorialDescription.c_str(),
-                16, 56, 340, 40);
-            CreateSettingsButton(settingsContentWindow_, tutorial.c_str(), 16, 108, 160, 30,
+                16, 56, contentWidth, english ? 60 : 40);
+            CreateSettingsButton(settingsContentWindow_, tutorial.c_str(), 16,
+                                 english ? 128 : 108, english ? 220 : 160, 30,
                                  MenuTrayTutorial);
             break;
         }
@@ -12329,27 +12381,43 @@ private:
             const std::wstring reportDescription = T("settings.advanced.report.description");
             const std::wstring report = T("settings.advanced.report");
             CreateSettingsText(settingsContentWindow_, folderDescription.c_str(),
-                16, 56, 340, 40);
-            CreateSettingsButton(settingsContentWindow_, openFolder.c_str(), 16, 108, 180, 30,
+                16, 56, contentWidth, english ? 60 : 40);
+            CreateSettingsButton(settingsContentWindow_, openFolder.c_str(), 16,
+                                 english ? 126 : 108, english ? 250 : 180, 30,
                                  MenuOpenDataFolder);
             CreateSettingsText(settingsContentWindow_, reportDescription.c_str(),
-                16, 152, 340, 28);
-            CreateSettingsButton(settingsContentWindow_, report.c_str(), 16, 190, 150, 30,
+                16, english ? 172 : 152, contentWidth, english ? 50 : 28);
+            CreateSettingsButton(settingsContentWindow_, report.c_str(), 16,
+                                 english ? 230 : 190, english ? 210 : 150, 30,
                                  MenuGenerateDiagnosticReport);
             break;
         }
         }
         LayoutSettingsWindow();
-        InvalidateRect(settingsContentWindow_, nullptr, TRUE);
+        RedrawWindow(settingsContentWindow_, nullptr, nullptr,
+            RDW_INVALIDATE | RDW_ERASE | RDW_ALLCHILDREN | RDW_UPDATENOW);
     }
 
     int SettingsContentPreferredHeightPixels() const {
         int height = SettingsDipToPixels(340);
+        if (localization_.CurrentLocale() == L"en-US") {
+            switch (settingsPage_) {
+            case SettingsPage::General: height = SettingsDipToPixels(280); break;
+            case SettingsPage::Appearance: height = SettingsDipToPixels(338); break;
+            case SettingsPage::Workspace: height = SettingsDipToPixels(180); break;
+            case SettingsPage::Data: height = SettingsDipToPixels(448); break;
+            case SettingsPage::Help: height = SettingsDipToPixels(180); break;
+            case SettingsPage::Advanced: height = SettingsDipToPixels(280); break;
+            default: break;
+            }
+        }
         if (settingsPage_ == SettingsPage::CoreManagement) {
             const int archivedCount = static_cast<int>(std::count_if(
                 state_.cores.begin(), state_.cores.end(),
                 [](const Core& core) { return core.archived; }));
-            height = SettingsDipToPixels(230 + std::min(archivedCount, 6) * 48);
+            const int base = localization_.CurrentLocale() == L"en-US" ? 250 : 230;
+            const int rowHeight = localization_.CurrentLocale() == L"en-US" ? 52 : 48;
+            height = SettingsDipToPixels(base + std::min(archivedCount, 6) * rowHeight);
         }
         return height;
     }
@@ -12463,10 +12531,20 @@ private:
         RECT bounds{};
         GetWindowRect(settingsWindow_, &bounds);
         const int desiredWidth = SettingsDipToPixels(
-            localization_.CurrentLocale() == L"en-US" ? 560 : 520);
+            localization_.CurrentLocale() == L"en-US" ? 640 : 520);
         SetWindowPos(settingsWindow_, nullptr, bounds.left, bounds.top,
             desiredWidth, bounds.bottom - bounds.top,
             SWP_NOZORDER | SWP_NOACTIVATE);
+        if (settingsInstantPreviewWindow_ != nullptr &&
+            IsWindow(settingsInstantPreviewWindow_) != FALSE) {
+            const std::wstring instantPreview = T("settings.instant_preview");
+            SetWindowTextW(settingsInstantPreviewWindow_, instantPreview.c_str());
+            SetWindowPos(settingsInstantPreviewWindow_, nullptr,
+                SettingsDipToPixels(16), SettingsDipToPixels(304),
+                SettingsDipToPixels(localization_.CurrentLocale() == L"en-US"
+                    ? 166 : 120), SettingsDipToPixels(36),
+                SWP_NOZORDER | SWP_NOACTIVATE);
+        }
         LayoutSettingsWindow();
     }
 
@@ -12542,7 +12620,7 @@ private:
         }
         const UINT dpi = window_ != nullptr ? GetDpiForWindow(window_) : 96;
         const int width = MulDiv(
-            localization_.CurrentLocale() == L"en-US" ? 560 : 520,
+            localization_.CurrentLocale() == L"en-US" ? 640 : 520,
             static_cast<int>(dpi), 96);
         const int height = MulDiv(430, static_cast<int>(dpi), 96);
         POINT cursor{};
@@ -12589,8 +12667,9 @@ private:
                 kSettingsPageCommandBase + static_cast<UINT>(index));
         }
         const std::wstring instantPreview = T("settings.instant_preview");
-        CreateSettingsText(settingsWindow_, instantPreview.c_str(),
-            16, 304, 120, 36);
+        settingsInstantPreviewWindow_ = CreateSettingsText(settingsWindow_,
+            instantPreview.c_str(), 16, 304,
+            localization_.CurrentLocale() == L"en-US" ? 166 : 120, 36);
         LayoutSettingsWindow();
         RebuildSettingsWindow();
         ShowWindow(settingsWindow_, SW_SHOW);
@@ -12711,6 +12790,7 @@ private:
             }
             if (settingsWindow_ == source) {
                 settingsWindow_ = nullptr;
+                settingsInstantPreviewWindow_ = nullptr;
                 settingsRebuildPending_ = false;
                 DestroySettingsFonts();
             }
@@ -26848,6 +26928,7 @@ private:
     WorkspaceState coreShortLabelEditSnapshot_;
     HWND settingsWindow_ = nullptr;
     HWND settingsContentWindow_ = nullptr;
+    HWND settingsInstantPreviewWindow_ = nullptr;
     HFONT settingsFont_ = nullptr;
     HFONT settingsTitleFont_ = nullptr;
     HFONT settingsEmphasisFont_ = nullptr;
