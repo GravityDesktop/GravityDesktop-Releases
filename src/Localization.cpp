@@ -326,6 +326,7 @@ std::unordered_map<std::string, std::wstring> BuiltInEnglish() {
         {"toolbar.hide_to_tray", L"Hide to tray"},
         {"toolbar.fullscreen", L"Full-screen work mode"},
         {"toolbar.exit", L"Exit"},
+        {"core.default_name", L"File Core {index}"},
         {"tray.show", L"Show Gravity Desktop"},
         {"tray.hide", L"Hide Gravity Desktop"},
         {"tray.pause", L"Pause desktop interaction"},

@@ -1080,9 +1080,20 @@ struct CoreBaselineFileLayout {
     bool lockedPosition = false;
 };
 
+enum class CoreNameSource : int {
+    Custom = 0,
+    AutomaticDraft = 1,
+    AutomaticPermanent = 2,
+};
+
 struct Core {
     std::uint64_t id = 0;
     std::wstring name;
+    // coreSequence is assigned only after the first successful file attach.
+    // draftOrdinal distinguishes empty cores but may be reused after deletion.
+    std::uint64_t coreSequence = 0;
+    std::uint32_t draftOrdinal = 0;
+    CoreNameSource nameSource = CoreNameSource::Custom;
     // Optional user-owned visual identifier.  It is deliberately independent
     // from the core name, icon kind and all layout coordinates.
     std::wstring shortLabel;
@@ -1229,6 +1240,59 @@ std::wstring MigrateAutomaticCoreName(const std::wstring& name) {
     return std::wstring(kCurrentPrefix) + L" " + name.substr(index);
 }
 
+std::optional<std::uint64_t> AutomaticCoreSequenceFromName(
+    const std::wstring& name) {
+    // These are the automatic prefixes shipped by Gravity Desktop.  This is
+    // used only to migrate an older state that predates next_core_sequence.
+    // A user-created name that deliberately matches the pattern is treated as
+    // reserving that number, which is safer than generating a duplicate.
+    static constexpr std::array<std::wstring_view, 7> prefixes{
+        L"文件核心", L"新核心", L"File Core", L"ファイルコア",
+        L"Dateikern", L"Núcleo de archivos", L"Noyau de fichiers"};
+    for (const std::wstring_view prefix : prefixes) {
+        if (name.size() <= prefix.size() ||
+            name.compare(0, prefix.size(), prefix) != 0) {
+            continue;
+        }
+        std::size_t index = prefix.size();
+        while (index < name.size() && iswspace(name[index])) {
+            ++index;
+        }
+        if (index == name.size()) continue;
+        std::uint64_t value = 0;
+        for (; index < name.size(); ++index) {
+            const wchar_t character = name[index];
+            if (character < L'0' || character > L'9') {
+                value = 0;
+                break;
+            }
+            const std::uint64_t digit =
+                static_cast<std::uint64_t>(character - L'0');
+            if (value >
+                (std::numeric_limits<std::uint64_t>::max() - digit) / 10) {
+                value = 0;
+                break;
+            }
+            value = value * 10 + digit;
+        }
+        if (value != 0) return value;
+    }
+    return std::nullopt;
+}
+
+std::uint64_t InferNextCoreSequence(const std::vector<Core>& cores) {
+    std::uint64_t highest = 0;
+    for (const Core& core : cores) {
+        if (const auto sequence =
+                AutomaticCoreSequenceFromName(core.name)) {
+            highest = std::max(highest, *sequence);
+        }
+    }
+    return highest == std::numeric_limits<std::uint64_t>::max()
+        ? highest
+        : highest + 1;
+}
+
 bool CoreBodyVisible(const Core& core) {
     return core.id != kUnclassifiedCoreId ||
            AttachedFileCount(core) > 0;
@@ -1236,6 +1300,10 @@ bool CoreBodyVisible(const Core& core) {
 
 struct WorkspaceState {
     std::uint64_t nextId = 2;
+    // Human-facing automatic core names have their own monotonic sequence.
+    // It is intentionally independent from nextId because file/family IDs
+    // share that counter.  Deleted or undone core numbers are never reused.
+    std::uint64_t nextCoreSequence = 1;
     D2D1_POINT_2F viewOffset = D2D1::Point2F();
     float zoom = 1.0f;
     DensityMode densityMode = DensityMode::Standard;
@@ -2503,10 +2571,12 @@ std::string SerializeState(const WorkspaceState& state) {
     output.imbue(std::locale::classic());
     output << std::setprecision(9);
     output << "{\n"
-           << "  \"schemaVersion\": 16,\n"
-           << "  \"schema_version\": 16,\n"
-           << "  \"version\": 16,\n"
+           << "  \"schemaVersion\": 18,\n"
+           << "  \"schema_version\": 18,\n"
+           << "  \"version\": 18,\n"
            << "  \"next_id\": " << state.nextId << ",\n"
+           << "  \"next_core_sequence\": "
+           << state.nextCoreSequence << ",\n"
            << "  \"view\": {\"x\": " << state.viewOffset.x << ", \"y\": "
            << state.viewOffset.y << ", \"zoom\": " << state.zoom << "},\n"
            << "  \"settings\": {\"density\": "
@@ -2563,6 +2633,10 @@ std::string SerializeState(const WorkspaceState& state) {
     for (std::size_t coreIndex = 0; coreIndex < state.cores.size(); ++coreIndex) {
         const Core& core = state.cores[coreIndex];
         output << "    {\"id\": " << core.id << ", \"name\": " << EscapeJson(core.name)
+               << ", \"core_sequence\": " << core.coreSequence
+               << ", \"draft_ordinal\": " << core.draftOrdinal
+               << ", \"name_source\": "
+               << static_cast<int>(core.nameSource)
                << ", \"short_label\": " << EscapeJson(core.shortLabel)
                << ", \"x\": " << core.position.x << ", \"y\": " << core.position.y
                << ", \"expanded\": " << (core.expanded ? "true" : "false")
@@ -2961,6 +3035,10 @@ std::string SerializeRelationshipManifest(const WorkspaceState& state) {
         const Core& core = state.cores[coreIndex];
         output << "    {\"core_id\": " << core.id
                << ", \"core_name\": " << EscapeJson(core.name)
+               << ", \"core_sequence\": " << core.coreSequence
+               << ", \"draft_ordinal\": " << core.draftOrdinal
+               << ", \"name_source\": "
+               << static_cast<int>(core.nameSource)
                << ", \"archived\": "
                << (core.archived ? "true" : "false")
                << ", \"x_ratio\": " << core.xRatio
@@ -3012,6 +3090,9 @@ struct RelationshipRecoveryItem {
 struct RelationshipRecoveryCore {
     std::uint64_t stableId = 0;
     std::wstring name;
+    std::uint64_t coreSequence = 0;
+    std::uint32_t draftOrdinal = 0;
+    CoreNameSource nameSource = CoreNameSource::Custom;
     bool archived = false;
     float xRatio = -1.0f;
     float yRatio = -1.0f;
@@ -3099,6 +3180,14 @@ bool DeserializeRelationshipRecoveryManifest(
         core.stableId = static_cast<std::uint64_t>(
             NumberMember(*coreObject, "core_id", 0.0));
         core.name = StringMember(*coreObject, "core_name", L"");
+        core.coreSequence = static_cast<std::uint64_t>(std::max(
+            0.0, NumberMember(*coreObject, "core_sequence", 0.0)));
+        core.draftOrdinal = static_cast<std::uint32_t>(std::clamp(
+            NumberMember(*coreObject, "draft_ordinal", 0.0),
+            0.0, static_cast<double>(UINT32_MAX)));
+        core.nameSource = static_cast<CoreNameSource>(std::clamp(
+            static_cast<int>(NumberMember(
+                *coreObject, "name_source", 0.0)), 0, 2));
         core.archived = BoolMember(*coreObject, "archived", false);
         core.xRatio = static_cast<float>(NumberMember(
             *coreObject, "x_ratio", -1.0));
@@ -3269,6 +3358,9 @@ bool DeserializeState(const std::string& json, WorkspaceState& state,
     loaded.firstRunCompleted = documentVersion < 12;
     loaded.nextId = static_cast<std::uint64_t>(
         std::max(2.0, NumberMember(*root, "next_id", 2.0)));
+    loaded.nextCoreSequence = static_cast<std::uint64_t>(
+        std::max(1.0, NumberMember(
+            *root, "next_core_sequence", 1.0)));
     if (const JsonValue* viewValue = FindMember(*root, "view")) {
         if (const JsonValue::Object* view = viewValue->AsObject()) {
             loaded.viewOffset.x = static_cast<float>(NumberMember(*view, "x", 0.0));
@@ -3371,6 +3463,14 @@ bool DeserializeState(const std::string& json, WorkspaceState& state,
         ids.insert(core.id);
         maximumId = std::max(maximumId, core.id);
         core.name = StringMember(*object, "name", L"核心");
+        core.coreSequence = static_cast<std::uint64_t>(std::max(
+            0.0, NumberMember(*object, "core_sequence", 0.0)));
+        core.draftOrdinal = static_cast<std::uint32_t>(std::clamp(
+            NumberMember(*object, "draft_ordinal", 0.0),
+            0.0, static_cast<double>(UINT32_MAX)));
+        core.nameSource = static_cast<CoreNameSource>(std::clamp(
+            static_cast<int>(NumberMember(*object, "name_source", 0.0)),
+            0, 2));
         core.shortLabel = StringMember(*object, "short_label", L"");
         if (ValidateCoreShortLabel(core.shortLabel) !=
             CoreShortLabelValidation::Valid) {
@@ -3769,6 +3869,98 @@ bool DeserializeState(const std::string& json, WorkspaceState& state,
     }
 
     loaded.nextId = std::max(loaded.nextId, maximumId + 1);
+    loaded.nextCoreSequence = std::max(
+        loaded.nextCoreSequence,
+        InferNextCoreSequence(loaded.cores));
+    std::set<std::uint64_t> usedCoreSequences;
+    std::set<std::uint32_t> usedDraftOrdinals;
+    auto allocatePermanentSequence = [&]() {
+        loaded.nextCoreSequence = std::max<std::uint64_t>(
+            1, loaded.nextCoreSequence);
+        while (usedCoreSequences.contains(loaded.nextCoreSequence) &&
+               loaded.nextCoreSequence !=
+                   std::numeric_limits<std::uint64_t>::max()) {
+            ++loaded.nextCoreSequence;
+        }
+        const std::uint64_t result = loaded.nextCoreSequence;
+        usedCoreSequences.insert(result);
+        if (loaded.nextCoreSequence !=
+            std::numeric_limits<std::uint64_t>::max()) {
+            ++loaded.nextCoreSequence;
+        }
+        return result;
+    };
+    auto allocateDraftOrdinal = [&]() {
+        std::uint32_t ordinal = 1;
+        while (usedDraftOrdinals.contains(ordinal) &&
+               ordinal != UINT32_MAX) {
+            ++ordinal;
+        }
+        usedDraftOrdinals.insert(ordinal);
+        return ordinal;
+    };
+    if (documentVersion < 18 && automaticCoreNameMigrated != nullptr) {
+        *automaticCoreNameMigrated = true;
+    }
+    for (Core& core : loaded.cores) {
+        if (core.id == kUnclassifiedCoreId) {
+            core.coreSequence = 0;
+            core.draftOrdinal = 0;
+            core.nameSource = CoreNameSource::Custom;
+            continue;
+        }
+        if (documentVersion < 18) {
+            // Older states did not record whether an empty core had contained
+            // files in the past.  Preserve history conservatively: every
+            // existing old core is treated as activated once, while its
+            // custom name remains untouched.
+            const auto parsed = AutomaticCoreSequenceFromName(core.name);
+            if (parsed.has_value() &&
+                usedCoreSequences.insert(*parsed).second) {
+                core.coreSequence = *parsed;
+                core.nameSource = CoreNameSource::AutomaticPermanent;
+                loaded.nextCoreSequence = std::max(
+                    loaded.nextCoreSequence,
+                    *parsed == std::numeric_limits<std::uint64_t>::max()
+                        ? *parsed : *parsed + 1);
+            } else {
+                core.coreSequence = allocatePermanentSequence();
+                core.nameSource = CoreNameSource::Custom;
+            }
+            core.draftOrdinal = 0;
+            continue;
+        }
+        if (core.coreSequence != 0) {
+            if (!usedCoreSequences.insert(core.coreSequence).second) {
+                core.coreSequence = allocatePermanentSequence();
+            }
+            loaded.nextCoreSequence = std::max(
+                loaded.nextCoreSequence,
+                core.coreSequence ==
+                        std::numeric_limits<std::uint64_t>::max()
+                    ? core.coreSequence : core.coreSequence + 1);
+            core.draftOrdinal = 0;
+            if (core.nameSource == CoreNameSource::AutomaticDraft) {
+                core.nameSource = CoreNameSource::AutomaticPermanent;
+            }
+        } else if (!core.files.empty()) {
+            // A v18 state cannot leave a file-owning core in draft state.
+            // Repair only lifecycle metadata; file data and layout stay intact.
+            core.coreSequence = allocatePermanentSequence();
+            core.draftOrdinal = 0;
+            if (core.nameSource == CoreNameSource::AutomaticDraft) {
+                core.nameSource = CoreNameSource::AutomaticPermanent;
+            }
+        } else {
+            if (core.draftOrdinal == 0 ||
+                !usedDraftOrdinals.insert(core.draftOrdinal).second) {
+                core.draftOrdinal = allocateDraftOrdinal();
+            }
+            if (core.nameSource == CoreNameSource::AutomaticPermanent) {
+                core.nameSource = CoreNameSource::AutomaticDraft;
+            }
+        }
+    }
     auto unclassified = std::find_if(
         loaded.cores.begin(), loaded.cores.end(),
         [](const Core& core) { return core.id == kUnclassifiedCoreId; });
@@ -4675,6 +4867,9 @@ public:
                 Core core;
                 core.id = restored.nextId++;
                 core.name = source.name;
+                core.coreSequence = source.coreSequence;
+                core.draftOrdinal = source.draftOrdinal;
+                core.nameSource = source.nameSource;
                 core.archived = source.archived;
                 core.expanded = !core.archived;
                 core.themeColor = ChooseNewCoreColor(restored);
@@ -4753,6 +4948,19 @@ public:
                 }
             }
         }
+
+        restored.nextCoreSequence = InferNextCoreSequence(restored.cores);
+        for (Core& recoveredCore : restored.cores) {
+            if (recoveredCore.id != kUnclassifiedCoreId &&
+                recoveredCore.coreSequence == 0 &&
+                recoveredCore.nameSource != CoreNameSource::AutomaticDraft) {
+                // Old manifests did not carry lifecycle metadata.  Treat
+                // their existing cores as historical rather than recycling
+                // a number after disaster recovery.
+                (void)ActivateCoreIfNeeded(restored, recoveredCore.id);
+            }
+        }
+        NormalizeCoreLifecycleMetadata(restored);
 
         const RelationValidationResult validation =
             ValidateRelationState(restored);
@@ -5207,6 +5415,7 @@ public:
         fileImportantFormat_.Reset();
         fileNameFormat_.Reset();
         bodyFormat_.Reset();
+        coreNameFormat_.Reset();
         coreFormat_.Reset();
         hudFormat_.Reset();
         wicFactory_.Reset();
@@ -7832,6 +8041,21 @@ private:
         coreFormat_->SetWordWrapping(DWRITE_WORD_WRAPPING_NO_WRAP);
 
         result = writeFactory_->CreateTextFormat(
+            uiFont, nullptr, DWRITE_FONT_WEIGHT_SEMI_BOLD,
+            DWRITE_FONT_STYLE_NORMAL, DWRITE_FONT_STRETCH_NORMAL,
+            metrics_.coreFontSize, L"zh-CN",
+            coreNameFormat_.ReleaseAndGetAddressOf());
+        if (FAILED(result)) {
+            return result;
+        }
+        coreNameFormat_->SetTextAlignment(DWRITE_TEXT_ALIGNMENT_CENTER);
+        coreNameFormat_->SetParagraphAlignment(
+            DWRITE_PARAGRAPH_ALIGNMENT_CENTER);
+        // Localized core names can be much longer than the Chinese default.
+        // Use a second line instead of clipping their beginning and end.
+        coreNameFormat_->SetWordWrapping(DWRITE_WORD_WRAPPING_WRAP);
+
+        result = writeFactory_->CreateTextFormat(
             uiFont, nullptr, DWRITE_FONT_WEIGHT_NORMAL, DWRITE_FONT_STYLE_NORMAL,
             DWRITE_FONT_STRETCH_NORMAL, metrics_.helperFontSize, L"zh-CN",
             hudFormat_.ReleaseAndGetAddressOf());
@@ -9371,10 +9595,13 @@ private:
 
         const float coreHalfBase =
             metrics_.coreSize * state_.zoom / 2.0f;
+        // Reserve the same width used by CoreNameRectangle.  A localized
+        // title next to a workspace edge must remain fully visible.
         const float coreLabelHalf = std::max(
-            coreHalfBase + 8.0f, metrics_.labelWidth / 2.0f);
+            coreHalfBase + 8.0f,
+            std::max(metrics_.labelWidth, 164.0f) / 2.0f);
         const float coreBottom =
-            coreHalfBase + metrics_.coreFontSize + 18.0f;
+            coreHalfBase + metrics_.coreFontSize * 2.0f + 20.0f;
         const auto clampCore =
             [&client, coreLabelHalf, coreHalfBase,
              coreBottom](D2D1_POINT_2F point) {
@@ -10873,12 +11100,16 @@ private:
         const Core& core, D2D1_POINT_2F center,
         float coreRadius) const {
         (void)core;
+        // Keep product-facing core names independent from the narrower file
+        // label width.  This leaves enough room for French and Spanish while
+        // preserving the existing file-node density and hit targets.
+        const float titleWidth = std::max(metrics_.labelWidth, 164.0f);
         return D2D1::RectF(
-            center.x - metrics_.labelWidth / 2.0f,
+            center.x - titleWidth / 2.0f,
             center.y + coreRadius + 7.0f,
-            center.x + metrics_.labelWidth / 2.0f,
+            center.x + titleWidth / 2.0f,
             center.y + coreRadius +
-                metrics_.coreFontSize + 14.0f);
+                metrics_.coreFontSize * 2.0f + 16.0f);
     }
 
     void AddInteractionShape(
@@ -16481,11 +16712,10 @@ private:
                 brush_.Get());
         }
 
-        const std::wstring name = Shorten(core.name, 18);
         const D2D1_RECT_F nameRect =
             CoreNameRectangle(core, center, coreRadius);
         DrawDesktopText(
-            name, coreFormat_.Get(), nameRect,
+            core.name, coreNameFormat_.Get(), nameRect,
             (hovered || selected || focused) ? 1.0f : 0.92f,
             0xFCFCFC);
         if (externalDropCoreId_ == core.id &&
@@ -21899,6 +22129,7 @@ private:
         GenerateStableOffsets(item);
         AssignDroppedItemLayout(*candidateCore, item, dropWorld, 0);
         candidateCore->files.push_back(std::move(item));
+        (void)ActivateCoreIfNeeded(candidate, targetCoreId);
 
         if (parentId != 0) {
             FileItem* parent = nullptr;
@@ -22052,6 +22283,7 @@ private:
                 *target, item, dropWorld, 0);
             childId = item.id;
             target->files.push_back(std::move(item));
+            (void)ActivateCoreIfNeeded(state_, targetCoreId);
         } else {
             childId = existing->id;
         }
@@ -22287,6 +22519,7 @@ private:
         }
 
         if (added > 0 || moved > 0) {
+            (void)ActivateCoreIfNeeded(state_, targetId);
             bool upgradedCapacity = false;
             bool appliedRecommendation = false;
             if (Core* core = FindCore(targetId)) {
@@ -22393,13 +22626,157 @@ private:
         return 0;
     }
 
+    std::uint32_t NextDraftCoreOrdinal(
+        const WorkspaceState& state,
+        std::uint64_t excludedCoreId = 0) const {
+        std::uint32_t ordinal = 1;
+        for (;;) {
+            const std::wstring candidate = localization_.Format(
+                "core.default_name",
+                {{L"index", std::to_wstring(ordinal)}});
+            const bool alreadyVisible = std::any_of(
+                state.cores.begin(), state.cores.end(),
+                [&candidate, excludedCoreId](const Core& core) {
+                    return core.id != excludedCoreId && _wcsicmp(
+                        core.name.c_str(), candidate.c_str()) == 0;
+                });
+            if (!alreadyVisible || ordinal == UINT32_MAX) {
+                return ordinal;
+            }
+            ++ordinal;
+        }
+    }
+
+    bool ActivateCoreIfNeeded(
+        WorkspaceState& state, std::uint64_t coreId) const {
+        Core* core = FindCoreInState(state, coreId);
+        if (core == nullptr || core->id == kUnclassifiedCoreId ||
+            core->coreSequence != 0) {
+            return false;
+        }
+        std::set<std::uint64_t> used;
+        for (const Core& existing : state.cores) {
+            if (existing.coreSequence != 0) {
+                used.insert(existing.coreSequence);
+            }
+        }
+        state.nextCoreSequence = std::max<std::uint64_t>(
+            1, state.nextCoreSequence);
+        while (used.contains(state.nextCoreSequence) &&
+               state.nextCoreSequence !=
+                   std::numeric_limits<std::uint64_t>::max()) {
+            ++state.nextCoreSequence;
+        }
+        const std::uint64_t sequence = state.nextCoreSequence;
+        if (state.nextCoreSequence !=
+            std::numeric_limits<std::uint64_t>::max()) {
+            ++state.nextCoreSequence;
+        }
+        core->coreSequence = sequence;
+        core->draftOrdinal = 0;
+        if (core->nameSource == CoreNameSource::AutomaticDraft) {
+            core->name = localization_.Format(
+                "core.default_name",
+                {{L"index", std::to_wstring(sequence)}});
+            core->nameSource = CoreNameSource::AutomaticPermanent;
+        }
+        return true;
+    }
+
+    void NormalizeCoreLifecycleMetadata(
+        WorkspaceState& state) const {
+        std::set<std::uint64_t> usedSequences;
+        std::vector<std::uint64_t> mustReactivate;
+        for (Core& core : state.cores) {
+            if (core.id == kUnclassifiedCoreId) {
+                core.coreSequence = 0;
+                core.draftOrdinal = 0;
+                core.nameSource = CoreNameSource::Custom;
+                continue;
+            }
+            if (core.coreSequence == 0) continue;
+            if (!usedSequences.insert(core.coreSequence).second) {
+                const bool automatic =
+                    core.nameSource ==
+                    CoreNameSource::AutomaticPermanent;
+                core.coreSequence = 0;
+                core.draftOrdinal = 0;
+                core.nameSource = automatic
+                    ? CoreNameSource::AutomaticDraft
+                    : CoreNameSource::Custom;
+                mustReactivate.push_back(core.id);
+                continue;
+            }
+            state.nextCoreSequence = std::max(
+                state.nextCoreSequence,
+                core.coreSequence ==
+                        std::numeric_limits<std::uint64_t>::max()
+                    ? core.coreSequence : core.coreSequence + 1);
+        }
+        for (Core& core : state.cores) {
+            if (core.id != kUnclassifiedCoreId &&
+                core.coreSequence == 0 && !core.files.empty()) {
+                mustReactivate.push_back(core.id);
+            }
+        }
+        std::sort(mustReactivate.begin(), mustReactivate.end());
+        mustReactivate.erase(
+            std::unique(mustReactivate.begin(), mustReactivate.end()),
+            mustReactivate.end());
+        for (const std::uint64_t id : mustReactivate) {
+            (void)ActivateCoreIfNeeded(state, id);
+        }
+        for (Core& core : state.cores) {
+            if (core.id == kUnclassifiedCoreId ||
+                core.coreSequence != 0) {
+                core.draftOrdinal = 0;
+                continue;
+            }
+            const std::uint32_t ordinal = NextDraftCoreOrdinal(
+                state, core.id);
+            core.draftOrdinal = ordinal;
+            if (core.nameSource == CoreNameSource::AutomaticDraft) {
+                core.name = localization_.Format(
+                    "core.default_name",
+                    {{L"index", std::to_wstring(ordinal)}});
+            }
+        }
+    }
+
+    void PreserveCoreActivationHistory(
+        const WorkspaceState& current,
+        WorkspaceState& restored) const {
+        restored.nextCoreSequence = std::max(
+            restored.nextCoreSequence, current.nextCoreSequence);
+        for (const Core& currentCore : current.cores) {
+            if (currentCore.coreSequence == 0) continue;
+            Core* restoredCore = FindCoreInState(restored, currentCore.id);
+            if (restoredCore == nullptr || restoredCore->coreSequence != 0) {
+                continue;
+            }
+            restoredCore->coreSequence = currentCore.coreSequence;
+            restoredCore->draftOrdinal = 0;
+            if (restoredCore->nameSource ==
+                CoreNameSource::AutomaticDraft) {
+                restoredCore->name = localization_.Format(
+                    "core.default_name",
+                    {{L"index", std::to_wstring(
+                        currentCore.coreSequence)}});
+                restoredCore->nameSource =
+                    CoreNameSource::AutomaticPermanent;
+            }
+        }
+    }
+
     void CreateCore(D2D1_POINT_2F position, bool beginRename = true) {
         WorkspaceState before = state_;
         Core core;
         core.id = state_.nextId++;
+        core.draftOrdinal = NextDraftCoreOrdinal(state_);
+        core.nameSource = CoreNameSource::AutomaticDraft;
         core.name = localization_.Format(
             "core.default_name",
-            {{L"index", std::to_wstring(state_.cores.size())}});
+            {{L"index", std::to_wstring(core.draftOrdinal)}});
         core.position = position;
         const D2D1_SIZE_F workspace = ClientDipSize();
         const D2D1_POINT_2F screen = WorldToScreen(position);
@@ -22766,6 +23143,9 @@ private:
         bool requireExistingFiles = true) const {
         WorkspaceRestorePlan plan;
         plan.candidate = state_;
+        plan.candidate.nextCoreSequence = std::max(
+            plan.candidate.nextCoreSequence,
+            imported.nextCoreSequence);
         plan.existingReferencesKept = ReferenceCount(plan.candidate);
         (void)ApplyLayoutSnapshot(plan.candidate, imported);
 
@@ -22871,6 +23251,9 @@ private:
             &plan, &targetCoreIds, &allocateId](const Core& sourceCore) {
             Core continued = sourceCore;
             continued.id = allocateId();
+            continued.coreSequence = 0;
+            continued.draftOrdinal = 0;
+            continued.nameSource = CoreNameSource::Custom;
             continued.files.clear();
             continued.savedBaselineLayout.clear();
             const int sequence = static_cast<int>(
@@ -22965,6 +23348,8 @@ private:
                 ++plan.restoredReferences;
             }
         }
+
+        NormalizeCoreLifecycleMetadata(plan.candidate);
 
         const auto findTargetItem = [&plan](std::uint64_t id)
             -> std::pair<Core*, FileItem*> {
@@ -23656,6 +24041,7 @@ private:
             target->files.push_back(
                 std::move(item));
         }
+        (void)ActivateCoreIfNeeded(state_, targetId);
         target->expanded = true;
         RefreshAutomaticCoreIdentity(*source);
         RefreshAutomaticCoreIdentity(*target);
@@ -24453,6 +24839,7 @@ private:
                 const WorkspaceState before = state_;
                 const bool dirtyBefore = dirty_;
                 core->name = Shorten(value, 40);
+                core->nameSource = CoreNameSource::Custom;
                 core->iconKind = InferCoreIconKind(*core);
                 if (!core->themeColorCustomized) {
                     core->themeColor = DefaultCoreColor(core->iconKind);
@@ -24645,13 +25032,14 @@ private:
             return;
         }
         if (managedUndoAction_.has_value()) {
-            const WorkspaceState& restoredState = undoStack_.back();
+            WorkspaceState restoredState = undoStack_.back();
+            PreserveCoreActivationHistory(state_, restoredState);
             if (!UndoManagedFileOperations(
                     managedUndoAction_->reverseTransactions,
                     restoredState)) {
                 return;
             }
-            state_ = restoredState;
+            state_ = std::move(restoredState);
             undoStack_.pop_back();
             managedUndoAction_.reset();
             dirty_ = false;
@@ -24667,8 +25055,10 @@ private:
             Invalidate();
             return;
         }
+        const WorkspaceState currentState = state_;
         state_ = std::move(undoStack_.back());
         undoStack_.pop_back();
+        PreserveCoreActivationHistory(currentState, state_);
         ClearSelection();
         hover_ = {};
         ResetFocusImmediately();
@@ -26994,6 +27384,7 @@ private:
     ComPtr<IDWriteFactory> writeFactory_;
     ComPtr<IDWriteTextFormat> bodyFormat_;
     ComPtr<IDWriteTextFormat> coreFormat_;
+    ComPtr<IDWriteTextFormat> coreNameFormat_;
     ComPtr<IDWriteTextFormat> hudFormat_;
     ComPtr<IDWriteTextFormat> fileNameFormat_;
     ComPtr<IDWriteTextFormat> fileImportantFormat_;
@@ -27293,6 +27684,9 @@ bool RunSelfTest() {
         MigrateAutomaticCoreName(L"新核心 7") != L"文件核心 7" ||
         MigrateAutomaticCoreName(L"新核心设计") != L"新核心设计" ||
         MigrateAutomaticCoreName(L"文件核心 7") != L"文件核心 7" ||
+        AutomaticCoreSequenceFromName(L"文件核心 4") != 4 ||
+        AutomaticCoreSequenceFromName(L"File Core 9") != 9 ||
+        AutomaticCoreSequenceFromName(L"用户核心 12").has_value() ||
         MakeDisplayName(L"C:\\Desktop\\测试文件（引力桌面恢复 2）.txt", false)
                 .find(L"恢复") == std::wstring::npos ||
         !IsTransientDesktopArtifactName(
@@ -27422,6 +27816,98 @@ bool RunSelfTest() {
             createdColorCore.themeColor ||
         !restoredRandomColorState.cores.back().
             themeColorCustomized) {
+        return false;
+    }
+
+    GravityApp coreSequenceApp;
+    if (!coreSequenceApp.localization_.Load()) {
+        return false;
+    }
+    coreSequenceApp.state_.cores.push_back(unclassifiedColorCore);
+    coreSequenceApp.state_.nextId = 2;
+    coreSequenceApp.state_.nextCoreSequence = 5;
+    coreSequenceApp.CreateCore(
+        D2D1::Point2F(100.0f, 100.0f), false);
+    if (coreSequenceApp.state_.nextCoreSequence != 5 ||
+        coreSequenceApp.state_.cores.back().coreSequence != 0 ||
+        coreSequenceApp.state_.cores.back().draftOrdinal != 1 ||
+        coreSequenceApp.state_.cores.back().nameSource !=
+            CoreNameSource::AutomaticDraft) {
+        return false;
+    }
+    WorkspaceState restoredDraftState;
+    if (!DeserializeState(
+            SerializeState(coreSequenceApp.state_),
+            restoredDraftState) ||
+        restoredDraftState.nextCoreSequence != 5 ||
+        restoredDraftState.cores.back().coreSequence != 0 ||
+        restoredDraftState.cores.back().draftOrdinal != 1 ||
+        restoredDraftState.cores.back().nameSource !=
+            CoreNameSource::AutomaticDraft) {
+        return false;
+    }
+    const WorkspaceState draftSnapshot = coreSequenceApp.state_;
+    FileItem activationItem;
+    activationItem.id = coreSequenceApp.state_.nextId++;
+    activationItem.path = L"C:\\GravityDesktopSelfTest\\activate.txt";
+    coreSequenceApp.state_.cores.back().files.push_back(activationItem);
+    const std::uint64_t firstCoreId =
+        coreSequenceApp.state_.cores.back().id;
+    if (!coreSequenceApp.ActivateCoreIfNeeded(
+            coreSequenceApp.state_, firstCoreId) ||
+        coreSequenceApp.state_.nextCoreSequence != 6 ||
+        coreSequenceApp.state_.cores.back().coreSequence != 5 ||
+        !AutomaticCoreSequenceFromName(
+            coreSequenceApp.state_.cores.back().name).has_value() ||
+        *AutomaticCoreSequenceFromName(
+            coreSequenceApp.state_.cores.back().name) != 5) {
+        return false;
+    }
+    WorkspaceState undoneActivation = draftSnapshot;
+    coreSequenceApp.PreserveCoreActivationHistory(
+        coreSequenceApp.state_, undoneActivation);
+    if (undoneActivation.nextCoreSequence != 6 ||
+        undoneActivation.cores.back().coreSequence != 5 ||
+        undoneActivation.cores.back().nameSource !=
+            CoreNameSource::AutomaticPermanent) {
+        return false;
+    }
+    coreSequenceApp.state_.cores.back().files.clear();
+    coreSequenceApp.CreateCore(
+        D2D1::Point2F(120.0f, 120.0f), false);
+    const std::uint64_t secondCoreId =
+        coreSequenceApp.state_.cores.back().id;
+    activationItem.id = coreSequenceApp.state_.nextId++;
+    coreSequenceApp.state_.cores.back().files.push_back(activationItem);
+    if (!coreSequenceApp.ActivateCoreIfNeeded(
+            coreSequenceApp.state_, secondCoreId) ||
+        coreSequenceApp.state_.nextCoreSequence != 7 ||
+        !AutomaticCoreSequenceFromName(
+            coreSequenceApp.state_.cores.back().name).has_value() ||
+        *AutomaticCoreSequenceFromName(
+            coreSequenceApp.state_.cores.back().name) != 6) {
+        return false;
+    }
+    WorkspaceState restoredCoreSequenceState;
+    if (!DeserializeState(
+            SerializeState(coreSequenceApp.state_),
+            restoredCoreSequenceState) ||
+        restoredCoreSequenceState.nextCoreSequence != 7) {
+        return false;
+    }
+
+    GravityApp recycledDraftApp;
+    if (!recycledDraftApp.localization_.Load()) return false;
+    recycledDraftApp.state_.cores.push_back(unclassifiedColorCore);
+    recycledDraftApp.state_.nextCoreSequence = 12;
+    recycledDraftApp.CreateCore(
+        D2D1::Point2F(80.0f, 80.0f), false);
+    recycledDraftApp.state_.cores.pop_back();
+    recycledDraftApp.CreateCore(
+        D2D1::Point2F(90.0f, 90.0f), false);
+    if (recycledDraftApp.state_.nextCoreSequence != 12 ||
+        recycledDraftApp.state_.cores.back().draftOrdinal != 1 ||
+        recycledDraftApp.state_.cores.back().coreSequence != 0) {
         return false;
     }
 
