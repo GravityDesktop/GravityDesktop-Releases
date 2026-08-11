@@ -100,8 +100,10 @@ constexpr UINT_PTR kWorkspaceEnvironmentRefreshTimer = 15;
 constexpr UINT_PTR kRelationshipManifestRetryTimer = 16;
 constexpr UINT_PTR kWorkspaceChromeAutoHideTimer = 17;
 constexpr UINT_PTR kWorkspaceChromeRevealWatchTimer = 18;
+constexpr UINT_PTR kDesktopPointerRecoveryTimer = 19;
 constexpr UINT kWorkspaceChromeAutoHideDelayMs = 280;
 constexpr UINT kWorkspaceChromeRevealWatchIntervalMs = 100;
+constexpr UINT kDesktopPointerRecoveryIntervalMs = 125;
 constexpr std::array<UINT, 3> kSaveRetryDelaysMs{
     1000, 3000, 10000};
 constexpr std::array<UINT, 3> kRelationshipManifestRetryDelaysMs{
@@ -4388,6 +4390,9 @@ public:
             SetTimer(
                 lifecycleWindow_, kDesktopHostWatchTimer,
                 kDesktopHostWatchIntervalMs, nullptr);
+            SetTimer(
+                lifecycleWindow_, kDesktopPointerRecoveryTimer,
+                kDesktopPointerRecoveryIntervalMs, nullptr);
         }
     }
 
@@ -7143,6 +7148,10 @@ private:
     }
 
     void HandleDesktopLifecycleTimer(WPARAM timer) {
+        if (timer == kDesktopPointerRecoveryTimer) {
+            RefreshPointerStateAfterDesktopActivation();
+            return;
+        }
         if (timer == kWorkspaceEnvironmentRefreshTimer) {
             RefreshWorkspaceEnvironmentAfterSystemChange();
             return;
@@ -11483,8 +11492,7 @@ private:
             return;
         }
         POINT screenPoint{};
-        if (GetCursorPos(&screenPoint) == FALSE ||
-            !PointerCanRefreshDesktopCompanion(screenPoint)) {
+        if (GetCursorPos(&screenPoint) == FALSE) {
             return;
         }
 
@@ -11492,9 +11500,30 @@ private:
         if (ScreenToClient(window_, &visualPoint) == FALSE) {
             return;
         }
+        const D2D1_POINT_2F visualDip =
+            PixelToDip(visualPoint.x, visualPoint.y);
+        const bool dividerHovered =
+            ScreenPointInsideDividerTriangle(screenPoint);
         const bool chromeHovered = PointInside(
-            PixelToDip(visualPoint.x, visualPoint.y),
+            visualDip,
             WorkspaceChromeInteractionRectangle(ClientDipSize()));
+        const bool companionPointer =
+            PointerCanRefreshDesktopCompanion(screenPoint) ||
+            dividerHovered || chromeHovered;
+        if (!companionPointer) {
+            return;
+        }
+        // A desktop activation does not always generate a new mouse message
+        // for our transparent companion windows.  Re-present the existing
+        // island before asking Windows to refresh its cursor state.
+        EnsureInteractionWindowPresented();
+        if (!draggingDivider_ && dividerHovered_ != dividerHovered) {
+            dividerHovered_ = dividerHovered;
+            if (!dividerHovered_) {
+                HideDividerTooltip();
+            }
+            UpdateDividerHandleVisual();
+        }
         SetWorkspaceChromeHovered(chromeHovered);
 
         if (ScreenPointInsideInteractionIsland(screenPoint)) {
@@ -11809,14 +11838,17 @@ private:
     }
 
     int SettingsNavigationWidthDip() const {
-        // English navigation labels are materially longer than their Chinese
-        // counterparts. Keep the content pane stable and widen only the
-        // navigation rail when the selected language needs it.
-        return localization_.CurrentLocale() == L"en-US" ? 190 : 142;
+        // Keep this rail fixed for every supported and planned language.
+        // Resizing it during a language switch leaves native owner-drawn
+        // buttons at their former dimensions until the next full rebuild.
+        return 190;
     }
 
     int SettingsContentWidthDip() const {
-        return localization_.CurrentLocale() == L"en-US" ? 390 : 340;
+        // Reserve the content width for the longest planned language.  A
+        // stable settings frame prevents controls from crossing the
+        // navigation boundary when the locale changes at runtime.
+        return 390;
     }
 
     void CreateSettingsFonts() {
@@ -12466,6 +12498,31 @@ private:
             SWP_NOZORDER | SWP_NOACTIVATE);
     }
 
+    void LayoutSettingsNavigation() {
+        if (settingsWindow_ == nullptr ||
+            IsWindow(settingsWindow_) == FALSE) {
+            return;
+        }
+        const int x = SettingsDipToPixels(12);
+        const int width = SettingsDipToPixels(
+            SettingsNavigationWidthDip() - 16);
+        const int height = SettingsDipToPixels(30);
+        for (int index = 0; index < 7; ++index) {
+            if (HWND control = GetDlgItem(
+                    settingsWindow_,
+                    kSettingsPageCommandBase +
+                        static_cast<UINT>(index));
+                control != nullptr) {
+                SetWindowPos(
+                    control, nullptr, x,
+                    SettingsDipToPixels(14 + index * 38),
+                    width, height,
+                    SWP_NOZORDER | SWP_NOACTIVATE);
+                InvalidateRect(control, nullptr, TRUE);
+            }
+        }
+    }
+
     void QueueSettingsWindowRebuild() {
         if (settingsRebuildPending_ || settingsWindow_ == nullptr ||
             IsWindow(settingsWindow_) == FALSE) {
@@ -12530,8 +12587,7 @@ private:
         }
         RECT bounds{};
         GetWindowRect(settingsWindow_, &bounds);
-        const int desiredWidth = SettingsDipToPixels(
-            localization_.CurrentLocale() == L"en-US" ? 640 : 520);
+        const int desiredWidth = SettingsDipToPixels(640);
         SetWindowPos(settingsWindow_, nullptr, bounds.left, bounds.top,
             desiredWidth, bounds.bottom - bounds.top,
             SWP_NOZORDER | SWP_NOACTIVATE);
@@ -12541,11 +12597,13 @@ private:
             SetWindowTextW(settingsInstantPreviewWindow_, instantPreview.c_str());
             SetWindowPos(settingsInstantPreviewWindow_, nullptr,
                 SettingsDipToPixels(16), SettingsDipToPixels(304),
-                SettingsDipToPixels(localization_.CurrentLocale() == L"en-US"
-                    ? 166 : 120), SettingsDipToPixels(36),
+                SettingsDipToPixels(166), SettingsDipToPixels(36),
                 SWP_NOZORDER | SWP_NOACTIVATE);
         }
+        LayoutSettingsNavigation();
         LayoutSettingsWindow();
+        RedrawWindow(settingsWindow_, nullptr, nullptr,
+            RDW_INVALIDATE | RDW_ERASE | RDW_ALLCHILDREN | RDW_UPDATENOW);
     }
 
     void RefreshTrayIconLanguage() {
@@ -12619,9 +12677,7 @@ private:
             return;
         }
         const UINT dpi = window_ != nullptr ? GetDpiForWindow(window_) : 96;
-        const int width = MulDiv(
-            localization_.CurrentLocale() == L"en-US" ? 640 : 520,
-            static_cast<int>(dpi), 96);
+        const int width = MulDiv(640, static_cast<int>(dpi), 96);
         const int height = MulDiv(430, static_cast<int>(dpi), 96);
         POINT cursor{};
         GetCursorPos(&cursor);
@@ -12669,7 +12725,8 @@ private:
         const std::wstring instantPreview = T("settings.instant_preview");
         settingsInstantPreviewWindow_ = CreateSettingsText(settingsWindow_,
             instantPreview.c_str(), 16, 304,
-            localization_.CurrentLocale() == L"en-US" ? 166 : 120, 36);
+            166, 36);
+        LayoutSettingsNavigation();
         LayoutSettingsWindow();
         RebuildSettingsWindow();
         ShowWindow(settingsWindow_, SW_SHOW);
@@ -26322,6 +26379,20 @@ private:
             SWP_NOACTIVATE |
             SWP_SHOWWINDOW);
         UpdateDividerHandleHitRegion();
+        // Do not trust the last WM_MOUSELEAVE after returning from a full
+        // screen application.  It may belong to a window which Explorer hid
+        // without delivering the leave notification.
+        if (!draggingDivider_) {
+            POINT cursor{};
+            const bool hover = GetCursorPos(&cursor) != FALSE &&
+                ScreenPointInsideDividerTriangle(cursor);
+            if (dividerHovered_ != hover) {
+                dividerHovered_ = hover;
+                if (!hover) {
+                    HideDividerTooltip();
+                }
+            }
+        }
         UpdateDividerHandleVisual();
         UpdateDividerTooltipRectangle();
     }
