@@ -190,6 +190,7 @@ constexpr UINT kRefreshInteractionLayerMessage = WM_APP + 4;
 constexpr UINT kCommitCoreShortLabelMessage = WM_APP + 5;
 constexpr UINT kPreviewCoreShortLabelMessage = WM_APP + 6;
 constexpr UINT kDesktopFailOpenMessage = WM_APP + 7;
+constexpr UINT kDeferredSettingsRebuildMessage = WM_APP + 8;
 constexpr UINT kTrayIconId = 1;
 constexpr wchar_t kAutoStartRegistrySubkey[] =
     L"Software\\Microsoft\\Windows\\CurrentVersion\\Run";
@@ -413,6 +414,7 @@ enum MenuCommand : UINT {
     MenuLanguageAutomatic,
     MenuLanguageChinese,
     MenuLanguageEnglish,
+    MenuLanguagePicker,
     MenuOpenDataFolder,
     MenuGenerateDiagnosticReport,
     MenuAdjustCoreDistance,
@@ -457,19 +459,19 @@ enum MenuCommand : UINT {
 struct CoreColorPreset {
     UINT command;
     UINT32 color;
-    const wchar_t* name;
+    const char* localizationKey;
 };
 
 constexpr std::array<CoreColorPreset, 9> kCoreColorPresets{{
-    {MenuSetCoreColorRed,    0xC8545E, L"红"},
-    {MenuSetCoreColorOrange, 0xD68A2C, L"橙"},
-    {MenuSetCoreColorYellow, 0xB99A27, L"黄"},
-    {MenuSetCoreColorGreen,  0x46966B, L"绿"},
-    {MenuSetCoreColorCyan,   0x2C9BA8, L"青"},
-    {MenuSetCoreColorBlue,   0x3978D3, L"蓝"},
-    {MenuSetCoreColorPurple, 0x7E69DA, L"紫"},
-    {MenuSetCoreColorPink,   0xD86A9E, L"粉"},
-    {MenuSetCoreColorGray,   0x778392, L"灰"},
+    {MenuSetCoreColorRed,    0xC8545E, "color.red"},
+    {MenuSetCoreColorOrange, 0xD68A2C, "color.orange"},
+    {MenuSetCoreColorYellow, 0xB99A27, "color.yellow"},
+    {MenuSetCoreColorGreen,  0x46966B, "color.green"},
+    {MenuSetCoreColorCyan,   0x2C9BA8, "color.cyan"},
+    {MenuSetCoreColorBlue,   0x3978D3, "color.blue"},
+    {MenuSetCoreColorPurple, 0x7E69DA, "color.purple"},
+    {MenuSetCoreColorPink,   0xD86A9E, "color.pink"},
+    {MenuSetCoreColorGray,   0x778392, "color.gray"},
 }};
 
 // The recommended range protects label boxes.  Manual distance adjustments
@@ -11255,30 +11257,39 @@ private:
         return state_.workspaceChromeOrientation == 1;
     }
 
+    bool WorkspaceChromeUsesCompactLabels(
+        const D2D1_SIZE_F& client) const {
+        // English labels need materially more horizontal space than Chinese.
+        // Enter compact mode before the strip has to overlap adjacent labels.
+        const float threshold = localization_.CurrentLocale() == L"en-US"
+            ? 860.0f : 700.0f;
+        return client.width < threshold;
+    }
+
     D2D1_RECT_F WorkspaceChromeGroupRectangle(
         const D2D1_SIZE_F& client) const {
         static constexpr std::array<float, kWorkspaceControlCount> regularWidths{
             34.0f, 102.0f, 66.0f, 104.0f,
             68.0f, 92.0f, 112.0f, 52.0f};
         static constexpr std::array<float, kWorkspaceControlCount> compactWidths{
-            34.0f, 46.0f, 54.0f, 58.0f,
-            54.0f, 54.0f, 62.0f, 46.0f};
+            34.0f, 74.0f, 52.0f, 76.0f,
+            68.0f, 52.0f, 86.0f, 42.0f};
         static constexpr std::array<float, kWorkspaceControlCount> englishWidths{
             34.0f, 112.0f, 66.0f, 116.0f,
             72.0f, 108.0f, 172.0f, 52.0f};
         const auto& widths =
-            client.width < 680.0f
+            WorkspaceChromeUsesCompactLabels(client)
                 ? compactWidths
                 : (localization_.CurrentLocale() == L"en-US"
                     ? englishWidths : regularWidths);
-        constexpr float gap = 2.0f;
+        constexpr float gap = 6.0f;
         float horizontalWidth = 40.0f + gap * (kWorkspaceControlCount - 1);
         for (const float width : widths) {
             horizontalWidth += width;
         }
         const bool vertical = WorkspaceChromeIsVertical();
         const float groupWidth = vertical
-            ? (client.width < 680.0f ? 108.0f :
+            ? (WorkspaceChromeUsesCompactLabels(client) ? 108.0f :
                 (localization_.CurrentLocale() == L"en-US" ? 196.0f : 164.0f))
             : horizontalWidth;
         const float groupHeight = vertical
@@ -11319,15 +11330,15 @@ private:
             34.0f, 102.0f, 66.0f, 104.0f,
             68.0f, 92.0f, 112.0f, 52.0f};
         static constexpr std::array<float, kWorkspaceControlCount> compactWidths{
-            34.0f, 46.0f, 54.0f, 58.0f,
-            54.0f, 54.0f, 62.0f, 46.0f};
+            34.0f, 74.0f, 52.0f, 76.0f,
+            68.0f, 52.0f, 86.0f, 42.0f};
         static constexpr std::array<float, kWorkspaceControlCount> englishWidths{
             34.0f, 112.0f, 66.0f, 116.0f,
             72.0f, 108.0f, 172.0f, 52.0f};
-        const auto& widths = client.width < 680.0f ? compactWidths :
+        const auto& widths = WorkspaceChromeUsesCompactLabels(client) ? compactWidths :
             (localization_.CurrentLocale() == L"en-US"
                 ? englishWidths : regularWidths);
-        constexpr float gap = 2.0f;
+        constexpr float gap = 6.0f;
         const int safeIndex = std::clamp(index, 0, kWorkspaceControlCount - 1);
         const D2D1_RECT_F group = WorkspaceChromeGroupRectangle(client);
         if (WorkspaceChromeIsVertical()) {
@@ -11619,10 +11630,11 @@ private:
                 brush_.Get(), 1.0f);
         }
 
-        const bool compact = client.width < 680.0f;
+        const bool compact = WorkspaceChromeUsesCompactLabels(client);
         const std::array<std::wstring, kWorkspaceControlCount> labels{
             L"",
-            compact ? L"＋" : L"＋ " + T("toolbar.create_core"),
+            compact ? L"＋ " + T("toolbar.create_core.short")
+                    : L"＋ " + T("toolbar.create_core"),
             T("toolbar.undo"),
             compact ? T("toolbar.organize.short")
                     : T("toolbar.organize") + L" ▾",
@@ -11695,10 +11707,13 @@ private:
                     D2D1::Point2F(cx, cy + 8.5f),
                     brush_.Get(), 1.4f);
             } else {
+                const D2D1_RECT_F textBounds = D2D1::RectF(
+                    button.left + 5.0f, button.top,
+                    button.right - 5.0f, button.bottom);
                 renderTarget_->DrawTextW(
                     labels[index].c_str(),
                     static_cast<UINT32>(labels[index].size()),
-                    hudFormat_.Get(), button, brush_.Get(),
+                    hudFormat_.Get(), textBounds, brush_.Get(),
                     D2D1_DRAW_TEXT_OPTIONS_CLIP);
             }
         }
@@ -12077,18 +12092,39 @@ private:
                 "settings.language.current",
                 {{L"language", gravity::i18n::Localization::DisplayName(
                     localization_.CurrentLocale())}});
-            const std::wstring automatic = T("settings.language.automatic");
             const std::wstring followWindows = T("settings.language.follow_windows");
             CreateSettingsText(settingsContentWindow_, languageTitle.c_str(),
                 16, 54, 180, 22);
             CreateSettingsText(settingsContentWindow_, languageCurrent.c_str(),
                 16, 76, 330, 20);
-            CreateSettingsButton(settingsContentWindow_, automatic.c_str(),
-                16, 104, 108, 28, MenuLanguageAutomatic);
-            CreateSettingsButton(settingsContentWindow_, L"简体中文",
-                132, 104, 100, 28, MenuLanguageChinese);
-            CreateSettingsButton(settingsContentWindow_, L"English",
-                240, 104, 94, 28, MenuLanguageEnglish);
+            const std::array<std::wstring, 7> languageOptions{{
+                T("settings.language.automatic_option"), L"简体中文", L"English",
+                T("settings.language.japanese_pending"),
+                T("settings.language.german_pending"),
+                T("settings.language.spanish_pending"),
+                T("settings.language.french_pending")}};
+            HWND languagePicker = CreateWindowExW(
+                0, L"COMBOBOX", L"",
+                WS_CHILD | WS_VISIBLE | WS_TABSTOP | CBS_DROPDOWNLIST |
+                    WS_VSCROLL,
+                SettingsDipToPixels(16), SettingsDipToPixels(104),
+                SettingsDipToPixels(330), SettingsDipToPixels(190),
+                settingsContentWindow_, reinterpret_cast<HMENU>(
+                    static_cast<UINT_PTR>(MenuLanguagePicker)),
+                GetModuleHandleW(nullptr), nullptr);
+            if (languagePicker != nullptr) {
+                ApplySettingsControlFont(languagePicker);
+                for (const std::wstring& option : languageOptions) {
+                    SendMessageW(languagePicker, CB_ADDSTRING, 0,
+                        reinterpret_cast<LPARAM>(option.c_str()));
+                }
+                int selection = 0;
+                if (localization_.GetPreferences().languageMode ==
+                    gravity::i18n::LanguageMode::Explicit) {
+                    selection = localization_.CurrentLocale() == L"zh-CN" ? 1 : 2;
+                }
+                SendMessageW(languagePicker, CB_SETCURSEL, selection, 0);
+            }
             CreateSettingsText(settingsContentWindow_, followWindows.c_str(),
                 16, 136, 330, 20);
 
@@ -12317,11 +12353,23 @@ private:
             SWP_NOZORDER | SWP_NOACTIVATE);
     }
 
+    void QueueSettingsWindowRebuild() {
+        if (settingsRebuildPending_ || settingsWindow_ == nullptr ||
+            IsWindow(settingsWindow_) == FALSE) {
+            return;
+        }
+        settingsRebuildPending_ = true;
+        if (PostMessageW(settingsWindow_, kDeferredSettingsRebuildMessage,
+                         0, 0) == FALSE) {
+            settingsRebuildPending_ = false;
+            RebuildSettingsWindow();
+        }
+    }
+
     void SelectSettingsPage(SettingsPage page) {
         settingsPage_ = page;
         settingsContentScrollPixels_ = 0;
-        RebuildSettingsWindow();
-        InvalidateRect(settingsWindow_, nullptr, TRUE);
+        QueueSettingsWindowRebuild();
     }
 
     void SetApplicationLanguage(gravity::i18n::LanguageMode mode,
@@ -12344,7 +12392,7 @@ private:
         RefreshSettingsWindowLanguage();
         RefreshTrayIconLanguage();
         RefreshDividerTooltipLanguage();
-        RebuildSettingsWindow();
+        QueueSettingsWindowRebuild();
         Invalidate();
     }
 
@@ -12522,8 +12570,37 @@ private:
                 return TRUE;
             }
             return FALSE;
+        case kDeferredSettingsRebuildMessage:
+            settingsRebuildPending_ = false;
+            RebuildSettingsWindow();
+            return 0;
         case WM_COMMAND: {
             const UINT command = LOWORD(wParam);
+            if (command == MenuLanguagePicker &&
+                HIWORD(wParam) == CBN_SELCHANGE) {
+                const int selection = static_cast<int>(SendMessageW(
+                    reinterpret_cast<HWND>(lParam), CB_GETCURSEL, 0, 0));
+                if (selection == 0) {
+                    SetApplicationLanguage(
+                        gravity::i18n::LanguageMode::Automatic);
+                } else if (selection == 1) {
+                    SetApplicationLanguage(
+                        gravity::i18n::LanguageMode::Explicit, L"zh-CN");
+                } else if (selection == 2) {
+                    SetApplicationLanguage(
+                        gravity::i18n::LanguageMode::Explicit, L"en-US");
+                } else {
+                    SetStatus(T("settings.language.unavailable"));
+                    const int current =
+                        localization_.GetPreferences().languageMode ==
+                                gravity::i18n::LanguageMode::Automatic
+                            ? 0
+                            : (localization_.CurrentLocale() == L"zh-CN" ? 1 : 2);
+                    SendMessageW(reinterpret_cast<HWND>(lParam), CB_SETCURSEL,
+                                 current, 0);
+                }
+                return 0;
+            }
             if (command >= kSettingsPageCommandBase &&
                 command < kSettingsPageCommandBase + 7) {
                 SelectSettingsPage(static_cast<SettingsPage>(
@@ -12535,14 +12612,14 @@ private:
                     settingsArchivedCoreIds_.size()) {
                 RestoreCore(settingsArchivedCoreIds_[command -
                     kSettingsArchivedCoreCommandBase]);
-                RebuildSettingsWindow();
+                QueueSettingsWindowRebuild();
                 return 0;
             }
             if (command == MenuTrayTutorial) {
                 ShowWindow(settingsWindow_, SW_HIDE);
             }
             ExecuteMenuCommand(command);
-            RebuildSettingsWindow();
+            QueueSettingsWindowRebuild();
             return 0;
         }
         case WM_SIZE:
@@ -12584,6 +12661,7 @@ private:
             }
             if (settingsWindow_ == source) {
                 settingsWindow_ = nullptr;
+                settingsRebuildPending_ = false;
                 DestroySettingsFonts();
             }
             SetWindowLongPtrW(source, GWLP_USERDATA, 0);
@@ -13679,8 +13757,8 @@ private:
         renderTarget_->DrawRoundedRectangle(
             D2D1::RoundedRect(card, 10.0f, 10.0f), brush_.Get(), 1.0f);
         brush_->SetColor(D2D1::ColorF(primary, 0.98f));
-        const wchar_t* title = L"核心外观设置";
-        renderTarget_->DrawTextW(title, static_cast<UINT32>(wcslen(title)),
+        const std::wstring title = T("appearance.title");
+        renderTarget_->DrawTextW(title.c_str(), static_cast<UINT32>(title.size()),
             hudFormat_.Get(), D2D1::RectF(card.left + 14.0f, card.top + 10.0f,
             card.right - 44.0f, card.top + 33.0f), brush_.Get(),
             D2D1_DRAW_TEXT_OPTIONS_CLIP);
@@ -13695,8 +13773,8 @@ private:
             D2D1::Point2F(close.right - 9.0f, close.top + 9.0f),
             D2D1::Point2F(close.left + 9.0f, close.bottom - 9.0f),
             brush_.Get(), 1.35f);
-        const wchar_t* colorLabel = L"核心颜色";
-        renderTarget_->DrawTextW(colorLabel, static_cast<UINT32>(wcslen(colorLabel)),
+        const std::wstring colorLabel = T("appearance.core_color");
+        renderTarget_->DrawTextW(colorLabel.c_str(), static_cast<UINT32>(colorLabel.size()),
             hudFormat_.Get(), D2D1::RectF(card.left + 14.0f, card.top + 45.0f,
             card.right - 14.0f, card.top + 67.0f), brush_.Get(),
             D2D1_DRAW_TEXT_OPTIONS_CLIP);
@@ -13724,8 +13802,9 @@ private:
                     brush_.Get(), 1.6f);
             }
             brush_->SetColor(D2D1::ColorF(secondary, 0.96f));
-            renderTarget_->DrawTextW(preset.name,
-                static_cast<UINT32>(wcslen(preset.name)), hudFormat_.Get(),
+            const std::wstring presetName = T(preset.localizationKey);
+            renderTarget_->DrawTextW(presetName.c_str(),
+                static_cast<UINT32>(presetName.size()), hudFormat_.Get(),
                 D2D1::RectF(swatch.right + 5.0f, option.top,
                              option.right, option.bottom), brush_.Get(),
                 D2D1_DRAW_TEXT_OPTIONS_CLIP);
@@ -13749,9 +13828,9 @@ private:
         renderTarget_->DrawRoundedRectangle(
             D2D1::RoundedRect(customSwatch, 3.0f, 3.0f), brush_.Get(), 1.0f);
         brush_->SetColor(D2D1::ColorF(primary, 0.98f));
-        const wchar_t* customColorText = L"自定义颜色...";
-        renderTarget_->DrawTextW(customColorText,
-            static_cast<UINT32>(wcslen(customColorText)), hudFormat_.Get(),
+        const std::wstring customColorText = T("appearance.custom_color");
+        renderTarget_->DrawTextW(customColorText.c_str(),
+            static_cast<UINT32>(customColorText.size()), hudFormat_.Get(),
             D2D1::RectF(customSwatch.right + 7.0f, customColor.top,
                          customColor.right - 8.0f, customColor.bottom),
             brush_.Get(), D2D1_DRAW_TEXT_OPTIONS_CLIP);
@@ -13764,10 +13843,10 @@ private:
         const D2D1_RECT_F shortLabelCancel =
             CoreAppearanceShortLabelCancelRectangle(client);
         brush_->SetColor(D2D1::ColorF(secondary, 0.96f));
-        const wchar_t* shortLabelTitle = L"核心短标识";
+        const std::wstring shortLabelTitle = T("appearance.short_label");
         renderTarget_->DrawTextW(
-            shortLabelTitle,
-            static_cast<UINT32>(wcslen(shortLabelTitle)),
+            shortLabelTitle.c_str(),
+            static_cast<UINT32>(shortLabelTitle.size()),
             hudFormat_.Get(),
             D2D1::RectF(card.left + 14.0f, shortLabelInput.top,
                          shortLabelInput.left - 8.0f, shortLabelInput.bottom),
@@ -13784,7 +13863,7 @@ private:
             shortLabelEditing ? 1.4f : 1.0f);
         if (!shortLabelEditing) {
             const std::wstring value = core->shortLabel.empty()
-                ? L"未设置" : core->shortLabel;
+                ? T("appearance.not_set") : core->shortLabel;
             brush_->SetColor(D2D1::ColorF(
                 core->shortLabel.empty() ? secondary : primary,
                 core->shortLabel.empty() ? 0.76f : 0.98f));
@@ -13797,9 +13876,9 @@ private:
                              shortLabelInput.bottom),
                 brush_.Get(), D2D1_DRAW_TEXT_OPTIONS_CLIP);
         }
-        const std::array<std::pair<D2D1_RECT_F, const wchar_t*>, 2>
-            shortLabelActions{{{shortLabelApply, L"应用"},
-                               {shortLabelCancel, L"取消"}}};
+        const std::array<std::pair<D2D1_RECT_F, std::wstring>, 2>
+            shortLabelActions{{{shortLabelApply, T("common.apply")},
+                               {shortLabelCancel, T("common.cancel")}}};
         for (const auto& action : shortLabelActions) {
             brush_->SetColor(D2D1::ColorF(
                 shortLabelEditing
@@ -13817,7 +13896,7 @@ private:
                 shortLabelEditing ? primary : secondary,
                 shortLabelEditing ? 0.98f : 0.68f));
             renderTarget_->DrawTextW(
-                action.second, static_cast<UINT32>(wcslen(action.second)),
+                action.second.c_str(), static_cast<UINT32>(action.second.size()),
                 hudFormat_.Get(), action.first, brush_.Get(),
                 D2D1_DRAW_TEXT_OPTIONS_CLIP);
         }
@@ -13826,7 +13905,7 @@ private:
             hasShortLabelError ? static_cast<UINT32>(0xB65C34) : secondary,
             hasShortLabelError ? 0.98f : 0.82f));
         const std::wstring shortLabelHint = !hasShortLabelError
-            ? L"最多两个字符；留空后恢复原图标。"
+            ? T("appearance.short_label_hint")
             : coreShortLabelEditError_;
         renderTarget_->DrawTextW(
             shortLabelHint.c_str(),
@@ -13843,20 +13922,20 @@ private:
             D2D1::Point2F(card.right - 14.0f, separatorY),
             brush_.Get(), 1.0f);
         brush_->SetColor(D2D1::ColorF(primary, 0.98f));
-        const wchar_t* lineSectionTitle =
-            L"连接线（颜色按核心，粗细全局）";
+        const std::wstring lineSectionTitle =
+            T("appearance.connection_section");
         renderTarget_->DrawTextW(
-            lineSectionTitle,
-            static_cast<UINT32>(wcslen(lineSectionTitle)),
+            lineSectionTitle.c_str(),
+            static_cast<UINT32>(lineSectionTitle.size()),
             hudFormat_.Get(),
             D2D1::RectF(card.left + 14.0f, card.top + 342.0f,
                          card.right - 14.0f, card.top + 366.0f),
             brush_.Get(), D2D1_DRAW_TEXT_OPTIONS_CLIP);
         brush_->SetColor(D2D1::ColorF(secondary, 0.96f));
-        const wchar_t* lineColorLabel = L"连线颜色";
+        const std::wstring lineColorLabel = T("appearance.line_color");
         renderTarget_->DrawTextW(
-            lineColorLabel,
-            static_cast<UINT32>(wcslen(lineColorLabel)),
+            lineColorLabel.c_str(),
+            static_cast<UINT32>(lineColorLabel.size()),
             hudFormat_.Get(),
             D2D1::RectF(card.left + 14.0f, card.top + 361.0f,
                          card.right - 14.0f, card.top + 381.0f),
@@ -13867,8 +13946,9 @@ private:
                 ConnectionLineColorMode::Black,
                 ConnectionLineColorMode::White,
                 ConnectionLineColorMode::Custom};
-        static constexpr std::array<const wchar_t*, 4> lineColorNames{
-            L"跟随核心", L"黑色", L"白色", L"自定义颜色..."};
+        const std::array<std::wstring, 4> lineColorNames{
+            T("appearance.follow_core"), T("appearance.black"),
+            T("appearance.white"), T("appearance.custom_color")};
         for (int index = 0; index < 4; ++index) {
             const ConnectionLineColorMode mode = lineColorModes[index];
             const bool selected = core->connectionLineColorMode == mode;
@@ -13915,8 +13995,8 @@ private:
                 brush_.Get(), 1.0f);
             brush_->SetColor(D2D1::ColorF(primary, 0.96f));
             renderTarget_->DrawTextW(
-                lineColorNames[index],
-                static_cast<UINT32>(wcslen(lineColorNames[index])),
+                lineColorNames[index].c_str(),
+                static_cast<UINT32>(lineColorNames[index].size()),
                 hudFormat_.Get(),
                 D2D1::RectF(swatch.right + 6.0f, option.top,
                              option.right - 5.0f, option.bottom),
@@ -13927,8 +14007,9 @@ private:
             CoreAppearanceControl::CoreScale,
             CoreAppearanceControl::GlowIntensity,
             CoreAppearanceControl::LineWidth};
-        static constexpr std::array<const wchar_t*, 3> labels{
-            L"核心大小", L"全局光晕", L"连线粗细"};
+        const std::array<std::wstring, 3> labels{
+            T("appearance.core_size"), T("appearance.global_glow"),
+            T("appearance.line_width")};
         for (int index = 0; index < 3; ++index) {
             const CoreAppearanceControl control = controls[index];
             const D2D1_RECT_F track =
@@ -13937,8 +14018,8 @@ private:
             const float ratio = CoreAppearanceRatio(value, control);
             const float thumbX = track.left + (track.right - track.left) * ratio;
             brush_->SetColor(D2D1::ColorF(secondary, 0.96f));
-            renderTarget_->DrawTextW(labels[index],
-                static_cast<UINT32>(wcslen(labels[index])), hudFormat_.Get(),
+            renderTarget_->DrawTextW(labels[index].c_str(),
+                static_cast<UINT32>(labels[index].size()), hudFormat_.Get(),
                 D2D1::RectF(card.left + 14.0f, track.top - 8.0f,
                              track.left - 6.0f, track.bottom + 11.0f),
                 brush_.Get(), D2D1_DRAW_TEXT_OPTIONS_CLIP);
@@ -13979,8 +14060,8 @@ private:
         renderTarget_->DrawRoundedRectangle(
             D2D1::RoundedRect(reset, 6.0f, 6.0f), brush_.Get(), 1.0f);
         brush_->SetColor(D2D1::ColorF(primary, 0.98f));
-        const wchar_t* resetText = L"恢复默认外观";
-        renderTarget_->DrawTextW(resetText, static_cast<UINT32>(wcslen(resetText)),
+        const std::wstring resetText = T("appearance.reset");
+        renderTarget_->DrawTextW(resetText.c_str(), static_cast<UINT32>(resetText.size()),
             hudFormat_.Get(), reset, brush_.Get(), D2D1_DRAW_TEXT_OPTIONS_CLIP);
     }
 
@@ -22010,7 +22091,9 @@ private:
         WorkspaceState before = state_;
         Core core;
         core.id = state_.nextId++;
-        core.name = L"文件核心 " + std::to_wstring(state_.cores.size());
+        core.name = localization_.Format(
+            "core.default_name",
+            {{L"index", std::to_wstring(state_.cores.size())}});
         core.position = position;
         const D2D1_SIZE_F workspace = ClientDipSize();
         const D2D1_POINT_2F screen = WorldToScreen(position);
@@ -26718,6 +26801,7 @@ private:
     HFONT settingsEmphasisFont_ = nullptr;
     SettingsPage settingsPage_ = SettingsPage::General;
     int settingsContentScrollPixels_ = 0;
+    bool settingsRebuildPending_ = false;
     std::vector<std::uint64_t> settingsArchivedCoreIds_;
     // Only used while relation recovery protection blocks the main state
     // file. It keeps this independent visual preference writable without
