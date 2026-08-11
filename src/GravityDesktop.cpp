@@ -24861,11 +24861,16 @@ private:
         const D2D1_RECT_F input = CoreAppearanceShortLabelInputRectangle(
             ClientDipSize());
         const float scale = dpi_ / 96.0f;
-        HWND coordinateWindow = interactionWindow_ != nullptr
-            ? interactionWindow_ : window_;
+        // CoreAppearanceShortLabelInputRectangle is expressed in the visual
+        // workspace coordinate system.  interactionWindow_ extends to the
+        // left by the divider-handle overhang, so using its origin shifts the
+        // native edit control left when editing starts.  Always anchor the
+        // editor to the same visual window used to draw the placeholder.
+        HWND coordinateWindow = window_;
         POINT origin{0, 0};
-        if (coordinateWindow != nullptr) {
-            ClientToScreen(coordinateWindow, &origin);
+        if (coordinateWindow == nullptr ||
+            ClientToScreen(coordinateWindow, &origin) == FALSE) {
+            return;
         }
         SetWindowPos(
             coreShortLabelEditWindow_, HWND_TOP,
