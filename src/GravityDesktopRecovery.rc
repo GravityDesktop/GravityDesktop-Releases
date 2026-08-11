@@ -1,0 +1,36 @@
+#pragma code_page(65001)
+
+#include <winver.h>
+
+VS_VERSION_INFO VERSIONINFO
+ FILEVERSION 0,1,0,0
+ PRODUCTVERSION 0,1,0,0
+ FILEFLAGSMASK 0x3fL
+#ifdef _DEBUG
+ FILEFLAGS VS_FF_DEBUG
+#else
+ FILEFLAGS 0x0L
+#endif
+ FILEOS VOS__WINDOWS32
+ FILETYPE VFT_APP
+ FILESUBTYPE VFT2_UNKNOWN
+BEGIN
+    BLOCK "StringFileInfo"
+    BEGIN
+        BLOCK "040904B0"
+        BEGIN
+            VALUE "CompanyName", "wangboyun"
+            VALUE "FileDescription", "Gravity Desktop Recovery"
+            VALUE "FileVersion", "0.1.0-alpha"
+            VALUE "InternalName", "GravityDesktopRecovery"
+            VALUE "LegalCopyright", "Copyright © 2026 wangboyun"
+            VALUE "OriginalFilename", "GravityDesktopRecovery.exe"
+            VALUE "ProductName", "Gravity Desktop Recovery"
+            VALUE "ProductVersion", "0.1.0-alpha"
+        END
+    END
+    BLOCK "VarFileInfo"
+    BEGIN
+        VALUE "Translation", 0x0409, 1200
+    END
+END

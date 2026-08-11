@@ -26,6 +26,9 @@
     <ClCompile Include="src\GravityDesktopRecovery.cpp" />
     <ClCompile Include="src\Localization.cpp" />
   </ItemGroup>
+  <ItemGroup>
+    <ResourceCompile Include="src\GravityDesktopRecovery.rc" />
+  </ItemGroup>
   <Target Name="CopyGravityDesktopRecoveryLocalizationAssets" AfterTargets="Build">
     <ItemGroup>
       <GravityDesktopRecoveryLocalizationAssets Include="$(ProjectDir)src\locales\*.json" />

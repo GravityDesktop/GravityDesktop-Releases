@@ -28,6 +28,8 @@ BEGIN
             VALUE "OriginalFilename", "GravityDesktop.exe"
             VALUE "ProductName", "引力桌面"
             VALUE "ProductVersion", "0.1.0-alpha"
+            VALUE "CompanyName", "wangboyun"
+            VALUE "LegalCopyright", "Copyright © 2026 wangboyun"
             VALUE "Comments", "English Name: Gravity Desktop; Author: wangboyun"
         END
     END
