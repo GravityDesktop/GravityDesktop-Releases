@@ -11903,7 +11903,7 @@ private:
 
     HWND CreateSettingsText(HWND parent, const wchar_t* text,
                             int x, int y, int width, int height,
-                            DWORD extraStyle = 0) const {
+                            DWORD extraStyle = SS_NOPREFIX) const {
         HWND control = CreateWindowExW(
             0, L"STATIC", text,
             WS_CHILD | WS_VISIBLE | extraStyle,
@@ -11914,6 +11914,45 @@ private:
             ApplySettingsControlFont(control);
         }
         return control;
+    }
+
+    int MeasureSettingsTextHeightDip(
+        std::wstring_view text, int widthDip,
+        int minimumHeightDip = 20) const {
+        if (settingsContentWindow_ == nullptr || widthDip <= 0) {
+            return minimumHeightDip;
+        }
+        HDC dc = GetDC(settingsContentWindow_);
+        if (dc == nullptr) {
+            return minimumHeightDip;
+        }
+        HGDIOBJ oldFont = SelectObject(
+            dc, settingsFont_ != nullptr
+                    ? settingsFont_
+                    : GetStockObject(DEFAULT_GUI_FONT));
+        RECT bounds{0, 0, SettingsDipToPixels(widthDip), 0};
+        std::wstring value(text);
+        DrawTextW(dc, value.c_str(), static_cast<int>(value.size()), &bounds,
+            DT_CALCRECT | DT_WORDBREAK | DT_NOPREFIX | DT_EDITCONTROL);
+        SelectObject(dc, oldFont);
+        ReleaseDC(settingsContentWindow_, dc);
+        const int dpi = std::max(1, static_cast<int>(
+            GetDpiForWindow(settingsContentWindow_)));
+        return std::max(
+            minimumHeightDip,
+            MulDiv(std::max(1L, bounds.bottom - bounds.top), 96, dpi) + 2);
+    }
+
+    int CreateSettingsWrappedText(
+        HWND parent, const std::wstring& text,
+        int x, int y, int width,
+        int minimumHeight = 20) const {
+        const int height = MeasureSettingsTextHeightDip(
+            text, width, minimumHeight);
+        CreateSettingsText(
+            parent, text.c_str(), x, y, width, height,
+            SS_LEFT | SS_NOPREFIX);
+        return height;
     }
 
     HWND CreateSettingsButton(HWND parent, const wchar_t* text,
@@ -12160,6 +12199,51 @@ private:
         settingsArchivedCoreIds_.clear();
     }
 
+    void ValidateSettingsControlLayout() {
+        if (settingsContentWindow_ == nullptr ||
+            IsWindow(settingsContentWindow_) == FALSE) {
+            return;
+        }
+        struct ChildBounds {
+            HWND window = nullptr;
+            RECT bounds{};
+        };
+        std::vector<ChildBounds> controls;
+        for (HWND child = GetWindow(settingsContentWindow_, GW_CHILD);
+             child != nullptr;
+             child = GetWindow(child, GW_HWNDNEXT)) {
+            if (IsWindowVisible(child) == FALSE) {
+                continue;
+            }
+            RECT bounds{};
+            if (GetWindowRect(child, &bounds) == FALSE) {
+                continue;
+            }
+            MapWindowPoints(
+                HWND_DESKTOP, settingsContentWindow_,
+                reinterpret_cast<POINT*>(&bounds), 2);
+            controls.push_back(ChildBounds{child, bounds});
+        }
+        for (std::size_t first = 0; first < controls.size(); ++first) {
+            for (std::size_t second = first + 1;
+                 second < controls.size(); ++second) {
+                RECT overlap{};
+                if (IntersectRect(
+                        &overlap, &controls[first].bounds,
+                        &controls[second].bounds) == FALSE ||
+                    overlap.right - overlap.left <= SettingsDipToPixels(2) ||
+                    overlap.bottom - overlap.top <= SettingsDipToPixels(2)) {
+                    continue;
+                }
+                AppendRuntimeDiagnostic(
+                    "settings_layout_overlap_detected",
+                    S_FALSE,
+                    static_cast<DWORD>(settingsPage_));
+                return;
+            }
+        }
+    }
+
     void RebuildSettingsWindow() {
         if (settingsWindow_ == nullptr ||
             IsWindow(settingsWindow_) == FALSE ||
@@ -12298,11 +12382,13 @@ private:
         case SettingsPage::Workspace: {
             const std::wstring resetDescription = T("settings.workspace.reset_view.description");
             const std::wstring resetLabel = T("settings.workspace.reset_view");
-            CreateSettingsText(settingsContentWindow_, resetDescription.c_str(),
-                16, 56, contentWidth, english ? 60 : 40);
-            CreateSettingsButton(settingsContentWindow_, resetLabel.c_str(), 16,
-                                 english ? 128 : 108, english ? 190 : 130, 30,
-                                 MenuResetView);
+            int y = 56;
+            y += CreateSettingsWrappedText(
+                settingsContentWindow_, resetDescription,
+                16, y, contentWidth, 40);
+            y += 12;
+            CreateSettingsButton(settingsContentWindow_, resetLabel.c_str(),
+                16, y, 190, 30, MenuResetView);
             break;
         }
         case SettingsPage::Data: {
@@ -12315,43 +12401,39 @@ private:
             const std::wstring exportBackup = T("settings.data.export_backup");
             const std::wstring restoreBackup = T("settings.data.restore_backup");
             const std::wstring saveNow = T("settings.data.save_now");
-            if (english) {
-                CreateSettingsText(settingsContentWindow_, layoutSnapshot.c_str(),
-                    16, 54, contentWidth, 22);
-                CreateSettingsText(settingsContentWindow_, layoutSnapshotDescription.c_str(),
-                    16, 78, contentWidth, 54);
-                CreateSettingsButton(settingsContentWindow_, exportLayout.c_str(),
-                    16, 140, contentWidth, 30, MenuExportLayoutSnapshot);
-                CreateSettingsButton(settingsContentWindow_, restoreLayout.c_str(),
-                    16, 178, contentWidth, 30, MenuImportLayoutSnapshot);
-                CreateSettingsText(settingsContentWindow_, fullBackup.c_str(),
-                    16, 224, contentWidth, 22);
-                CreateSettingsText(settingsContentWindow_, fullBackupDescription.c_str(),
-                    16, 248, contentWidth, 70);
-                CreateSettingsButton(settingsContentWindow_, exportBackup.c_str(),
-                    16, 326, contentWidth, 30, MenuExportWorkspaceBackup);
-                CreateSettingsButton(settingsContentWindow_, restoreBackup.c_str(),
-                    16, 364, contentWidth, 30, MenuImportWorkspaceBackup);
-                CreateSettingsButton(settingsContentWindow_, saveNow.c_str(),
-                    16, 402, contentWidth, 30, MenuSaveNow);
-            } else {
-                CreateSettingsText(settingsContentWindow_, layoutSnapshot.c_str(), 16, 54, 180, 22);
-                CreateSettingsText(settingsContentWindow_, layoutSnapshotDescription.c_str(),
-                    16, 78, 340, 34);
-                CreateSettingsButton(settingsContentWindow_, exportLayout.c_str(), 16, 116, 154, 30,
-                                     MenuExportLayoutSnapshot);
-                CreateSettingsButton(settingsContentWindow_, restoreLayout.c_str(), 180, 116, 154, 30,
-                                     MenuImportLayoutSnapshot);
-                CreateSettingsText(settingsContentWindow_, fullBackup.c_str(), 16, 166, 220, 22);
-                CreateSettingsText(settingsContentWindow_, fullBackupDescription.c_str(),
-                    16, 190, 340, 40);
-                CreateSettingsButton(settingsContentWindow_, exportBackup.c_str(), 16, 238, 154, 30,
-                                     MenuExportWorkspaceBackup);
-                CreateSettingsButton(settingsContentWindow_, restoreBackup.c_str(), 180, 238, 154, 30,
-                                     MenuImportWorkspaceBackup);
-                CreateSettingsButton(settingsContentWindow_, saveNow.c_str(), 16, 286, 154, 30,
-                                     MenuSaveNow);
-            }
+            constexpr int columnGap = 10;
+            const int columnWidth = (contentWidth - columnGap) / 2;
+            int y = 54;
+            y += CreateSettingsWrappedText(
+                settingsContentWindow_, layoutSnapshot,
+                16, y, contentWidth, 22);
+            y += 4;
+            y += CreateSettingsWrappedText(
+                settingsContentWindow_, layoutSnapshotDescription,
+                16, y, contentWidth, 36);
+            y += 8;
+            CreateSettingsButton(settingsContentWindow_, exportLayout.c_str(),
+                16, y, columnWidth, 30, MenuExportLayoutSnapshot);
+            CreateSettingsButton(settingsContentWindow_, restoreLayout.c_str(),
+                16 + columnWidth + columnGap, y, columnWidth, 30,
+                MenuImportLayoutSnapshot);
+            y += 48;
+            y += CreateSettingsWrappedText(
+                settingsContentWindow_, fullBackup,
+                16, y, contentWidth, 22);
+            y += 4;
+            y += CreateSettingsWrappedText(
+                settingsContentWindow_, fullBackupDescription,
+                16, y, contentWidth, 40);
+            y += 8;
+            CreateSettingsButton(settingsContentWindow_, exportBackup.c_str(),
+                16, y, columnWidth, 30, MenuExportWorkspaceBackup);
+            CreateSettingsButton(settingsContentWindow_, restoreBackup.c_str(),
+                16 + columnWidth + columnGap, y, columnWidth, 30,
+                MenuImportWorkspaceBackup);
+            y += 48;
+            CreateSettingsButton(settingsContentWindow_, saveNow.c_str(),
+                16, y, columnWidth, 30, MenuSaveNow);
             break;
         }
         case SettingsPage::CoreManagement: {
@@ -12360,13 +12442,19 @@ private:
             const std::wstring checkReferences = T("settings.core.check_references");
             const std::wstring archivedCores = T("settings.core.restore_archived");
             const std::wstring restore = T("settings.core.restore");
-            CreateSettingsText(settingsContentWindow_, referenceCheck.c_str(), 16, 58, contentWidth, 22);
-            CreateSettingsText(settingsContentWindow_, referenceCheckDescription.c_str(),
-                16, 82, contentWidth, english ? 54 : 24);
-            CreateSettingsButton(settingsContentWindow_, checkReferences.c_str(), 16,
-                                 english ? 144 : 112, english ? 210 : 132, 30,
-                                 MenuRefreshReferences);
-            const int archivedTop = english ? 194 : 166;
+            int y = 58;
+            y += CreateSettingsWrappedText(
+                settingsContentWindow_, referenceCheck,
+                16, y, contentWidth, 22);
+            y += 4;
+            y += CreateSettingsWrappedText(
+                settingsContentWindow_, referenceCheckDescription,
+                16, y, contentWidth, 24);
+            y += 8;
+            CreateSettingsButton(settingsContentWindow_, checkReferences.c_str(),
+                16, y, 210, 30, MenuRefreshReferences);
+            y += 48;
+            const int archivedTop = y;
             CreateSettingsText(settingsContentWindow_, archivedCores.c_str(),
                 16, archivedTop, contentWidth, 22);
             int row = 0;
@@ -12400,11 +12488,13 @@ private:
         case SettingsPage::Help: {
             const std::wstring tutorialDescription = T("settings.help.tutorial.description");
             const std::wstring tutorial = T("settings.help.tutorial");
-            CreateSettingsText(settingsContentWindow_, tutorialDescription.c_str(),
-                16, 56, contentWidth, english ? 60 : 40);
-            CreateSettingsButton(settingsContentWindow_, tutorial.c_str(), 16,
-                                 english ? 128 : 108, english ? 220 : 160, 30,
-                                 MenuTrayTutorial);
+            int y = 56;
+            y += CreateSettingsWrappedText(
+                settingsContentWindow_, tutorialDescription,
+                16, y, contentWidth, 40);
+            y += 12;
+            CreateSettingsButton(settingsContentWindow_, tutorial.c_str(),
+                16, y, 220, 30, MenuTrayTutorial);
             break;
         }
         case SettingsPage::Advanced: {
@@ -12412,22 +12502,27 @@ private:
             const std::wstring openFolder = T("settings.advanced.open_data_folder");
             const std::wstring reportDescription = T("settings.advanced.report.description");
             const std::wstring report = T("settings.advanced.report");
-            CreateSettingsText(settingsContentWindow_, folderDescription.c_str(),
-                16, 56, contentWidth, english ? 60 : 40);
-            CreateSettingsButton(settingsContentWindow_, openFolder.c_str(), 16,
-                                 english ? 126 : 108, english ? 250 : 180, 30,
-                                 MenuOpenDataFolder);
-            CreateSettingsText(settingsContentWindow_, reportDescription.c_str(),
-                16, english ? 172 : 152, contentWidth, english ? 50 : 28);
-            CreateSettingsButton(settingsContentWindow_, report.c_str(), 16,
-                                 english ? 230 : 190, english ? 210 : 150, 30,
-                                 MenuGenerateDiagnosticReport);
+            int y = 56;
+            y += CreateSettingsWrappedText(
+                settingsContentWindow_, folderDescription,
+                16, y, contentWidth, 40);
+            y += 10;
+            CreateSettingsButton(settingsContentWindow_, openFolder.c_str(),
+                16, y, 250, 30, MenuOpenDataFolder);
+            y += 46;
+            y += CreateSettingsWrappedText(
+                settingsContentWindow_, reportDescription,
+                16, y, contentWidth, 32);
+            y += 10;
+            CreateSettingsButton(settingsContentWindow_, report.c_str(),
+                16, y, 210, 30, MenuGenerateDiagnosticReport);
             break;
         }
         }
         LayoutSettingsWindow();
         RedrawWindow(settingsContentWindow_, nullptr, nullptr,
             RDW_INVALIDATE | RDW_ERASE | RDW_ALLCHILDREN | RDW_UPDATENOW);
+        ValidateSettingsControlLayout();
     }
 
     int SettingsContentPreferredHeightPixels() const {
@@ -12539,6 +12634,10 @@ private:
     void SelectSettingsPage(SettingsPage page) {
         settingsPage_ = page;
         settingsContentScrollPixels_ = 0;
+        // Every navigation button is owner-drawn from settingsPage_.  Repaint
+        // all of them so a previously selected button cannot retain its blue
+        // pixels after another page becomes active.
+        LayoutSettingsNavigation();
         QueueSettingsWindowRebuild();
     }
 
@@ -12742,9 +12841,17 @@ private:
             PaintSettingsSurface(source);
             return 0;
         case WM_CTLCOLORSTATIC:
-            SetTextColor(reinterpret_cast<HDC>(wParam), RGB(67, 78, 89));
-            SetBkMode(reinterpret_cast<HDC>(wParam), TRANSPARENT);
-            return reinterpret_cast<LRESULT>(GetStockObject(NULL_BRUSH));
+        {
+            HDC controlDc = reinterpret_cast<HDC>(wParam);
+            const COLORREF background = source == settingsContentWindow_
+                ? RGB(251, 252, 253)
+                : RGB(241, 245, 249);
+            SetTextColor(controlDc, RGB(67, 78, 89));
+            SetBkMode(controlDc, OPAQUE);
+            SetBkColor(controlDc, background);
+            SetDCBrushColor(controlDc, background);
+            return reinterpret_cast<LRESULT>(GetStockObject(DC_BRUSH));
+        }
         case WM_DRAWITEM:
             if (lParam != 0) {
                 DrawSettingsButton(*reinterpret_cast<const DRAWITEMSTRUCT*>(lParam));
