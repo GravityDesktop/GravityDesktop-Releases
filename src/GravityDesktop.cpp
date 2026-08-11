@@ -99,7 +99,9 @@ constexpr UINT_PTR kDesktopHostMigrationTimer = 14;
 constexpr UINT_PTR kWorkspaceEnvironmentRefreshTimer = 15;
 constexpr UINT_PTR kRelationshipManifestRetryTimer = 16;
 constexpr UINT_PTR kWorkspaceChromeAutoHideTimer = 17;
+constexpr UINT_PTR kWorkspaceChromeRevealWatchTimer = 18;
 constexpr UINT kWorkspaceChromeAutoHideDelayMs = 280;
+constexpr UINT kWorkspaceChromeRevealWatchIntervalMs = 100;
 constexpr std::array<UINT, 3> kSaveRetryDelaysMs{
     1000, 3000, 10000};
 constexpr std::array<UINT, 3> kRelationshipManifestRetryDelaysMs{
@@ -11398,8 +11400,6 @@ private:
             draggingWorkspaceChrome_ || workspaceChromePointerPending_ ||
             workspaceChromeMenuOpen_ || corePlacementMode_ ||
             window_ == nullptr ||
-            (settingsWindow_ != nullptr &&
-             IsWindowVisible(settingsWindow_) != FALSE) ||
             WorkspaceChromePointerOverGroup(
                 WorkspaceChromeGroupRectangle(ClientDipSize()))) {
             return;
@@ -11420,6 +11420,9 @@ private:
         }
         workspaceChromeHovered_ = hovered;
         if (hovered) {
+            if (window_ != nullptr) {
+                KillTimer(window_, kWorkspaceChromeRevealWatchTimer);
+            }
             CancelWorkspaceChromeAutoHideDelay();
         } else {
             ScheduleWorkspaceChromeAutoHide();
@@ -11515,9 +11518,7 @@ private:
             state_.workspaceChromePinned || workspaceChromeHovered_ ||
             WorkspaceChromePointerOverGroup(group) ||
             draggingWorkspaceChrome_ || workspaceChromePointerPending_ ||
-            workspaceChromeMenuOpen_ || corePlacementMode_ ||
-            (settingsWindow_ != nullptr &&
-             IsWindowVisible(settingsWindow_) != FALSE)) {
+            workspaceChromeMenuOpen_ || corePlacementMode_) {
             return false;
         }
         const float nearest = std::min({
@@ -11564,6 +11565,50 @@ private:
             std::min(group.top, reveal.top),
             std::max(group.right, reveal.right),
             std::max(group.bottom, reveal.bottom));
+    }
+
+    void SyncWorkspaceChromeRevealWatch() {
+        if (window_ == nullptr || IsWindow(window_) == FALSE) {
+            return;
+        }
+        KillTimer(window_, kWorkspaceChromeRevealWatchTimer);
+        if (!workspaceVisible_ || state_.workspacePaused ||
+            failOpenActive_ || shuttingDown_ || exitRequested_ ||
+            !WorkspaceChromeCollapsed(ClientDipSize())) {
+            return;
+        }
+        if (SetTimer(window_, kWorkspaceChromeRevealWatchTimer,
+                     kWorkspaceChromeRevealWatchIntervalMs, nullptr) == 0) {
+            AppendRuntimeDiagnostic(
+                "workspace_chrome_reveal_watch_timer_failed",
+                E_FAIL, GetLastError());
+        }
+    }
+
+    void HandleWorkspaceChromeRevealWatch() {
+        if (window_ == nullptr || IsWindow(window_) == FALSE ||
+            !workspaceVisible_ || state_.workspacePaused ||
+            failOpenActive_ || shuttingDown_ || exitRequested_ ||
+            !WorkspaceChromeCollapsed(ClientDipSize())) {
+            if (window_ != nullptr) {
+                KillTimer(window_, kWorkspaceChromeRevealWatchTimer);
+            }
+            return;
+        }
+        POINT cursor{};
+        if (GetCursorPos(&cursor) == FALSE ||
+            ScreenToClient(window_, &cursor) == FALSE) {
+            return;
+        }
+        if (PointInside(PixelToDip(cursor.x, cursor.y),
+                        WorkspaceChromeRevealRectangle(ClientDipSize()))) {
+            SetWorkspaceChromeHovered(true);
+            if (interactionWindow_ != nullptr &&
+                IsWindow(interactionWindow_) != FALSE) {
+                EnsurePointerLeaveTracking(interactionWindow_);
+            }
+            Invalidate();
+        }
     }
 
     void DrawWorkspaceChrome(const D2D1_SIZE_F& client) {
@@ -12576,29 +12621,34 @@ private:
             return 0;
         case WM_COMMAND: {
             const UINT command = LOWORD(wParam);
-            if (command == MenuLanguagePicker &&
-                HIWORD(wParam) == CBN_SELCHANGE) {
-                const int selection = static_cast<int>(SendMessageW(
-                    reinterpret_cast<HWND>(lParam), CB_GETCURSEL, 0, 0));
-                if (selection == 0) {
-                    SetApplicationLanguage(
-                        gravity::i18n::LanguageMode::Automatic);
-                } else if (selection == 1) {
-                    SetApplicationLanguage(
-                        gravity::i18n::LanguageMode::Explicit, L"zh-CN");
-                } else if (selection == 2) {
-                    SetApplicationLanguage(
-                        gravity::i18n::LanguageMode::Explicit, L"en-US");
-                } else {
-                    SetStatus(T("settings.language.unavailable"));
-                    const int current =
-                        localization_.GetPreferences().languageMode ==
-                                gravity::i18n::LanguageMode::Automatic
-                            ? 0
-                            : (localization_.CurrentLocale() == L"zh-CN" ? 1 : 2);
-                    SendMessageW(reinterpret_cast<HWND>(lParam), CB_SETCURSEL,
-                                 current, 0);
+            if (command == MenuLanguagePicker) {
+                if (HIWORD(wParam) == CBN_SELCHANGE) {
+                    const int selection = static_cast<int>(SendMessageW(
+                        reinterpret_cast<HWND>(lParam), CB_GETCURSEL, 0, 0));
+                    if (selection == 0) {
+                        SetApplicationLanguage(
+                            gravity::i18n::LanguageMode::Automatic);
+                    } else if (selection == 1) {
+                        SetApplicationLanguage(
+                            gravity::i18n::LanguageMode::Explicit, L"zh-CN");
+                    } else if (selection == 2) {
+                        SetApplicationLanguage(
+                            gravity::i18n::LanguageMode::Explicit, L"en-US");
+                    } else {
+                        SetStatus(T("settings.language.unavailable"));
+                        const int current =
+                            localization_.GetPreferences().languageMode ==
+                                    gravity::i18n::LanguageMode::Automatic
+                                ? 0
+                                : (localization_.CurrentLocale() == L"zh-CN"
+                                    ? 1 : 2);
+                        SendMessageW(reinterpret_cast<HWND>(lParam),
+                                     CB_SETCURSEL, current, 0);
+                    }
                 }
+                // CBN_DROPDOWN and focus notifications are not commands.
+                // Treating them as one caused a rebuild while the native list
+                // was opening, so the list was immediately destroyed.
                 return 0;
             }
             if (command >= kSettingsPageCommandBase &&
@@ -24439,10 +24489,12 @@ private:
                 !draggingWorkspaceChrome_ &&
                 !workspaceChromePointerPending_ &&
                 !workspaceChromeMenuOpen_ &&
-                !corePlacementMode_ &&
-                (settingsWindow_ == nullptr ||
-                 IsWindowVisible(settingsWindow_) == FALSE);
+                !corePlacementMode_;
+            SyncWorkspaceChromeRevealWatch();
+            EnsureInteractionWindowPresented();
             Invalidate();
+        } else if (timer == kWorkspaceChromeRevealWatchTimer) {
+            HandleWorkspaceChromeRevealWatch();
         } else if (timer == kStatusTimer) {
             KillTimer(window_, kStatusTimer);
             status_.clear();
