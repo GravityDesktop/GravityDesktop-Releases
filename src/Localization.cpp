@@ -4,6 +4,7 @@
 #include <shlobj.h>
 
 #include <algorithm>
+#include <array>
 #include <cctype>
 #include <cwctype>
 #include <fstream>
@@ -194,7 +195,51 @@ std::wstring ResolveRequestedLanguage(std::wstring requested) {
         return L"zh-CN";
     }
     if (StartsWith(requested, L"en-")) return L"en-US";
+    if (requested == L"ja" || StartsWith(requested, L"ja-")) return L"ja-JP";
+    if (requested == L"de" || StartsWith(requested, L"de-")) return L"de-DE";
+    if (requested == L"es" || StartsWith(requested, L"es-")) return L"es-ES";
+    if (requested == L"fr" || StartsWith(requested, L"fr-")) return L"fr-FR";
     return L"en-US";
+}
+
+bool IsSupportedLocale(std::wstring_view locale) {
+    const std::wstring normalized = Lowercase(std::wstring(locale));
+    return normalized == L"zh-cn" || normalized == L"en-us" ||
+           normalized == L"ja-jp" || normalized == L"de-de" ||
+           normalized == L"es-es" || normalized == L"fr-fr";
+}
+
+std::wstring CanonicalLocale(std::wstring_view locale) {
+    const std::wstring normalized = Lowercase(std::wstring(locale));
+    if (normalized == L"zh-cn") return L"zh-CN";
+    if (normalized == L"ja-jp") return L"ja-JP";
+    if (normalized == L"de-de") return L"de-DE";
+    if (normalized == L"es-es") return L"es-ES";
+    if (normalized == L"fr-fr") return L"fr-FR";
+    return L"en-US";
+}
+
+std::wstring FirstWindowsUserLanguage() {
+    DWORD bytes = 0;
+    if (RegGetValueW(
+            HKEY_CURRENT_USER,
+            L"Control Panel\\International\\User Profile",
+            L"Languages", RRF_RT_REG_MULTI_SZ,
+            nullptr, nullptr, &bytes) != ERROR_SUCCESS ||
+        bytes < sizeof(wchar_t) * 2) {
+        return {};
+    }
+    std::vector<wchar_t> languages(
+        bytes / sizeof(wchar_t) + 1, L'\0');
+    if (RegGetValueW(
+            HKEY_CURRENT_USER,
+            L"Control Panel\\International\\User Profile",
+            L"Languages", RRF_RT_REG_MULTI_SZ,
+            nullptr, languages.data(), &bytes) != ERROR_SUCCESS) {
+        return {};
+    }
+    return languages.front() == L'\0'
+        ? std::wstring{} : std::wstring(languages.data());
 }
 
 std::filesystem::path ExecutableDirectory() {
@@ -218,6 +263,45 @@ LoadLocaleFile(std::wstring_view locale) {
     const auto text = ReadUtf8File(path);
     if (!text.has_value()) return std::nullopt;
     return ParseStringMap(*text);
+}
+
+std::vector<std::wstring> ExtractPlaceholders(std::wstring_view text) {
+    std::vector<std::wstring> placeholders;
+    std::size_t position = 0;
+    while ((position = text.find(L'{', position)) != std::wstring_view::npos) {
+        const std::size_t end = text.find(L'}', position + 1);
+        if (end == std::wstring_view::npos) break;
+        placeholders.emplace_back(text.substr(position, end - position + 1));
+        position = end + 1;
+    }
+    std::sort(placeholders.begin(), placeholders.end());
+    placeholders.erase(
+        std::unique(placeholders.begin(), placeholders.end()),
+        placeholders.end());
+    return placeholders;
+}
+
+bool ValidateLocaleFiles() {
+    const auto english = LoadLocaleFile(L"en-US");
+    if (!english.has_value() || english->empty()) return false;
+    constexpr std::array<std::wstring_view, 5> locales{
+        L"zh-CN", L"ja-JP", L"de-DE", L"es-ES", L"fr-FR"};
+    for (const std::wstring_view locale : locales) {
+        const auto translated = LoadLocaleFile(locale);
+        if (!translated.has_value() ||
+            translated->size() != english->size()) {
+            return false;
+        }
+        for (const auto& [key, source] : *english) {
+            const auto found = translated->find(key);
+            if (found == translated->end() ||
+                ExtractPlaceholders(source) !=
+                    ExtractPlaceholders(found->second)) {
+                return false;
+            }
+        }
+    }
+    return true;
 }
 
 std::unordered_map<std::string, std::wstring> BuiltInEnglish() {
@@ -283,10 +367,9 @@ Preferences ParsePreferences(const std::string& text) {
     const auto preferred = map->find("preferredLanguage");
     if (mode != map->end() && mode->second == L"explicit" &&
         preferred != map->end() &&
-        (Lowercase(preferred->second) == L"zh-cn" ||
-         Lowercase(preferred->second) == L"en-us")) {
+        IsSupportedLocale(preferred->second)) {
         result.languageMode = LanguageMode::Explicit;
-        result.preferredLanguage = preferred->second;
+        result.preferredLanguage = CanonicalLocale(preferred->second);
     }
     return result;
 }
@@ -344,10 +427,9 @@ bool Localization::SetAutomatic() {
 }
 
 bool Localization::SetExplicitLanguage(std::wstring_view locale) {
-    const std::wstring normalized = Lowercase(std::wstring(locale));
-    if (normalized != L"zh-cn" && normalized != L"en-us") return false;
+    if (!IsSupportedLocale(locale)) return false;
     preferences_.languageMode = LanguageMode::Explicit;
-    preferences_.preferredLanguage = normalized == L"zh-cn" ? L"zh-CN" : L"en-US";
+    preferences_.preferredLanguage = CanonicalLocale(locale);
     if (!SavePreferences()) return false;
     ResolveAndLoadLanguage();
     return true;
@@ -367,14 +449,25 @@ std::wstring Localization::ResolveLanguage() const {
     if (preferences_.languageMode == LanguageMode::Explicit) {
         requested = Lowercase(preferences_.preferredLanguage);
     } else {
-        ULONG size = 0;
-        if (GetUserPreferredUILanguages(MUI_LANGUAGE_NAME, &size, nullptr,
-                                        nullptr) != FALSE && size > 1) {
-            std::vector<wchar_t> languages(size, L'\0');
-            ULONG count = 0;
-            if (GetUserPreferredUILanguages(MUI_LANGUAGE_NAME, &size,
-                                            languages.data(), &count) != FALSE) {
-                requested = Lowercase(languages.data());
+        requested = Lowercase(FirstWindowsUserLanguage());
+        if (requested.empty()) {
+            ULONG size = 0;
+            if (GetUserPreferredUILanguages(MUI_LANGUAGE_NAME, &size, nullptr,
+                                            nullptr) != FALSE && size > 1) {
+                std::vector<wchar_t> languages(size, L'\0');
+                ULONG count = 0;
+                if (GetUserPreferredUILanguages(
+                        MUI_LANGUAGE_NAME, &size,
+                        languages.data(), &count) != FALSE) {
+                    requested = Lowercase(languages.data());
+                }
+            }
+        }
+        if (requested.empty()) {
+            wchar_t localeName[LOCALE_NAME_MAX_LENGTH]{};
+            if (GetUserDefaultLocaleName(
+                    localeName, LOCALE_NAME_MAX_LENGTH) > 0) {
+                requested = Lowercase(localeName);
             }
         }
     }
@@ -384,7 +477,7 @@ std::wstring Localization::ResolveLanguage() const {
 void Localization::ResolveAndLoadLanguage() {
     currentLocale_ = ResolveLanguage();
     active_ = english_;
-    if (currentLocale_ == L"zh-CN") {
+    if (currentLocale_ != L"en-US") {
         const auto pack = LoadLocaleFile(currentLocale_);
         if (!pack.has_value()) {
             currentLocale_ = L"en-US";
@@ -425,6 +518,10 @@ std::wstring Localization::Format(
 std::wstring Localization::DisplayName(std::wstring_view locale) {
     if (locale == L"zh-CN") return L"简体中文";
     if (locale == L"en-US") return L"English";
+    if (locale == L"ja-JP") return L"日本語";
+    if (locale == L"de-DE") return L"Deutsch";
+    if (locale == L"es-ES") return L"Español";
+    if (locale == L"fr-FR") return L"Français";
     return std::wstring(locale);
 }
 
@@ -443,8 +540,12 @@ bool Localization::RunSelfTest() {
         ResolveRequestedLanguage(L"zh-SG") == L"zh-CN" &&
         ResolveRequestedLanguage(L"en-GB") == L"en-US" &&
         ResolveRequestedLanguage(L"zh-Hant") == L"en-US" &&
-        ResolveRequestedLanguage(L"ja-JP") == L"en-US" &&
-        parsed.has_value() && parsed->at("text") == L"Français ü 日本語";
+        ResolveRequestedLanguage(L"ja-JP") == L"ja-JP" &&
+        ResolveRequestedLanguage(L"de-AT") == L"de-DE" &&
+        ResolveRequestedLanguage(L"es-MX") == L"es-ES" &&
+        ResolveRequestedLanguage(L"fr-CA") == L"fr-FR" &&
+        parsed.has_value() && parsed->at("text") == L"Français ü 日本語" &&
+        ValidateLocaleFiles();
 }
 
 } // namespace gravity::i18n

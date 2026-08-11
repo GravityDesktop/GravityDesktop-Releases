@@ -11270,10 +11270,10 @@ private:
 
     bool WorkspaceChromeUsesCompactLabels(
         const D2D1_SIZE_F& client) const {
-        // English labels need materially more horizontal space than Chinese.
-        // Enter compact mode before the strip has to overlap adjacent labels.
-        const float threshold = localization_.CurrentLocale() == L"en-US"
-            ? 860.0f : 700.0f;
+        // Reserve the non-Chinese strip for the longest supported localized
+        // labels (not merely the currently selected language).
+        const float threshold = localization_.CurrentLocale() != L"zh-CN"
+            ? 1080.0f : 700.0f;
         return client.width < threshold;
     }
 
@@ -11285,14 +11285,14 @@ private:
         static constexpr std::array<float, kWorkspaceControlCount> compactWidths{
             34.0f, 74.0f, 52.0f, 76.0f,
             68.0f, 52.0f, 86.0f, 42.0f};
-        static constexpr std::array<float, kWorkspaceControlCount> englishWidths{
-            34.0f, 112.0f, 66.0f, 116.0f,
-            72.0f, 108.0f, 172.0f, 52.0f};
+        static constexpr std::array<float, kWorkspaceControlCount> localizedWidths{
+            34.0f, 142.0f, 96.0f, 176.0f,
+            108.0f, 144.0f, 214.0f, 76.0f};
         const auto& widths =
             WorkspaceChromeUsesCompactLabels(client)
                 ? compactWidths
-                : (localization_.CurrentLocale() == L"en-US"
-                    ? englishWidths : regularWidths);
+                : (localization_.CurrentLocale() != L"zh-CN"
+                    ? localizedWidths : regularWidths);
         constexpr float gap = 6.0f;
         float horizontalWidth = 40.0f + gap * (kWorkspaceControlCount - 1);
         for (const float width : widths) {
@@ -11301,7 +11301,7 @@ private:
         const bool vertical = WorkspaceChromeIsVertical();
         const float groupWidth = vertical
             ? (WorkspaceChromeUsesCompactLabels(client) ? 108.0f :
-                (localization_.CurrentLocale() == L"en-US" ? 196.0f : 164.0f))
+                (localization_.CurrentLocale() != L"zh-CN" ? 220.0f : 164.0f))
             : horizontalWidth;
         const float groupHeight = vertical
             ? 40.0f + (kWorkspaceControlCount - 1) * 32.0f +
@@ -11343,12 +11343,12 @@ private:
         static constexpr std::array<float, kWorkspaceControlCount> compactWidths{
             34.0f, 74.0f, 52.0f, 76.0f,
             68.0f, 52.0f, 86.0f, 42.0f};
-        static constexpr std::array<float, kWorkspaceControlCount> englishWidths{
-            34.0f, 112.0f, 66.0f, 116.0f,
-            72.0f, 108.0f, 172.0f, 52.0f};
+        static constexpr std::array<float, kWorkspaceControlCount> localizedWidths{
+            34.0f, 142.0f, 96.0f, 176.0f,
+            108.0f, 144.0f, 214.0f, 76.0f};
         const auto& widths = WorkspaceChromeUsesCompactLabels(client) ? compactWidths :
-            (localization_.CurrentLocale() == L"en-US"
-                ? englishWidths : regularWidths);
+            (localization_.CurrentLocale() != L"zh-CN"
+                ? localizedWidths : regularWidths);
         constexpr float gap = 6.0f;
         const int safeIndex = std::clamp(index, 0, kWorkspaceControlCount - 1);
         const D2D1_RECT_F group = WorkspaceChromeGroupRectangle(client);
@@ -11841,7 +11841,7 @@ private:
         // Keep this rail fixed for every supported and planned language.
         // Resizing it during a language switch leaves native owner-drawn
         // buttons at their former dimensions until the next full rebuild.
-        return 190;
+        return 224;
     }
 
     int SettingsContentWidthDip() const {
@@ -12251,7 +12251,7 @@ private:
             return;
         }
         ClearSettingsPageControls();
-        const bool english = localization_.CurrentLocale() == L"en-US";
+        const bool english = localization_.CurrentLocale() != L"zh-CN";
         const int contentWidth = SettingsContentWidthDip();
         const std::wstring pageTitle = SettingsPageName(settingsPage_);
         CreateSettingsHeading(
@@ -12271,10 +12271,7 @@ private:
                 16, 76, contentWidth, 20);
             const std::array<std::wstring, 7> languageOptions{{
                 T("settings.language.automatic_option"), L"简体中文", L"English",
-                T("settings.language.japanese_pending"),
-                T("settings.language.german_pending"),
-                T("settings.language.spanish_pending"),
-                T("settings.language.french_pending")}};
+                L"日本語", L"Deutsch", L"Español", L"Français"}};
             HWND languagePicker = CreateWindowExW(
                 0, L"COMBOBOX", L"",
                 WS_CHILD | WS_VISIBLE | WS_TABSTOP | CBS_DROPDOWNLIST |
@@ -12293,7 +12290,15 @@ private:
                 int selection = 0;
                 if (localization_.GetPreferences().languageMode ==
                     gravity::i18n::LanguageMode::Explicit) {
-                    selection = localization_.CurrentLocale() == L"zh-CN" ? 1 : 2;
+                    const std::array<std::wstring_view, 6> locales{{
+                        L"zh-CN", L"en-US", L"ja-JP",
+                        L"de-DE", L"es-ES", L"fr-FR"}};
+                    const auto found = std::find(
+                        locales.begin(), locales.end(),
+                        localization_.CurrentLocale());
+                    selection = found == locales.end()
+                        ? 0 : static_cast<int>(
+                            std::distance(locales.begin(), found)) + 1;
                 }
                 SendMessageW(languagePicker, CB_SETCURSEL, selection, 0);
             }
@@ -12527,7 +12532,7 @@ private:
 
     int SettingsContentPreferredHeightPixels() const {
         int height = SettingsDipToPixels(340);
-        if (localization_.CurrentLocale() == L"en-US") {
+        if (localization_.CurrentLocale() != L"zh-CN") {
             switch (settingsPage_) {
             case SettingsPage::General: height = SettingsDipToPixels(280); break;
             case SettingsPage::Appearance: height = SettingsDipToPixels(338); break;
@@ -12542,8 +12547,8 @@ private:
             const int archivedCount = static_cast<int>(std::count_if(
                 state_.cores.begin(), state_.cores.end(),
                 [](const Core& core) { return core.archived; }));
-            const int base = localization_.CurrentLocale() == L"en-US" ? 250 : 230;
-            const int rowHeight = localization_.CurrentLocale() == L"en-US" ? 52 : 48;
+            const int base = localization_.CurrentLocale() != L"zh-CN" ? 250 : 230;
+            const int rowHeight = localization_.CurrentLocale() != L"zh-CN" ? 52 : 48;
             height = SettingsDipToPixels(base + std::min(archivedCount, 6) * rowHeight);
         }
         return height;
@@ -12686,7 +12691,7 @@ private:
         }
         RECT bounds{};
         GetWindowRect(settingsWindow_, &bounds);
-        const int desiredWidth = SettingsDipToPixels(640);
+        const int desiredWidth = SettingsDipToPixels(680);
         SetWindowPos(settingsWindow_, nullptr, bounds.left, bounds.top,
             desiredWidth, bounds.bottom - bounds.top,
             SWP_NOZORDER | SWP_NOACTIVATE);
@@ -12776,7 +12781,7 @@ private:
             return;
         }
         const UINT dpi = window_ != nullptr ? GetDpiForWindow(window_) : 96;
-        const int width = MulDiv(640, static_cast<int>(dpi), 96);
+        const int width = MulDiv(680, static_cast<int>(dpi), 96);
         const int height = MulDiv(430, static_cast<int>(dpi), 96);
         POINT cursor{};
         GetCursorPos(&cursor);
@@ -12877,16 +12882,12 @@ private:
                     } else if (selection == 2) {
                         SetApplicationLanguage(
                             gravity::i18n::LanguageMode::Explicit, L"en-US");
-                    } else {
-                        SetStatus(T("settings.language.unavailable"));
-                        const int current =
-                            localization_.GetPreferences().languageMode ==
-                                    gravity::i18n::LanguageMode::Automatic
-                                ? 0
-                                : (localization_.CurrentLocale() == L"zh-CN"
-                                    ? 1 : 2);
-                        SendMessageW(reinterpret_cast<HWND>(lParam),
-                                     CB_SETCURSEL, current, 0);
+                    } else if (selection >= 3 && selection <= 6) {
+                        const std::array<std::wstring_view, 4> locales{{
+                            L"ja-JP", L"de-DE", L"es-ES", L"fr-FR"}};
+                        SetApplicationLanguage(
+                            gravity::i18n::LanguageMode::Explicit,
+                            locales[static_cast<std::size_t>(selection - 3)]);
                     }
                 }
                 // CBN_DROPDOWN and focus notifications are not commands.
@@ -13784,7 +13785,8 @@ private:
 
     D2D1_RECT_F CoreAppearancePanelRectangle(
         const D2D1_SIZE_F& client) const {
-        constexpr float width = 360.0f;
+        const float width = localization_.CurrentLocale() == L"zh-CN"
+            ? 360.0f : 440.0f;
         constexpr float height = 524.0f;
         const float left = std::clamp(coreAppearancePanelAnchorDip_.x - 18.0f,
             14.0f, std::max(14.0f, client.width - width - 14.0f));
@@ -13812,9 +13814,13 @@ private:
         const D2D1_RECT_F card = CoreAppearancePanelRectangle(client);
         const int column = std::clamp(index % 3, 0, 2);
         const int row = std::clamp(index / 3, 0, 2);
-        const float left = card.left + 16.0f + static_cast<float>(column) * 110.0f;
+        const float columnWidth =
+            (card.right - card.left - 32.0f) / 3.0f;
+        const float left = card.left + 16.0f +
+            static_cast<float>(column) * columnWidth;
         const float top = card.top + 70.0f + static_cast<float>(row) * 29.0f;
-        return D2D1::RectF(left, top, left + 98.0f, top + 23.0f);
+        return D2D1::RectF(
+            left, top, left + columnWidth - 12.0f, top + 23.0f);
     }
 
     D2D1_RECT_F CoreAppearanceTrackRectangle(
@@ -13834,7 +13840,9 @@ private:
         default:
             break;
         }
-        return D2D1::RectF(card.left + 104.0f, y,
+        const float labelWidth = localization_.CurrentLocale() == L"zh-CN"
+            ? 104.0f : 154.0f;
+        return D2D1::RectF(card.left + labelWidth, y,
                            card.right - 54.0f, y + 8.0f);
     }
 
@@ -13848,7 +13856,9 @@ private:
     D2D1_RECT_F CoreAppearanceShortLabelInputRectangle(
         const D2D1_SIZE_F& client) const {
         const D2D1_RECT_F card = CoreAppearancePanelRectangle(client);
-        return D2D1::RectF(card.left + 104.0f, card.top + 185.0f,
+        const float labelWidth = localization_.CurrentLocale() == L"zh-CN"
+            ? 104.0f : 154.0f;
+        return D2D1::RectF(card.left + labelWidth, card.top + 185.0f,
                            card.right - 126.0f, card.top + 211.0f);
     }
 
@@ -14201,11 +14211,13 @@ private:
         const std::wstring shortLabelHint = !hasShortLabelError
             ? T("appearance.short_label_hint")
             : coreShortLabelEditError_;
+        const float appearanceLabelWidth =
+            localization_.CurrentLocale() == L"zh-CN" ? 104.0f : 154.0f;
         renderTarget_->DrawTextW(
             shortLabelHint.c_str(),
             static_cast<UINT32>(shortLabelHint.size()),
             hudFormat_.Get(),
-            D2D1::RectF(card.left + 104.0f, card.top + 215.0f,
+            D2D1::RectF(card.left + appearanceLabelWidth, card.top + 215.0f,
                          card.right - 14.0f, card.top + 239.0f),
             brush_.Get(), D2D1_DRAW_TEXT_OPTIONS_CLIP);
 
