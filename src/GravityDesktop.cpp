@@ -421,6 +421,7 @@ enum MenuCommand : UINT {
     MenuLanguagePicker,
     MenuOpenDataFolder,
     MenuGenerateDiagnosticReport,
+    MenuOpenOfficialWebsite,
     MenuAdjustCoreDistance,
     MenuConnectionStyleThin,
     MenuConnectionStyleStandard,
@@ -12724,6 +12725,14 @@ private:
         case SettingsPage::Help: {
             const std::wstring tutorialDescription = T("settings.help.tutorial.description");
             const std::wstring tutorial = T("settings.help.tutorial");
+            const std::wstring aboutTitle = T("settings.about.title");
+            const std::wstring aboutProduct = T("settings.about.product");
+            const std::wstring aboutDescription = T("settings.about.description");
+            const std::wstring aboutVersion = T("settings.about.version");
+            const std::wstring aboutDeveloper = T("settings.about.developer");
+            const std::wstring aboutWebsite = T("settings.about.website");
+            const std::wstring aboutOpenWebsite = T("settings.about.open_website");
+            const std::wstring aboutCopyright = T("settings.about.copyright");
             int y = 56;
             y += CreateSettingsWrappedText(
                 settingsContentWindow_, tutorialDescription,
@@ -12731,6 +12740,28 @@ private:
             y += 12;
             CreateSettingsButton(settingsContentWindow_, tutorial.c_str(),
                 16, y, 220, 30, MenuTrayTutorial);
+            y += 54;
+            CreateSettingsHeading(settingsContentWindow_, aboutTitle.c_str(),
+                16, y, contentWidth, 24);
+            y += 30;
+            y += CreateSettingsWrappedText(settingsContentWindow_,
+                aboutProduct, 16, y, contentWidth, 22);
+            y += CreateSettingsWrappedText(settingsContentWindow_,
+                aboutDescription, 16, y, contentWidth, 22);
+            y += 8;
+            y += CreateSettingsWrappedText(settingsContentWindow_,
+                aboutVersion, 16, y, contentWidth, 20);
+            y += CreateSettingsWrappedText(settingsContentWindow_,
+                aboutDeveloper, 16, y, contentWidth, 20);
+            y += CreateSettingsWrappedText(settingsContentWindow_,
+                aboutWebsite, 16, y, contentWidth, 20);
+            y += 8;
+            CreateSettingsButton(settingsContentWindow_,
+                aboutOpenWebsite.c_str(), 16, y, 220, 30,
+                MenuOpenOfficialWebsite);
+            y += 42;
+            CreateSettingsWrappedText(settingsContentWindow_, aboutCopyright,
+                16, y, contentWidth, 20);
             break;
         }
         case SettingsPage::Advanced: {
@@ -12769,7 +12800,7 @@ private:
             case SettingsPage::Appearance: height = SettingsDipToPixels(338); break;
             case SettingsPage::Workspace: height = SettingsDipToPixels(180); break;
             case SettingsPage::Data: height = SettingsDipToPixels(448); break;
-            case SettingsPage::Help: height = SettingsDipToPixels(180); break;
+            case SettingsPage::Help: height = SettingsDipToPixels(390); break;
             case SettingsPage::Advanced: height = SettingsDipToPixels(280); break;
             default: break;
             }
@@ -12781,6 +12812,9 @@ private:
             const int base = localization_.CurrentLocale() != L"zh-CN" ? 250 : 230;
             const int rowHeight = localization_.CurrentLocale() != L"zh-CN" ? 52 : 48;
             height = SettingsDipToPixels(base + std::min(archivedCount, 6) * rowHeight);
+        }
+        if (settingsPage_ == SettingsPage::Help) {
+            height = SettingsDipToPixels(390);
         }
         return height;
     }
@@ -21116,6 +21150,11 @@ private:
             break;
         case MenuGenerateDiagnosticReport:
             GenerateDiagnosticReport();
+            break;
+        case MenuOpenOfficialWebsite:
+            ShellExecuteW(settingsWindow_ != nullptr ? settingsWindow_ : window_,
+                          L"open", L"https://gravitydesktop.com", nullptr,
+                          nullptr, SW_SHOWNORMAL);
             break;
         case MenuAdjustCoreDistance:
             OpenCoreDistanceSlider(selected_.coreId);

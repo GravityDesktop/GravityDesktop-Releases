@@ -19,11 +19,11 @@ BEGIN
     BEGIN
         BLOCK "040904B0"
         BEGIN
-            VALUE "CompanyName", "wangboyun"
+            VALUE "CompanyName", ""
             VALUE "FileDescription", "Gravity Desktop Recovery"
             VALUE "FileVersion", "0.1.0-alpha"
             VALUE "InternalName", "GravityDesktopRecovery"
-            VALUE "LegalCopyright", "Copyright © 2026 wangboyun"
+            VALUE "LegalCopyright", "© 2026 wangboyun. All rights reserved."
             VALUE "OriginalFilename", "GravityDesktopRecovery.exe"
             VALUE "ProductName", "Gravity Desktop Recovery"
             VALUE "ProductVersion", "0.1.0-alpha"

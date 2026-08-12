@@ -5,6 +5,7 @@
 #define MyAppEnglishName "Gravity Desktop"
 #define MyAppVersion "0.1.0-alpha"
 #define MyAppPublisher "wangboyun"
+#define MyAppWebsite "https://gravitydesktop.com"
 #define MyAppExeName "GravityDesktop.exe"
 
 [Setup]
@@ -12,6 +13,9 @@ AppId={{CF0B84D4-4B86-497C-A89C-5B4F49AB2D64}
 AppName={#MyAppName}
 AppVersion={#MyAppVersion}
 AppPublisher={#MyAppPublisher}
+AppPublisherURL={#MyAppWebsite}
+AppSupportURL={#MyAppWebsite}
+AppUpdatesURL={#MyAppWebsite}
 AppComments=桌面文件工作关系整理工具
 DefaultDirName={localappdata}\Programs\Gravity Desktop
 DefaultGroupName={#MyAppName}
@@ -30,6 +34,8 @@ VersionInfoVersion=0.1.0.0
 VersionInfoProductVersion=0.1.0.0
 VersionInfoProductName={#MyAppName}
 VersionInfoDescription=桌面文件工作关系整理工具
+VersionInfoCompany={#MyAppPublisher}
+VersionInfoCopyright=© 2026 wangboyun. All rights reserved.
 Compression=lzma2/ultra64
 SolidCompression=yes
 WizardStyle=modern
