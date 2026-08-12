@@ -299,6 +299,8 @@ enum class SettingsPage : int {
 constexpr float kConnectionLineWidthThin = 0.8f;
 constexpr float kConnectionLineWidthStandard = 1.2f;
 constexpr float kConnectionLineWidthEmphasis = 1.6f;
+constexpr float kCoreGlowIntensityMinimum = 0.30f;
+constexpr float kCoreGlowIntensityMaximum = 2.00f;
 
 ConnectionWidthPreset ConnectionWidthPresetFor(float width) {
     constexpr float epsilon = 0.015f;
@@ -3400,7 +3402,7 @@ bool DeserializeState(const std::string& json, WorkspaceState& state,
             loaded.coreGlowIntensity = std::clamp(
                 static_cast<float>(NumberMember(
                     *settings, "core_glow_intensity", 1.0)),
-                0.30f, 1.60f);
+                kCoreGlowIntensityMinimum, kCoreGlowIntensityMaximum);
             loaded.workspaceWidthRatio = std::clamp(static_cast<float>(
                 NumberMember(*settings, "workspace_ratio",
                     NumberMember(*settings, "workspace_width_ratio",
@@ -10631,7 +10633,10 @@ private:
     }
 
     float CoreGlowIntensity(const Core&) const {
-        return std::clamp(state_.coreGlowIntensity, 0.30f, 1.60f);
+        return std::clamp(
+            state_.coreGlowIntensity,
+            kCoreGlowIntensityMinimum,
+            kCoreGlowIntensityMaximum);
     }
 
     float CoreVisualScale(const Core& core) const {
@@ -14255,7 +14260,8 @@ private:
         switch (control) {
         case CoreAppearanceControl::CoreScale: return 0.80f;
         case CoreAppearanceControl::LineWidth: return 0.70f;
-        case CoreAppearanceControl::GlowIntensity: return 0.30f;
+        case CoreAppearanceControl::GlowIntensity:
+            return kCoreGlowIntensityMinimum;
         default: return 0.0f;
         }
     }
@@ -14264,7 +14270,8 @@ private:
         switch (control) {
         case CoreAppearanceControl::CoreScale: return 1.20f;
         case CoreAppearanceControl::LineWidth: return 2.50f;
-        case CoreAppearanceControl::GlowIntensity: return 1.60f;
+        case CoreAppearanceControl::GlowIntensity:
+            return kCoreGlowIntensityMaximum;
         default: return 1.0f;
         }
     }
@@ -30446,6 +30453,18 @@ bool RunSelfTest() {
     }
     if (GravityApp::WorkspaceChromeSlideDurationForMode(
             AnimationMode::Soft) != 260.0f) {
+        return false;
+    }
+    if (GravityApp::CoreAppearanceMaximum(
+            CoreAppearanceControl::GlowIntensity) !=
+            kCoreGlowIntensityMaximum) {
+        return false;
+    }
+    GravityApp glowRangeApp;
+    glowRangeApp.state_.coreGlowIntensity = 2.0f;
+    Core glowRangeCore;
+    if (std::abs(glowRangeApp.CoreGlowIntensity(glowRangeCore) - 2.0f) >
+        0.001f) {
         return false;
     }
 
