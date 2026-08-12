@@ -1,0 +1,40 @@
+<?xml version="1.0" encoding="utf-8"?>
+<Project ToolsVersion="15.0" DefaultTargets="Build" xmlns="http://schemas.microsoft.com/developer/msbuild/2003">
+  <PropertyGroup>
+    <WapProjPath Condition="'$(WapProjPath)' == ''">$(MSBuildExtensionsPath32)\Microsoft\DesktopBridge\</WapProjPath>
+    <ProjectGuid>{6B8E5BF3-6E43-49EA-AD2B-3A8DD7D55D80}</ProjectGuid>
+    <TargetPlatformIdentifier>UAP</TargetPlatformIdentifier>
+    <TargetPlatformVersion>10.0.26100.0</TargetPlatformVersion>
+    <TargetPlatformMinVersion>10.0.22000.0</TargetPlatformMinVersion>
+    <DefaultLanguage>en-US</DefaultLanguage>
+    <AppxPackageSigningEnabled>false</AppxPackageSigningEnabled>
+    <AppxBundle>Never</AppxBundle>
+    <AppxPackageDir>$(MSBuildProjectDirectory)\..\out\msix-wapproj\</AppxPackageDir>
+  </PropertyGroup>
+
+  <Import Project="$(WapProjPath)\Microsoft.DesktopBridge.props" />
+
+  <ItemGroup>
+    <ProjectReference Include="..\GravityDesktop.vcxproj">
+      <Project>{7EC2BFF8-B359-4B2E-9787-2B9919A95A72}</Project>
+      <Name>GravityDesktop</Name>
+    </ProjectReference>
+    <ProjectReference Include="..\GravityDesktopRecovery.vcxproj">
+      <Project>{E0C0972E-0D9F-4A31-B837-0C2E6A8F3F11}</Project>
+      <Name>GravityDesktopRecovery</Name>
+    </ProjectReference>
+    <AppxManifest Include="Package.appxmanifest" />
+    <Content Include="Assets\StoreLogo.png" />
+    <Content Include="Assets\Square44x44Logo.png" />
+    <Content Include="Assets\Square150x150Logo.png" />
+    <Content Include="Assets\Wide310x150Logo.png" />
+    <Content Include="..\src\locales\zh-CN.json"><Link>locales\zh-CN.json</Link></Content>
+    <Content Include="..\src\locales\en-US.json"><Link>locales\en-US.json</Link></Content>
+    <Content Include="..\src\locales\ja-JP.json"><Link>locales\ja-JP.json</Link></Content>
+    <Content Include="..\src\locales\de-DE.json"><Link>locales\de-DE.json</Link></Content>
+    <Content Include="..\src\locales\es-ES.json"><Link>locales\es-ES.json</Link></Content>
+    <Content Include="..\src\locales\fr-FR.json"><Link>locales\fr-FR.json</Link></Content>
+  </ItemGroup>
+
+  <Import Project="$(WapProjPath)\Microsoft.DesktopBridge.targets" />
+</Project>
