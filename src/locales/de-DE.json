@@ -53,7 +53,7 @@
   "settings.about.title": "Über Gravity Desktop",
   "settings.about.product": "Gravity Desktop / 引力桌面",
   "settings.about.description": "Tool zum Organisieren von Arbeitsbeziehungen zwischen Desktopdateien",
-  "settings.about.version": "Version: 0.1.0-alpha",
+  "settings.about.version": "Version: {version}",
   "settings.about.developer": "Entwickler: 王博赟 (wangboyun)",
   "settings.about.website": "Offizielle Website: gravitydesktop.com",
   "settings.about.open_website": "Offizielle Website öffnen",

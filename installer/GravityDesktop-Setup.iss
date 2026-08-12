@@ -3,10 +3,12 @@
 
 #define MyAppName "引力桌面"
 #define MyAppEnglishName "Gravity Desktop"
-#define MyAppVersion "0.1.0-alpha"
 #define MyAppPublisher "wangboyun"
 #define MyAppWebsite "https://gravitydesktop.com"
 #define MyAppExeName "GravityDesktop.exe"
+#define MyAppBinary AddBackslash(SourcePath) + "..\out\Release\GravityDesktop.exe"
+#define MyAppVersion GetFileProductVersionString(MyAppBinary)
+#define MyAppFileVersion GetVersionNumbersString(MyAppBinary)
 
 [Setup]
 AppId={{CF0B84D4-4B86-497C-A89C-5B4F49AB2D64}
@@ -27,11 +29,11 @@ PrivilegesRequiredOverridesAllowed=commandline
 ArchitecturesAllowed=x64compatible
 ArchitecturesInstallIn64BitMode=x64compatible
 OutputDir=..\out\installer
-OutputBaseFilename=GravityDesktop-Setup-0.1.0-alpha
+OutputBaseFilename=GravityDesktop-Setup-{#MyAppVersion}
 SetupIconFile=..\src\GravityDesktop.ico
 UninstallDisplayIcon={app}\{#MyAppExeName}
-VersionInfoVersion=0.1.0.0
-VersionInfoProductVersion=0.1.0.0
+VersionInfoVersion={#MyAppFileVersion}
+VersionInfoProductVersion={#MyAppFileVersion}
 VersionInfoProductName={#MyAppName}
 VersionInfoDescription=桌面文件工作关系整理工具
 VersionInfoCompany={#MyAppPublisher}

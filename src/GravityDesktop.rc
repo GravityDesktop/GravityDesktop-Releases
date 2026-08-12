@@ -2,12 +2,13 @@
 
 #include <winver.h>
 #include "GravityDesktopResource.h"
+#include "GravityDesktopVersion.h"
 
 IDI_GRAVITYDESKTOP ICON "GravityDesktop.ico"
 
 VS_VERSION_INFO VERSIONINFO
- FILEVERSION 0,1,0,0
- PRODUCTVERSION 0,1,0,0
+ FILEVERSION GRAVITY_DESKTOP_VERSION_TUPLE
+ PRODUCTVERSION GRAVITY_DESKTOP_VERSION_TUPLE
  FILEFLAGSMASK 0x3fL
 #ifdef _DEBUG
  FILEFLAGS VS_FF_DEBUG
@@ -23,11 +24,11 @@ BEGIN
         BLOCK "080404B0"
         BEGIN
             VALUE "FileDescription", "桌面文件工作关系整理工具"
-            VALUE "FileVersion", "0.1.0-alpha"
+            VALUE "FileVersion", GRAVITY_DESKTOP_VERSION_STRING
             VALUE "InternalName", "GravityDesktop"
             VALUE "OriginalFilename", "GravityDesktop.exe"
             VALUE "ProductName", "Gravity Desktop"
-            VALUE "ProductVersion", "0.1.0-alpha"
+            VALUE "ProductVersion", GRAVITY_DESKTOP_VERSION_STRING
             VALUE "CompanyName", ""
             VALUE "LegalCopyright", "© 2026 wangboyun. All rights reserved."
             VALUE "Comments", "引力桌面 / Gravity Desktop; Developer: 王博赟 (wangboyun); Website: https://gravitydesktop.com"

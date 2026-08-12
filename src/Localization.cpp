@@ -304,6 +304,106 @@ bool ValidateLocaleFiles() {
     return true;
 }
 
+bool ValidateSettingsLayoutAtSupportedDpis() {
+    constexpr std::array<std::wstring_view, 6> locales{
+        L"zh-CN", L"en-US", L"ja-JP", L"de-DE", L"es-ES", L"fr-FR"};
+    constexpr std::array<int, 4> dpis{96, 120, 144, 192};
+    struct ControlTextLimit {
+        std::string_view key;
+        int widthDip;
+    };
+    // Navigation and choice buttons must remain fully readable. Action buttons
+    // intentionally support end ellipsis, while wrapped descriptions measure
+    // their height dynamically in the settings window.
+    constexpr std::array<ControlTextLimit, 7> navigationLimits{{
+        {"settings.general", 208},
+        {"settings.appearance", 208},
+        {"settings.workspace", 208},
+        {"settings.data", 208},
+        {"settings.core_management", 208},
+        {"settings.help", 208},
+        {"settings.advanced", 208},
+    }};
+    constexpr std::array<std::string_view, 3> densityKeys{
+        "settings.density.compact", "settings.density.standard",
+        "settings.density.clear"};
+    constexpr std::array<std::string_view, 4> animationKeys{
+        "settings.animation.off", "settings.animation.simple",
+        "settings.animation.standard", "settings.animation.soft"};
+    constexpr std::array<std::string_view, 3> selectionKeys{
+        "settings.selection.ripple", "settings.selection.once",
+        "settings.selection.static"};
+
+    HDC screen = GetDC(nullptr);
+    if (screen == nullptr) return false;
+    bool valid = true;
+    for (const std::wstring_view locale : locales) {
+        const auto resource = LoadLocaleFile(locale);
+        if (!resource.has_value()) {
+            valid = false;
+            break;
+        }
+        for (const int dpi : dpis) {
+            HFONT font = CreateFontW(
+                -MulDiv(14, dpi, 96), 0, 0, 0, FW_NORMAL,
+                FALSE, FALSE, FALSE, DEFAULT_CHARSET,
+                OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS,
+                CLEARTYPE_QUALITY, DEFAULT_PITCH | FF_DONTCARE,
+                L"Segoe UI");
+            if (font == nullptr) {
+                valid = false;
+                break;
+            }
+            HGDIOBJ previous = SelectObject(screen, font);
+            const auto textFits = [&](std::string_view key, int widthDip) {
+                const auto found = resource->find(std::string(key));
+                if (found == resource->end()) return false;
+                SIZE size{};
+                return GetTextExtentPoint32W(
+                           screen, found->second.c_str(),
+                           static_cast<int>(found->second.size()), &size) != FALSE &&
+                    size.cx + MulDiv(4, dpi, 96) <=
+                        MulDiv(widthDip, dpi, 96);
+            };
+            for (const ControlTextLimit& limit : navigationLimits) {
+                if (!textFits(limit.key, limit.widthDip)) {
+                    valid = false;
+                    break;
+                }
+            }
+            const bool chinese = locale == L"zh-CN";
+            const int densityWidth = chinese ? 82 : 118;
+            const int animationWidth = chinese ? 70 : 88;
+            for (const std::string_view key : densityKeys) {
+                valid = valid && textFits(key, densityWidth);
+            }
+            for (const std::string_view key : animationKeys) {
+                valid = valid && textFits(key, animationWidth);
+            }
+            if (chinese) {
+                valid = valid && textFits(selectionKeys[0], 116) &&
+                    textFits(selectionKeys[1], 142) &&
+                    textFits(selectionKeys[2], 116);
+            } else {
+                for (const std::string_view key : selectionKeys) {
+                    valid = valid && textFits(key, 390);
+                }
+            }
+            // Verify the actual button grids still fit the fixed content rail.
+            constexpr int contentRightDip = 406;
+            valid = valid &&
+                16 + 3 * densityWidth + 2 * 10 <= contentRightDip &&
+                16 + 4 * animationWidth + 3 * 8 <= contentRightDip;
+            SelectObject(screen, previous);
+            DeleteObject(font);
+            if (!valid) break;
+        }
+        if (!valid) break;
+    }
+    ReleaseDC(nullptr, screen);
+    return valid;
+}
+
 std::unordered_map<std::string, std::wstring> BuiltInEnglish() {
     return {
         {"app.title", L"Gravity Desktop"},
@@ -546,7 +646,8 @@ bool Localization::RunSelfTest() {
         ResolveRequestedLanguage(L"es-MX") == L"es-ES" &&
         ResolveRequestedLanguage(L"fr-CA") == L"fr-FR" &&
         parsed.has_value() && parsed->at("text") == L"Français ü 日本語" &&
-        ValidateLocaleFiles();
+        ValidateLocaleFiles() &&
+        ValidateSettingsLayoutAtSupportedDpis();
 }
 
 } // namespace gravity::i18n

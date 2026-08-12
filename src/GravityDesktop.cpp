@@ -14,6 +14,7 @@
 #include <wrl/client.h>
 
 #include "GravityDesktopResource.h"
+#include "GravityDesktopVersion.h"
 #include "Localization.h"
 
 #include <algorithm>
@@ -101,7 +102,7 @@ constexpr UINT_PTR kRelationshipManifestRetryTimer = 16;
 constexpr UINT_PTR kWorkspaceChromeAutoHideTimer = 17;
 constexpr UINT_PTR kWorkspaceChromeRevealWatchTimer = 18;
 constexpr UINT_PTR kDesktopPointerRecoveryTimer = 19;
-constexpr UINT kWorkspaceChromeAutoHideDelayMs = 280;
+constexpr UINT kWorkspaceChromeAutoHideDelayMs = 180;
 constexpr UINT kWorkspaceChromeRevealWatchIntervalMs = 100;
 constexpr UINT kDesktopPointerRecoveryIntervalMs = 125;
 constexpr std::array<UINT, 3> kSaveRetryDelaysMs{
@@ -2210,6 +2211,15 @@ std::int64_t UnixTimeNow() {
     return std::chrono::duration_cast<std::chrono::seconds>(
                std::chrono::system_clock::now().time_since_epoch())
         .count();
+}
+
+std::string CreateRuntimeDiagnosticSessionId() {
+    std::ostringstream output;
+    output.imbue(std::locale::classic());
+    output << std::hex << static_cast<unsigned long long>(UnixTimeNow())
+           << '-' << static_cast<unsigned long>(GetCurrentProcessId())
+           << '-' << static_cast<unsigned long long>(GetTickCount64());
+    return output.str();
 }
 
 std::wstring FormatTimestamp(std::int64_t timestamp,
@@ -4564,7 +4574,8 @@ class GravityApp {
 public:
     explicit GravityApp(bool benchmarkMode = false,
                         bool autoStartMode = false)
-        : benchmarkMode_(benchmarkMode), autoStartMode_(autoStartMode) {}
+        : diagnosticSessionId_(CreateRuntimeDiagnosticSessionId()),
+          benchmarkMode_(benchmarkMode), autoStartMode_(autoStartMode) {}
 
     friend bool RunSelfTest();
 
@@ -4676,6 +4687,8 @@ public:
             GetWindowRect(window_, &visualRect) != FALSE;
         log << UnixTimeNow() << ' ' << event
             << " pid=" << GetCurrentProcessId()
+            << " version=" << GRAVITY_DESKTOP_VERSION_STRING
+            << " session=" << diagnosticSessionId_
             << " visual=" << handleValue(window_)
             << " input=" << handleValue(interactionWindow_)
             << " divider=" << handleValue(dividerHandleWindow_)
@@ -12773,7 +12786,9 @@ private:
             const std::wstring aboutTitle = T("settings.about.title");
             const std::wstring aboutProduct = T("settings.about.product");
             const std::wstring aboutDescription = T("settings.about.description");
-            const std::wstring aboutVersion = T("settings.about.version");
+            const std::wstring aboutVersion = localization_.Format(
+                "settings.about.version",
+                {{L"version", GRAVITY_DESKTOP_VERSION_WSTRING}});
             const std::wstring aboutDeveloper = T("settings.about.developer");
             const std::wstring aboutWebsite = T("settings.about.website");
             const std::wstring aboutOpenWebsite = T("settings.about.open_website");
@@ -19641,7 +19656,7 @@ private:
         output.imbue(std::locale::classic());
         output << "report_schema=1\n"
                << "product=Gravity Desktop\n"
-               << "version=0.1.0-alpha\n"
+               << "version=" << GRAVITY_DESKTOP_VERSION_STRING << "\n"
                << "timestamp=" << UnixTimeNow() << "\n"
                << "architecture=" <<
                    (systemInfo.wProcessorArchitecture == PROCESSOR_ARCHITECTURE_AMD64
@@ -27440,6 +27455,7 @@ private:
     std::unordered_map<std::uint64_t, CoreLayoutSnapshot>
         lastCoreLayouts_;
     std::filesystem::path stateFile_;
+    std::string diagnosticSessionId_;
     bool dirty_ = false;
     std::size_t saveRetryAttempt_ = 0;
     bool saveTimerActive_ = false;
@@ -27858,6 +27874,30 @@ bool RunSelfTest() {
             dividerCenter + 12, 45, dividerCenter) ||
         dividerGeometryApp.DividerTriangleContainsLocalPoint(
             dividerCenter, 48, dividerCenter)) {
+        return false;
+    }
+
+    const std::filesystem::path diagnosticTestDirectory =
+        std::filesystem::temp_directory_path() /
+        (L"GravityDesktop.Diagnostics." +
+         std::to_wstring(GetCurrentProcessId()));
+    struct DiagnosticTestCleanup {
+        std::filesystem::path path;
+        ~DiagnosticTestCleanup() {
+            std::error_code ignored;
+            std::filesystem::remove_all(path, ignored);
+        }
+    } diagnosticTestCleanup{diagnosticTestDirectory};
+    GravityApp diagnosticApp;
+    diagnosticApp.stateFile_ = diagnosticTestDirectory / L"state.json";
+    diagnosticApp.AppendRuntimeDiagnostic("self_test");
+    const std::optional<std::string> diagnosticLog =
+        ReadUtf8File(diagnosticApp.RuntimeDiagnosticLogPath());
+    if (!diagnosticLog.has_value() ||
+        diagnosticLog->find(
+            std::string("version=") + GRAVITY_DESKTOP_VERSION_STRING) ==
+            std::string::npos ||
+        diagnosticLog->find(" session=") == std::string::npos) {
         return false;
     }
 
@@ -30471,7 +30511,8 @@ bool RunSelfTest() {
         relationTestDirectory / L"diagnostic-report.zip";
     if (!WriteStoredZip(
             diagnosticZip,
-            {{"diagnostic.txt", "version=0.1.0-alpha\n"},
+            {{"diagnostic.txt",
+              std::string("version=") + GRAVITY_DESKTOP_VERSION_STRING + "\n"},
              {"logs/runtime.log", "event=test\n"}})) {
         return false;
     }

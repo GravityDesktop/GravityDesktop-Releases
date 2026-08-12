@@ -53,7 +53,7 @@
   "settings.about.title": "Gravity Desktop について",
   "settings.about.product": "引力桌面 Gravity Desktop",
   "settings.about.description": "デスクトップ上のファイルの作業関係を整理するツール",
-  "settings.about.version": "バージョン: 0.1.0-alpha",
+  "settings.about.version": "バージョン: {version}",
   "settings.about.developer": "開発者: 王博赟 (wangboyun)",
   "settings.about.website": "公式サイト: gravitydesktop.com",
   "settings.about.open_website": "公式サイトを開く",
