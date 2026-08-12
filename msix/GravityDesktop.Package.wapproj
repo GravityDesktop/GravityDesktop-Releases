@@ -24,10 +24,7 @@
       <Name>GravityDesktopRecovery</Name>
     </ProjectReference>
     <AppxManifest Include="Package.appxmanifest" />
-    <Content Include="Assets\StoreLogo.png" />
-    <Content Include="Assets\Square44x44Logo.png" />
-    <Content Include="Assets\Square150x150Logo.png" />
-    <Content Include="Assets\Wide310x150Logo.png" />
+    <Content Include="Assets\*.png" />
     <Content Include="..\src\locales\zh-CN.json"><Link>locales\zh-CN.json</Link></Content>
     <Content Include="..\src\locales\en-US.json"><Link>locales\en-US.json</Link></Content>
     <Content Include="..\src\locales\ja-JP.json"><Link>locales\ja-JP.json</Link></Content>

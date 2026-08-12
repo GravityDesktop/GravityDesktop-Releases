@@ -10,6 +10,10 @@ not replace `installer/GravityDesktop-Setup.iss` or alter application behavior.
 - `Package.appxmanifest`: x64 Windows 11 desktop manifest with `runFullTrust`.
   It exposes separate launch entries for Gravity Desktop and Gravity Desktop
   Recovery.
+- `Assets`: transparent high-resolution logo assets. The Square44 resource has
+  target-size and DPI-scale variants so the shell can select an exact taskbar,
+  Alt+Tab, Start, Search, and Task View icon instead of enlarging one small
+  bitmap. Both application entries use this same branded resource family.
 - `Build-MsixPrototype.ps1`: Windows SDK MakeAppx fallback that stages the
   current Release binaries, six runtime locale resources, and package assets.
 
