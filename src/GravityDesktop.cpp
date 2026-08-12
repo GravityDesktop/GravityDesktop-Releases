@@ -10,8 +10,13 @@
 #include <shlobj.h>
 #include <shobjidl.h>
 #include <shlwapi.h>
+#include <appmodel.h>
 #include <wincodec.h>
 #include <wrl/client.h>
+
+#include <winrt/base.h>
+#include <winrt/Windows.Foundation.h>
+#include <winrt/Windows.ApplicationModel.h>
 
 #include "GravityDesktopResource.h"
 #include "GravityDesktopVersion.h"
@@ -57,6 +62,7 @@
 #pragma comment(lib, "uuid.lib")
 #pragma comment(lib, "comdlg32.lib")
 #pragma comment(lib, "comctl32.lib")
+#pragma comment(lib, "windowsapp.lib")
 
 using Microsoft::WRL::ComPtr;
 
@@ -202,6 +208,7 @@ constexpr wchar_t kAutoStartRegistrySubkey[] =
 constexpr wchar_t kAutoStartRegistryValueName[] = L"GravityDesktop";
 constexpr wchar_t kDevelopmentAutoStartRegistryValueName[] =
     L"GravityDesktop.Development";
+constexpr wchar_t kPackagedStartupTaskId[] = L"GravityDesktopStartup";
 constexpr float kPi = 3.14159265358979323846f;
 constexpr std::array<int, 3> kRingCapacities{6, 13, 0};
 constexpr std::array<int, 3> kRingStarts{0, 6, 19};
@@ -2012,6 +2019,13 @@ std::wstring CurrentExecutablePath() {
     return NormalizePath(buffer);
 }
 
+bool IsPackagedProcess() {
+    UINT32 packageFullNameLength = 0;
+    const LONG result = GetCurrentPackageFullName(
+        &packageFullNameLength, nullptr);
+    return result == ERROR_SUCCESS || result == ERROR_INSUFFICIENT_BUFFER;
+}
+
 bool IsDevelopmentBuildExecutable(const std::wstring& executablePath) {
     if (executablePath.empty()) {
         return false;
@@ -2079,6 +2093,32 @@ struct AutoStartRegistrationStatus {
 
 AutoStartRegistrationStatus ReadAutoStartRegistration() {
     AutoStartRegistrationStatus status;
+    if (IsPackagedProcess()) {
+        try {
+            winrt::init_apartment(winrt::apartment_type::single_threaded);
+            const auto startupTask =
+                winrt::Windows::ApplicationModel::StartupTask::GetAsync(
+                    kPackagedStartupTaskId).get();
+            switch (startupTask.State()) {
+            case winrt::Windows::ApplicationModel::StartupTaskState::Enabled:
+                status.state = AutoStartRegistrationState::Enabled;
+                break;
+            case winrt::Windows::ApplicationModel::StartupTaskState::Disabled:
+            case winrt::Windows::ApplicationModel::StartupTaskState::DisabledByUser:
+            case winrt::Windows::ApplicationModel::StartupTaskState::DisabledByPolicy:
+                status.state = AutoStartRegistrationState::Disabled;
+                break;
+            default:
+                status.state = AutoStartRegistrationState::Unavailable;
+                break;
+            }
+        } catch (const winrt::hresult_error& error) {
+            status.error = static_cast<LONG>(error.code().value);
+        } catch (...) {
+            status.error = E_FAIL;
+        }
+        return status;
+    }
     const std::wstring executablePath = CurrentExecutablePath();
     if (executablePath.empty()) {
         status.error = GetLastError();
@@ -2159,6 +2199,24 @@ AutoStartRegistrationStatus ReadAutoStartRegistration() {
 }
 
 bool WriteAutoStartRegistration(bool enabled) {
+    if (IsPackagedProcess()) {
+        try {
+            winrt::init_apartment(winrt::apartment_type::single_threaded);
+            const auto startupTask =
+                winrt::Windows::ApplicationModel::StartupTask::GetAsync(
+                    kPackagedStartupTaskId).get();
+            if (enabled) {
+                const auto result = startupTask.RequestEnableAsync().get();
+                return result ==
+                    winrt::Windows::ApplicationModel::StartupTaskState::Enabled;
+            }
+            startupTask.Disable();
+            return startupTask.State() !=
+                winrt::Windows::ApplicationModel::StartupTaskState::Enabled;
+        } catch (...) {
+            return false;
+        }
+    }
     const std::wstring executablePath = CurrentExecutablePath();
     if (executablePath.empty()) {
         return false;

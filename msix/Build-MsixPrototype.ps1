@@ -1,6 +1,9 @@
 param(
     [ValidateSet('Release')]
-    [string]$Configuration = 'Release'
+    [string]$Configuration = 'Release',
+    [ValidatePattern('^\d+\.\d+\.\d+\.\d+$')]
+    [string]$PackageVersion = '0.1.0.0',
+    [string]$PackageName = 'GravityDesktop-MSIX-Prototype-0.1.0-alpha.msix'
 )
 
 $ErrorActionPreference = 'Stop'
@@ -9,7 +12,7 @@ $projectRoot = (Resolve-Path (Join-Path $PSScriptRoot '..')).Path
 $releaseRoot = Join-Path $projectRoot "out\$Configuration"
 $outputRoot = Join-Path $projectRoot 'out\msix-prototype'
 $stagingRoot = Join-Path $outputRoot 'staging'
-$packagePath = Join-Path $outputRoot 'GravityDesktop-MSIX-Prototype-0.1.0-alpha.msix'
+$packagePath = Join-Path $outputRoot $PackageName
 $makeAppx = 'C:\Program Files (x86)\Windows Kits\10\bin\10.0.26100.0\x64\makeappx.exe'
 
 if (-not (Test-Path $makeAppx)) {
@@ -28,7 +31,9 @@ if (Test-Path $stagingRoot) {
 New-Item -ItemType Directory -Force -Path (Join-Path $stagingRoot 'Assets'), (Join-Path $stagingRoot 'locales') | Out-Null
 New-Item -ItemType Directory -Force -Path $outputRoot | Out-Null
 
-Copy-Item -LiteralPath (Join-Path $PSScriptRoot 'Package.appxmanifest') -Destination (Join-Path $stagingRoot 'AppxManifest.xml')
+$manifestText = Get-Content -LiteralPath (Join-Path $PSScriptRoot 'Package.appxmanifest') -Raw -Encoding utf8
+$manifestText = $manifestText -replace 'Version="0\.1\.0\.0"', "Version=`"$PackageVersion`""
+[System.IO.File]::WriteAllText((Join-Path $stagingRoot 'AppxManifest.xml'), $manifestText, [System.Text.UTF8Encoding]::new($false))
 Copy-Item -LiteralPath (Join-Path $releaseRoot 'GravityDesktop.exe') -Destination $stagingRoot
 Copy-Item -LiteralPath (Join-Path $releaseRoot 'GravityDesktopRecovery.exe') -Destination $stagingRoot
 Copy-Item -LiteralPath (Join-Path $releaseRoot 'GravityDesktopLibrary.ico') -Destination $stagingRoot -ErrorAction SilentlyContinue

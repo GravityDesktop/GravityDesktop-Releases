@@ -2,8 +2,9 @@
 <!-- Store identity reserved for GravityDesktop in Microsoft Partner Center. -->
 <Package xmlns="http://schemas.microsoft.com/appx/manifest/foundation/windows10"
          xmlns:uap="http://schemas.microsoft.com/appx/manifest/uap/windows10"
+         xmlns:desktop="http://schemas.microsoft.com/appx/manifest/desktop/windows10"
          xmlns:rescap="http://schemas.microsoft.com/appx/manifest/foundation/windows10/restrictedcapabilities"
-         IgnorableNamespaces="uap rescap">
+         IgnorableNamespaces="uap desktop rescap">
   <Identity Name="wbyhome.GravityDesktop"
             Publisher="CN=00AA024B-6408-4EF0-B53F-F515553B964E"
             Version="0.1.0.0"
@@ -37,6 +38,17 @@
                           Square44x44Logo="Assets\Square44x44Logo.png">
         <uap:DefaultTile Wide310x150Logo="Assets\Wide310x150Logo.png" />
       </uap:VisualElements>
+      <Extensions>
+        <!-- Disabled by default. The packaged UI requests this task only after
+             the user explicitly enables startup. -->
+        <desktop:Extension Category="windows.startupTask"
+                           Executable="GravityDesktop.exe"
+                           EntryPoint="Windows.FullTrustApplication">
+          <desktop:StartupTask TaskId="GravityDesktopStartup"
+                               Enabled="false"
+                               DisplayName="Gravity Desktop" />
+        </desktop:Extension>
+      </Extensions>
     </Application>
     <Application Id="GravityDesktopRecovery"
                  Executable="GravityDesktopRecovery.exe"
