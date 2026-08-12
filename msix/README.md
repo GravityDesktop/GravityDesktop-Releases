@@ -8,8 +8,10 @@ not replace `installer/GravityDesktop-Setup.iss` or alter application behavior.
 - `GravityDesktop.Package.wapproj`: Windows Application Packaging Project for
   Visual Studio once the Desktop Bridge / MSIX Packaging workload is installed.
 - `Package.appxmanifest`: x64 Windows 11 desktop manifest with `runFullTrust`.
-  It exposes separate launch entries for Gravity Desktop and Gravity Desktop
-  Recovery.
+  It exposes one Store entry for Gravity Desktop. `GravityDesktopRecovery.exe`
+  remains package payload and is copied to the existing durable safety-center
+  location only when its content changes, preserving independent emergency
+  recovery without defining a second Store application.
 - `Assets`: transparent high-resolution logo assets. The Square44 resource has
   target-size and DPI-scale variants so the shell can select an exact taskbar,
   Alt+Tab, Start, Search, and Task View icon instead of enlarging one small
@@ -31,8 +33,13 @@ version may continue to be `0.1.0-alpha`.
 
 ## Building an unsigned prototype package
 
-1. Build the existing x64 Release binaries.
-2. Run `./msix/Build-MsixPrototype.ps1` from the repository root.
+1. Build the Store-compatible x64 binary with
+   `MSBuild GravityDesktop.sln /t:Rebuild /p:Configuration=Release /p:Platform=x64 /p:GravityDesktopPackaged=true`.
+2. Run `./msix/Build-MsixPrototype.ps1 -PackagedBuild` from the repository root.
+
+The normal EXE/Inno build remains `Release`. The `ReleaseMSIX` build switches
+only the platform launcher boundary to Windows Runtime Launcher APIs; it does
+not change workspace, file-management, or recovery semantics.
 
 The script writes only under `out/msix-prototype`, which is ignored by Git. It
 creates an unsigned MSIX package for structure inspection. Sideloading it
@@ -45,9 +52,9 @@ Center-reserved identity and the Store signing workflow.
   `%LocalAppData%\GravityDesktop` state/preference location and Documents
   managed library. This prototype does not migrate, virtualize, delete, or
   rewrite user data.
-- Existing HKCU Run autostart remains untouched. A future Store-focused variant
-  should evaluate `windows.startupTask`; it must not be silently substituted
-  for the current behavior.
+- The unpackaged EXE keeps HKCU Run. Package-identity execution uses the
+  manifest-declared `windows.startupTask`, so the two registration paths are
+  never used together.
 - Desktop-host attachment, interaction islands, click-through, tray behavior,
   Explorer recovery, Win+D, DPI, and monitor behavior require installation
   testing under package identity. No packaging-only change is assumed to make
