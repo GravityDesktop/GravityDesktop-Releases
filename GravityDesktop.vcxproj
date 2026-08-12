@@ -33,8 +33,10 @@
   </PropertyGroup>
   <Import Project="$(VCTargetsPath)\Microsoft.Cpp.props" />
   <PropertyGroup>
-    <OutDir>$(SolutionDir)out\$(Configuration)\</OutDir>
-    <IntDir>$(SolutionDir)out\obj\$(Configuration)\</IntDir>
+    <GravityDesktopOutputSuffix Condition="'$(GravityDesktopPackaged)'=='true'">$(Configuration)MSIX</GravityDesktopOutputSuffix>
+    <GravityDesktopOutputSuffix Condition="'$(GravityDesktopOutputSuffix)'==''">$(Configuration)</GravityDesktopOutputSuffix>
+    <OutDir>$(SolutionDir)out\$(GravityDesktopOutputSuffix)\</OutDir>
+    <IntDir>$(SolutionDir)out\obj\$(GravityDesktopOutputSuffix)\</IntDir>
     <TargetName>GravityDesktop</TargetName>
   </PropertyGroup>
   <ItemDefinitionGroup Condition="'$(Configuration)|$(Platform)'=='Debug|x64'">
@@ -73,6 +75,11 @@
       <OptimizeReferences>true</OptimizeReferences>
       <GenerateDebugInformation>false</GenerateDebugInformation>
     </Link>
+  </ItemDefinitionGroup>
+  <ItemDefinitionGroup Condition="'$(GravityDesktopPackaged)'=='true'">
+    <ClCompile>
+      <PreprocessorDefinitions>GRAVITYDESKTOP_PACKAGED;%(PreprocessorDefinitions)</PreprocessorDefinitions>
+    </ClCompile>
   </ItemDefinitionGroup>
   <ItemDefinitionGroup>
     <Manifest>

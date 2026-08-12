@@ -3,13 +3,15 @@ param(
     [string]$Configuration = 'Release',
     [ValidatePattern('^\d+\.\d+\.\d+\.\d+$')]
     [string]$PackageVersion = '0.1.0.0',
-    [string]$PackageName = 'GravityDesktop-MSIX-Prototype-0.1.0-alpha.msix'
+    [string]$PackageName = 'GravityDesktop-MSIX-Prototype-0.1.0-alpha.msix',
+    [switch]$PackagedBuild
 )
 
 $ErrorActionPreference = 'Stop'
 
 $projectRoot = (Resolve-Path (Join-Path $PSScriptRoot '..')).Path
-$releaseRoot = Join-Path $projectRoot "out\$Configuration"
+$releaseFolder = if ($PackagedBuild) { "$Configuration`MSIX" } else { $Configuration }
+$releaseRoot = Join-Path $projectRoot "out\$releaseFolder"
 $outputRoot = Join-Path $projectRoot 'out\msix-prototype'
 $stagingRoot = Join-Path $outputRoot 'staging'
 $packagePath = Join-Path $outputRoot $PackageName

@@ -17,6 +17,11 @@
 #include <winrt/base.h>
 #include <winrt/Windows.Foundation.h>
 #include <winrt/Windows.ApplicationModel.h>
+#ifdef GRAVITYDESKTOP_PACKAGED
+#include <winrt/Windows.Foundation.Collections.h>
+#include <winrt/Windows.Storage.h>
+#include <winrt/Windows.System.h>
+#endif
 
 #include "GravityDesktopResource.h"
 #include "GravityDesktopVersion.h"
@@ -2024,6 +2029,103 @@ bool IsPackagedProcess() {
     const LONG result = GetCurrentPackageFullName(
         &packageFullNameLength, nullptr);
     return result == ERROR_SUCCESS || result == ERROR_INSUFFICIENT_BUFFER;
+}
+
+// This is the only shell-launch boundary in the application.  The normal
+// EXE keeps the long-standing ShellExecute behavior.  The MSIX build is a
+// separate, Store-compatible binary and deliberately compiles out every
+// ShellExecute/SHOpenFolderAndSelectItems call so the packaged process uses
+// the documented Windows Runtime Launcher APIs instead.
+bool OpenFileWithSystemLauncher(HWND owner, const std::wstring& path) {
+#ifdef GRAVITYDESKTOP_PACKAGED
+    (void)owner;
+    if (!IsPackagedProcess()) return false;
+    try {
+        const auto file = winrt::Windows::Storage::StorageFile::
+            GetFileFromPathAsync(path).get();
+        return winrt::Windows::System::Launcher::LaunchFileAsync(file).get();
+    } catch (...) {
+        return false;
+    }
+#else
+    SHELLEXECUTEINFOW execute{sizeof(execute)};
+    execute.fMask = SEE_MASK_FLAG_NO_UI | SEE_MASK_ASYNCOK;
+    execute.hwnd = owner;
+    execute.lpVerb = L"open";
+    execute.lpFile = path.c_str();
+    execute.nShow = SW_SHOWNORMAL;
+    return ShellExecuteExW(&execute) != FALSE;
+#endif
+}
+
+bool OpenFolderWithSystemLauncher(HWND owner, const std::wstring& path) {
+#ifdef GRAVITYDESKTOP_PACKAGED
+    (void)owner;
+    if (!IsPackagedProcess()) return false;
+    try {
+        const auto folder = winrt::Windows::Storage::StorageFolder::
+            GetFolderFromPathAsync(path).get();
+        return winrt::Windows::System::Launcher::LaunchFolderAsync(folder).get();
+    } catch (...) {
+        return false;
+    }
+#else
+    return reinterpret_cast<INT_PTR>(ShellExecuteW(
+        owner, L"open", path.c_str(), nullptr, nullptr, SW_SHOWNORMAL)) > 32;
+#endif
+}
+
+bool RevealPathWithSystemLauncher(HWND owner, const std::wstring& path) {
+#ifdef GRAVITYDESKTOP_PACKAGED
+    if (!IsPackagedProcess()) return false;
+    try {
+        const std::filesystem::path target(path);
+        const std::filesystem::path parent = target.parent_path();
+        if (parent.empty()) return false;
+        const auto folder = winrt::Windows::Storage::StorageFolder::
+            GetFolderFromPathAsync(parent.wstring()).get();
+        winrt::Windows::System::FolderLauncherOptions options;
+        const auto initializeWithWindow = options.as<::IInitializeWithWindow>();
+        winrt::check_hresult(initializeWithWindow->Initialize(owner));
+        if (std::filesystem::is_directory(target)) {
+            const auto item = winrt::Windows::Storage::StorageFolder::
+                GetFolderFromPathAsync(target.wstring()).get();
+            options.ItemsToSelect().Append(item);
+        } else {
+            const auto item = winrt::Windows::Storage::StorageFile::
+                GetFileFromPathAsync(target.wstring()).get();
+            options.ItemsToSelect().Append(item);
+        }
+        return winrt::Windows::System::Launcher::LaunchFolderAsync(
+            folder, options).get();
+    } catch (...) {
+        return false;
+    }
+#else
+    (void)owner;
+    PIDLIST_ABSOLUTE itemIdList = ILCreateFromPathW(path.c_str());
+    if (itemIdList == nullptr) return false;
+    const HRESULT result = SHOpenFolderAndSelectItems(
+        itemIdList, 0, nullptr, 0);
+    ILFree(itemIdList);
+    return SUCCEEDED(result);
+#endif
+}
+
+bool OpenUriWithSystemLauncher(HWND owner, const std::wstring& uri) {
+#ifdef GRAVITYDESKTOP_PACKAGED
+    (void)owner;
+    if (!IsPackagedProcess()) return false;
+    try {
+        return winrt::Windows::System::Launcher::LaunchUriAsync(
+            winrt::Windows::Foundation::Uri(uri)).get();
+    } catch (...) {
+        return false;
+    }
+#else
+    return reinterpret_cast<INT_PTR>(ShellExecuteW(
+        owner, L"open", uri.c_str(), nullptr, nullptr, SW_SHOWNORMAL)) > 32;
+#endif
 }
 
 bool IsDevelopmentBuildExecutable(const std::wstring& executablePath) {
@@ -19728,9 +19830,7 @@ private:
             SetStatus(T("status.data_folder_create_failed"));
             return;
         }
-        if (reinterpret_cast<INT_PTR>(ShellExecuteW(
-                window_, L"open", folder.c_str(), nullptr, nullptr,
-                SW_SHOWNORMAL)) <= 32) {
+        if (!OpenFolderWithSystemLauncher(window_, folder.wstring())) {
             SetStatus(T("status.data_folder_open_failed"));
         }
         Invalidate();
@@ -21309,9 +21409,9 @@ private:
             GenerateDiagnosticReport();
             break;
         case MenuOpenOfficialWebsite:
-            ShellExecuteW(settingsWindow_ != nullptr ? settingsWindow_ : window_,
-                          L"open", L"https://gravitydesktop.com", nullptr,
-                          nullptr, SW_SHOWNORMAL);
+            (void)OpenUriWithSystemLauncher(
+                settingsWindow_ != nullptr ? settingsWindow_ : window_,
+                L"https://gravitydesktop.com");
             break;
         case MenuAdjustCoreDistance:
             OpenCoreDistanceSlider(selected_.coreId);
@@ -24729,17 +24829,7 @@ private:
             return;
         }
 
-        SHELLEXECUTEINFOW execute{sizeof(execute)};
-        // Use the Shell's asynchronous desktop-style invocation. Cursor
-        // ownership remains entirely with Windows and the target application;
-        // GravityDesktop must not install a synthetic global busy cursor.
-        execute.fMask = SEE_MASK_FLAG_NO_UI | SEE_MASK_ASYNCOK;
-        execute.hwnd = window_;
-        execute.lpVerb = L"open";
-        execute.lpFile = item->path.c_str();
-        execute.nShow = SW_SHOWNORMAL;
-        const BOOL opened = ShellExecuteExW(&execute);
-        if (opened != FALSE) {
+        if (OpenFileWithSystemLauncher(window_, item->path)) {
             item->missing = false;
             ++item->openCount;
             item->lastOpened = UnixTimeNow();
@@ -24778,22 +24868,23 @@ private:
             SetStatus(T("status.file_folder_unavailable"));
             return;
         }
-        ShellExecuteW(window_, L"open", directory.c_str(), nullptr, nullptr, SW_SHOWNORMAL);
+        if (!OpenFolderWithSystemLauncher(window_, directory)) {
+            SetStatus(T("status.file_folder_unavailable"));
+        }
     }
 
     void RevealItemInExplorer(std::uint64_t coreId, std::uint64_t itemId) {
         FileItem* item = FindItem(coreId, itemId);
         if (item == nullptr) return;
-        PIDLIST_ABSOLUTE itemIdList = ILCreateFromPathW(item->path.c_str());
-        if (itemIdList == nullptr) {
-            item->missing = true;
-            ScheduleSave();
-            SetStatus(T("status.file_reveal_changed"));
-            return;
+        if (!RevealPathWithSystemLauncher(window_, item->path)) {
+            if (GetFileAttributesW(item->path.c_str()) == INVALID_FILE_ATTRIBUTES) {
+                item->missing = true;
+                ScheduleSave();
+                SetStatus(T("status.file_reveal_changed"));
+            } else {
+                SetStatus(T("status.file_reveal_failed"));
+            }
         }
-        const HRESULT result = SHOpenFolderAndSelectItems(itemIdList, 0, nullptr, 0);
-        ILFree(itemIdList);
-        if (FAILED(result)) SetStatus(T("status.file_reveal_failed"));
     }
 
     void ShowItemPath(std::uint64_t coreId, std::uint64_t itemId) {
