@@ -50,17 +50,11 @@
         </desktop:Extension>
       </Extensions>
     </Application>
-    <Application Id="GravityDesktopRecovery"
-                 Executable="GravityDesktopRecovery.exe"
-                 EntryPoint="Windows.FullTrustApplication">
-      <uap:VisualElements DisplayName="Gravity Desktop Recovery"
-                          Description="Restore Gravity Desktop managed files"
-                          BackgroundColor="transparent"
-                          Square150x150Logo="Assets\Square150x150Logo.png"
-                          Square44x44Logo="Assets\Square44x44Logo.png">
-        <uap:DefaultTile Wide310x150Logo="Assets\Wide310x150Logo.png" />
-      </uap:VisualElements>
-    </Application>
+    <!-- The recovery executable remains package payload.  On the first normal
+         launch, the existing safety-center path provisions a verified durable
+         recovery copy outside the package, so it remains usable after the
+         main desktop process fails.  It is intentionally not a second Store
+         activation entry: Microsoft Store packages must expose one app here. -->
   </Applications>
 
   <Capabilities>
