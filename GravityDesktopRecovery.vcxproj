@@ -29,6 +29,9 @@
   <ItemGroup>
     <ResourceCompile Include="src\GravityDesktopRecovery.rc" />
   </ItemGroup>
+  <ItemGroup>
+    <None Include="src\GravityDesktopRecovery.manifest" />
+  </ItemGroup>
   <Target Name="CopyGravityDesktopRecoveryLocalizationAssets" AfterTargets="Build">
     <ItemGroup>
       <GravityDesktopRecoveryLocalizationAssets Include="$(ProjectDir)src\locales\*.json" />

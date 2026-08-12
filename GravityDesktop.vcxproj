@@ -81,6 +81,9 @@
   <ItemGroup>
     <ResourceCompile Include="src\GravityDesktop.rc" />
   </ItemGroup>
+  <ItemGroup>
+    <None Include="src\GravityDesktop.manifest" />
+  </ItemGroup>
   <Target Name="CopyGravityDesktopRuntimeAssets" AfterTargets="Build">
     <Copy SourceFiles="$(ProjectDir)src\GravityDesktopLibrary.ico"
           DestinationFolder="$(OutDir)"

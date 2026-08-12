@@ -5,6 +5,7 @@
 #include "GravityDesktopVersion.h"
 
 IDI_GRAVITYDESKTOP ICON "GravityDesktop.ico"
+1 RT_MANIFEST "GravityDesktop.manifest"
 
 VS_VERSION_INFO VERSIONINFO
  FILEVERSION GRAVITY_DESKTOP_VERSION_TUPLE
