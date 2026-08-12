@@ -40,9 +40,9 @@ Compression=lzma2/ultra64
 SolidCompression=yes
 WizardStyle=modern
 CloseApplications=yes
-CloseApplicationsFilter={#MyAppExeName}
+CloseApplicationsFilter={#MyAppExeName},GravityDesktopRecovery.exe
 RestartApplications=no
-AppMutex=Local\GravityDesktop.SingleInstance.9D19E743
+AppMutex=Local\GravityDesktop.SingleInstance.9D19E743,Local\GravityDesktop.EmergencyRecovery.9D19E743
 
 [Languages]
 Name: "chinesesimp"; MessagesFile: "compiler:Languages\ChineseSimplified.isl"
@@ -50,8 +50,8 @@ Name: "chinesesimp"; MessagesFile: "compiler:Languages\ChineseSimplified.isl"
 [Messages]
 SetupAppTitle=引力桌面安装程序
 SetupWindowTitle=引力桌面安装程序
-SetupAppRunningError=检测到引力桌面正在运行。请先退出引力桌面，然后继续安装。
-UninstallAppRunningError=检测到引力桌面正在运行。请先退出引力桌面，然后继续卸载。
+SetupAppRunningError=检测到引力桌面或紧急恢复程序正在运行。请先安全退出，然后继续安装。
+UninstallAppRunningError=检测到引力桌面或紧急恢复程序正在运行。请先安全退出，然后继续卸载。
 
 [Tasks]
 Name: "desktopicon"; Description: "创建桌面快捷方式"; GroupDescription: "附加快捷方式："; Flags: unchecked

@@ -4580,12 +4580,33 @@ public:
         if (lifecycleWindow_ != nullptr) {
             shellHookRegistered_ =
                 RegisterShellHookWindow(lifecycleWindow_) != FALSE;
-            SetTimer(
-                lifecycleWindow_, kDesktopHostWatchTimer,
-                kDesktopHostWatchIntervalMs, nullptr);
-            SetTimer(
-                lifecycleWindow_, kDesktopPointerRecoveryTimer,
-                kDesktopPointerRecoveryIntervalMs, nullptr);
+            EnsureLifecycleMonitoringTimers();
+        }
+    }
+
+    void EnsureLifecycleMonitoringTimers() {
+        if (lifecycleWindow_ == nullptr || shuttingDown_ || exitRequested_) {
+            return;
+        }
+        if (!desktopHostWatchTimerActive_) {
+            desktopHostWatchTimerActive_ =
+                SetTimer(lifecycleWindow_, kDesktopHostWatchTimer,
+                         kDesktopHostWatchIntervalMs, nullptr) != 0;
+            if (!desktopHostWatchTimerActive_) {
+                AppendRuntimeDiagnostic(
+                    "desktop_host_watch_timer_failed", E_FAIL,
+                    GetLastError());
+            }
+        }
+        if (!desktopPointerRecoveryTimerActive_) {
+            desktopPointerRecoveryTimerActive_ =
+                SetTimer(lifecycleWindow_, kDesktopPointerRecoveryTimer,
+                         kDesktopPointerRecoveryIntervalMs, nullptr) != 0;
+            if (!desktopPointerRecoveryTimerActive_) {
+                AppendRuntimeDiagnostic(
+                    "desktop_pointer_recovery_timer_failed", E_FAIL,
+                    GetLastError());
+            }
         }
     }
 
@@ -4755,10 +4776,12 @@ public:
         if (SetTimer(
                 window_, kRelationshipManifestRetryTimer,
                 delay, nullptr) == 0) {
+            relationshipManifestRetryTimerActive_ = false;
             AppendRuntimeDiagnostic(
                 "relationship_manifest_retry_timer_failed",
                 E_FAIL, GetLastError());
         } else {
+            relationshipManifestRetryTimerActive_ = true;
             AppendRuntimeDiagnostic(
                 "relationship_manifest_retry_scheduled");
         }
@@ -4776,6 +4799,7 @@ public:
             if (window_ != nullptr) {
                 KillTimer(window_, kRelationshipManifestRetryTimer);
             }
+            relationshipManifestRetryTimerActive_ = false;
             return true;
         }
         ScheduleRelationshipManifestRetry();
@@ -5081,7 +5105,7 @@ public:
             if (selectedCoreIds.empty()) {
                 pendingRelationshipRecovery_.reset();
                 AppendRuntimeDiagnostic("relationship_recovery_partial_none");
-                SetStatus(L"未选择任何核心；当前普通桌面未被修改");
+            SetStatus(T("status.no_core_selected"));
                 return;
             }
             const RelationshipRecoveryManifest selected =
@@ -5272,7 +5296,7 @@ public:
             !WriteStateWithRelationshipManifest(candidate)) {
             preserveExistingRelationshipManifest_ = priorManifestPreservation;
             AppendRuntimeDiagnostic("emergency_recovery_reconcile_failed");
-            SetStatus(L"紧急恢复后的引用未清理；真实文件仍安全保留在桌面和文件库中");
+            SetStatus(T("status.emergency_cleanup_failed"));
             return;
         }
 
@@ -5352,6 +5376,9 @@ public:
         const HRESULT textResult = CreateTextResources();
         if (SUCCEEDED(textResult)) {
             initialized_ = true;
+            // Retry once after full initialization in case the shell rejected
+            // a lifecycle timer during the narrow WM_NCCREATE window.
+            EnsureLifecycleMonitoringTimers();
             workspaceVisible_ =
                 IsWindowVisible(window_) != FALSE;
             EnsureInteractionWindowPresented();
@@ -5372,6 +5399,10 @@ public:
         if (lifecycleWindow_ != nullptr) {
             KillTimer(
                 lifecycleWindow_, kDesktopHostWatchTimer);
+            desktopHostWatchTimerActive_ = false;
+            KillTimer(
+                lifecycleWindow_, kDesktopPointerRecoveryTimer);
+            desktopPointerRecoveryTimerActive_ = false;
             KillTimer(
                 lifecycleWindow_, kDesktopReconnectTimer);
             KillTimer(
@@ -5397,6 +5428,8 @@ public:
             KillTimer(window_, kCoreSelectionHaloTimer);
             KillTimer(window_, kSelectionDismissTimer);
             KillTimer(window_, kRelationshipManifestRetryTimer);
+            relationshipManifestRetryTimerActive_ = false;
+            saveTimerActive_ = false;
         }
         if (!benchmarkMode_) {
             SaveState();
@@ -5427,6 +5460,7 @@ public:
     LRESULT HandleShellLifecycleMessage(
         HWND source, UINT message, WPARAM wParam, LPARAM lParam) {
         if (message == TaskbarCreatedMessage()) {
+            EnsureLifecycleMonitoringTimers();
             BeginDesktopReconnect(true);
             return 0;
         }
@@ -5493,6 +5527,8 @@ public:
             }
             if (lifecycleWindow_ == source) {
                 lifecycleWindow_ = nullptr;
+                desktopHostWatchTimerActive_ = false;
+                desktopPointerRecoveryTimerActive_ = false;
             }
             SetWindowLongPtrW(source, GWLP_USERDATA, 0);
             break;
@@ -7231,7 +7267,8 @@ private:
             }
         }
         if (dirty_) {
-            SetTimer(window_, kSaveTimer, 600, nullptr);
+            ArmSaveTimerOrPreserveRecovery(
+                600, "reconnect_save_timer_failed");
         }
         if (relationshipManifestSyncPending_) {
             relationshipManifestRetryAttempt_ = 0;
@@ -7359,6 +7396,7 @@ private:
 
     void HandleDesktopLifecycleTimer(WPARAM timer) {
         if (timer == kDesktopPointerRecoveryTimer) {
+            EnsureLifecycleMonitoringTimers();
             RefreshPointerStateAfterDesktopActivation();
             return;
         }
@@ -7379,6 +7417,13 @@ private:
             return;
         }
         if (timer == kDesktopHostWatchTimer) {
+            EnsureLifecycleMonitoringTimers();
+            if (relationshipManifestSyncPending_ &&
+                !relationshipManifestRetryTimerActive_ &&
+                relationshipManifestRetryAttempt_ <
+                    kRelationshipManifestRetryDelaysMs.size()) {
+                ScheduleRelationshipManifestRetry();
+            }
             if (initialized_ && !shuttingDown_ &&
                 !exitRequested_ && !failOpenActive_ &&
                 !desktopReconnectPending_) {
@@ -7587,8 +7632,8 @@ private:
                 PostQuitMessage(0);
             }
         } else {
-            MessageBoxW(window_, L"当前布局未能可靠保存，程序不会退出。\n\n请先处理保存失败后再退出。",
-                        L"引力桌面", MB_OK | MB_ICONWARNING);
+            MessageBoxW(window_, T("dialog.exit_save_failed").c_str(),
+                        T("app.title").c_str(), MB_OK | MB_ICONWARNING);
         }
     }
 
@@ -13730,8 +13775,8 @@ private:
         renderTarget_->DrawRoundedRectangle(
             D2D1::RoundedRect(card, 10.0f, 10.0f), brush_.Get(), 1.0f);
         brush_->SetColor(D2D1::ColorF(primary, 0.98f));
-        const wchar_t* title = L"布局调节";
-        renderTarget_->DrawTextW(title, static_cast<UINT32>(wcslen(title)),
+        const std::wstring title = T("layout.panel.title");
+        renderTarget_->DrawTextW(title.c_str(), static_cast<UINT32>(title.size()),
             hudFormat_.Get(), D2D1::RectF(card.left + 14.0f, card.top + 10.0f,
             card.right - 44.0f, card.top + 33.0f), brush_.Get(),
             D2D1_DRAW_TEXT_OPTIONS_CLIP);
@@ -13896,7 +13941,7 @@ private:
         const Core* core = FindCore(coreId);
         if (core == nullptr) return;
         if (core->layoutLocked) {
-            SetStatus(L"当前核心与文件位置已锁定；无法调整圈距或整体角度");
+            SetStatus(T("status.layout_locked_adjust"));
             return;
         }
         CloseCoreAppearancePanel();
@@ -14035,7 +14080,7 @@ private:
             if (const Core* core = FindCore(coreDistanceSliderCoreId_)) {
                 RecordCoreLayoutInvariant(*core, "slider-commit");
             }
-            SetStatus(L"当前核心的内圈、外圈距离或角度已保存");
+            SetStatus(T("status.layout_adjust_saved"));
         } else {
             state_ = std::move(coreDistanceDragSnapshot_);
             layoutDirty_ = true;
@@ -15269,7 +15314,7 @@ private:
         dividerDragStartSnapshotValid_ = false;
         dividerDragPointerOffsetPixels_ = 0;
         UpdateDividerHandleVisual();
-        SetStatus(L"已取消分界线调整");
+        SetStatus(T("status.divider_cancelled"));
         Invalidate();
     }
 
@@ -15315,12 +15360,13 @@ private:
         constexpr UINT ratio50 = 31602;
         constexpr UINT ratio60 = 31603;
         constexpr UINT restoreDefault = 31604;
-        AppendMenuW(menu, MF_STRING, ratio30, L"右侧 30%");
-        AppendMenuW(menu, MF_STRING, ratio40, L"右侧 40%");
-        AppendMenuW(menu, MF_STRING, ratio50, L"左右各 50%");
-        AppendMenuW(menu, MF_STRING, ratio60, L"右侧 60%");
+        AppendMenuW(menu, MF_STRING, ratio30, T("divider.ratio_30").c_str());
+        AppendMenuW(menu, MF_STRING, ratio40, T("divider.ratio_40").c_str());
+        AppendMenuW(menu, MF_STRING, ratio50, T("divider.ratio_50").c_str());
+        AppendMenuW(menu, MF_STRING, ratio60, T("divider.ratio_60").c_str());
         AppendMenuW(menu, MF_SEPARATOR, 0, nullptr);
-        AppendMenuW(menu, MF_STRING, restoreDefault, L"恢复默认比例");
+        AppendMenuW(menu, MF_STRING, restoreDefault,
+                    T("divider.restore_default").c_str());
         POINT screen{x, y};
         ClientToScreen(window_, &screen);
         const UINT command = TrackPopupMenuPreservingSelection(
@@ -15335,7 +15381,7 @@ private:
         case ratio60: SetWorkspaceRatio(0.60f, true); break;
         default: return;
         }
-        SetStatus(L"右侧工作区比例已保存");
+        SetStatus(T("status.divider_saved"));
     }
 
     D2D1_RECT_F TutorialCardRectangle(const D2D1_SIZE_F& client) const {
@@ -17559,7 +17605,7 @@ private:
                              std::uint64_t parentCoreId, std::uint64_t parentId,
                              D2D1_POINT_2F childOriginalWorld) {
         if (childId == parentId || WouldCreateRelationCycle(childId, parentId)) {
-            SetStatus(L"已拒绝：不能把文件连接到自身或其后代");
+            SetStatus(T("status.relation_cycle_rejected"));
             return false;
         }
         Core* source = FindCore(childCoreId);
@@ -17567,7 +17613,7 @@ private:
         FileItem* child = FindItem(childCoreId, childId);
         FileItem* parent = FindItem(parentCoreId, parentId);
         if (source == nullptr || target == nullptr || child == nullptr || parent == nullptr) {
-            SetStatus(L"无法建立关系：文件不存在或位置已变化");
+            SetStatus(T("status.relation_file_changed"));
             return false;
         }
         // Preserve the pre-drag position.  Dropping B on A changes only the
@@ -17607,7 +17653,7 @@ private:
             parent = FindItem(parentCoreId, parentId);
             if (child == nullptr || target == nullptr || parent == nullptr) {
                 state_ = std::move(before);
-                SetStatus(L"目标文件状态已变化，未建立关系");
+                SetStatus(T("status.relation_target_changed"));
                 return false;
             }
         }
@@ -17691,7 +17737,9 @@ private:
             ? FileDisplayName(child->path) : child->displayName;
         const std::wstring parentName = parent->displayName.empty()
             ? FileDisplayName(parent->path) : parent->displayName;
-        SetStatus(childName + L" 已设为 " + parentName + L" 的子文件 · 可按 Ctrl+Z 撤销");
+        SetStatus(localization_.Format(
+            "status.relation_connected",
+            {{L"child", childName}, {L"parent", parentName}}));
         return true;
     }
 
@@ -17753,7 +17801,7 @@ private:
         item->ringSlot = -1;
         layoutDirty_ = true;
         ScheduleSave();
-        SetStatus(L"已断开所有上层连接，文件保持独立 · 可按 Ctrl+Z 撤销");
+        SetStatus(T("status.relation_detached"));
     }
 
     void ArrangeAttachedSubtreeOutward(Core& core,
@@ -17857,13 +17905,13 @@ private:
         Core* target = FindCore(targetCoreId);
         FileItem* item = FindItem(sourceCoreId, itemId);
         if (source == nullptr || target == nullptr || item == nullptr) {
-            SetStatus(L"无法连接到核心：文件或核心不存在");
+            SetStatus(T("status.relation_core_missing"));
             return;
         }
 
         if (source == target && item->detachedFromUpper &&
             AttachedFileCount(*target) >= kCoreFileCapacity) {
-            SetStatus(L"无法连接到核心：核心容量已满");
+            SetStatus(T("status.relation_core_full"));
             return;
         }
 
@@ -17884,7 +17932,7 @@ private:
             item = FindItem(targetCoreId, itemId);
         }
         if (target == nullptr || item == nullptr) {
-            SetStatus(L"无法连接到目标核心");
+            SetStatus(T("status.relation_connect_failed"));
             return;
         }
 
@@ -17908,7 +17956,7 @@ private:
             dirty_ = dirtyBefore;
             layoutCache_.clear();
             layoutDirty_ = true;
-            SetStatus(L"无法连接到核心：没有可用槽位");
+            SetStatus(T("status.relation_no_slot"));
             Invalidate();
             return;
         }
@@ -17930,7 +17978,7 @@ private:
         }
         PushUndo(std::move(before));
         SetSelection({HitKind::Item, targetCoreId, itemId});
-        SetStatus(L"已连接到核心；真实文件位置未变化 · 可按 Ctrl+Z 撤销");
+        SetStatus(T("status.relation_core_connected"));
         Invalidate();
     }
 
@@ -19568,13 +19616,13 @@ private:
         std::error_code error;
         std::filesystem::create_directories(folder, error);
         if (error) {
-            SetStatus(L"无法创建数据目录");
+            SetStatus(T("status.data_folder_create_failed"));
             return;
         }
         if (reinterpret_cast<INT_PTR>(ShellExecuteW(
                 window_, L"open", folder.c_str(), nullptr, nullptr,
                 SW_SHOWNORMAL)) <= 32) {
-            SetStatus(L"无法打开数据目录");
+            SetStatus(T("status.data_folder_open_failed"));
         }
         Invalidate();
     }
@@ -19639,7 +19687,7 @@ private:
 
     void GenerateDiagnosticReport() {
         if (stateFile_.empty()) {
-            SetStatus(L"无法生成问题报告：程序数据目录不可用");
+            SetStatus(T("status.report_data_unavailable"));
             return;
         }
         const std::filesystem::path reportFolder =
@@ -19647,7 +19695,7 @@ private:
         std::error_code error;
         std::filesystem::create_directories(reportFolder, error);
         if (error) {
-            SetStatus(L"无法创建问题报告目录");
+            SetStatus(T("status.report_folder_failed"));
             return;
         }
         std::vector<ZipStoredEntry> entries;
@@ -19672,11 +19720,11 @@ private:
         if (!WriteStoredZip(report, entries)) {
             AppendRuntimeDiagnostic(
                 "diagnostic_report_create_failed", E_FAIL, GetLastError());
-            SetStatus(L"问题报告生成失败");
+            SetStatus(T("status.report_failed"));
             return;
         }
         AppendRuntimeDiagnostic("diagnostic_report_created");
-        SetStatus(L"问题报告已生成；未上传，也未包含文件内容或布局数据");
+        SetStatus(T("status.report_created"));
         Invalidate();
     }
 
@@ -24567,7 +24615,7 @@ private:
         if (attributes == INVALID_FILE_ATTRIBUTES) {
             item->missing = true;
             ScheduleSave();
-            SetStatus(L"文件位置已变化。请右键选择“重新定位”。");
+            SetStatus(T("status.file_location_changed"));
             Invalidate();
             return;
         }
@@ -24601,9 +24649,11 @@ private:
             }
             item->sizeTier = InferSizeTier(*item);
             ScheduleSave();
-            SetStatus(L"已打开：" + FileDisplayName(item->path));
+            SetStatus(localization_.Format(
+                "status.file_opened",
+                {{L"file", FileDisplayName(item->path)}}));
         } else {
-            SetStatus(L"Windows 无法打开此项目");
+            SetStatus(T("status.file_open_failed"));
         }
         Invalidate();
     }
@@ -24616,7 +24666,7 @@ private:
         if (directory.empty() || GetFileAttributesW(directory.c_str()) == INVALID_FILE_ATTRIBUTES) {
             item->missing = true;
             ScheduleSave();
-            SetStatus(L"原所在文件夹不可用");
+            SetStatus(T("status.file_folder_unavailable"));
             return;
         }
         ShellExecuteW(window_, L"open", directory.c_str(), nullptr, nullptr, SW_SHOWNORMAL);
@@ -24629,18 +24679,20 @@ private:
         if (itemIdList == nullptr) {
             item->missing = true;
             ScheduleSave();
-            SetStatus(L"文件位置已变化，无法在资源管理器中选中");
+            SetStatus(T("status.file_reveal_changed"));
             return;
         }
         const HRESULT result = SHOpenFolderAndSelectItems(itemIdList, 0, nullptr, 0);
         ILFree(itemIdList);
-        if (FAILED(result)) SetStatus(L"无法在资源管理器中选中此项目");
+        if (FAILED(result)) SetStatus(T("status.file_reveal_failed"));
     }
 
     void ShowItemPath(std::uint64_t coreId, std::uint64_t itemId) {
         const FileItem* item = FindItem(coreId, itemId);
         if (item == nullptr) return;
-        MessageBoxW(window_, item->path.c_str(), L"原始完整路径", MB_OK | MB_ICONINFORMATION);
+        MessageBoxW(window_, item->path.c_str(),
+                    T("dialog.full_path.title").c_str(),
+                    MB_OK | MB_ICONINFORMATION);
     }
 
     void RelocateItem(std::uint64_t coreId, std::uint64_t itemId) {
@@ -25124,8 +25176,34 @@ private:
             layoutDirty_ = true;
         }
         if (window_ != nullptr) {
-            SetTimer(window_, kSaveTimer, 600, nullptr);
+            ArmSaveTimerOrPreserveRecovery(
+                600, "state_save_timer_failed");
         }
+    }
+
+    void PreserveDirtyStateForRecovery(const char* event) {
+        const std::filesystem::path recovery = SessionEndRecoveryPath();
+        if (!dirty_ || recovery.empty() ||
+            !WriteUtf8Atomic(recovery, SerializeState(state_))) {
+            AppendRuntimeDiagnostic(event, E_FAIL, GetLastError());
+            return;
+        }
+        AppendRuntimeDiagnostic("state_recovery_snapshot_written");
+    }
+
+    bool ArmSaveTimerOrPreserveRecovery(UINT delay, const char* failureEvent) {
+        if (window_ != nullptr && IsWindow(window_) != FALSE &&
+            SetTimer(window_, kSaveTimer, delay, nullptr) != 0) {
+            saveTimerActive_ = true;
+            return true;
+        }
+        saveTimerActive_ = false;
+        AppendRuntimeDiagnostic(failureEvent, E_FAIL, GetLastError());
+        if (dirty_ && !stateRecoveryBlocked_ && !SaveState()) {
+            PreserveDirtyStateForRecovery(
+                "state_recovery_snapshot_write_failed");
+        }
+        return false;
     }
 
     void ScheduleSaveRetry() {
@@ -25135,16 +25213,13 @@ private:
             if (dirty_ && !stateRecoveryBlocked_ &&
                 saveRetryAttempt_ >= kSaveRetryDelaysMs.size()) {
                 AppendRuntimeDiagnostic("state_save_retry_exhausted");
-                SetStatus(
-                    L"状态保存仍未成功；当前修改保留在内存中，下一次修改时将重新尝试");
+                SetStatus(T("status.save_retry_exhausted"));
             }
             return;
         }
         const UINT delay = kSaveRetryDelaysMs[saveRetryAttempt_++];
-        if (SetTimer(window_, kSaveTimer, delay, nullptr) == 0) {
-            AppendRuntimeDiagnostic(
-                "state_save_retry_timer_failed", E_FAIL, GetLastError());
-        } else {
+        if (ArmSaveTimerOrPreserveRecovery(
+                delay, "state_save_retry_timer_failed")) {
             AppendRuntimeDiagnostic("state_save_retry_scheduled");
         }
     }
@@ -25154,11 +25229,13 @@ private:
             RestoreDesktopVisibilityAfterShellTransition();
         } else if (timer == kSaveTimer) {
             KillTimer(window_, kSaveTimer);
+            saveTimerActive_ = false;
             if (!SaveState()) {
                 ScheduleSaveRetry();
             }
         } else if (timer == kRelationshipManifestRetryTimer) {
             KillTimer(window_, kRelationshipManifestRetryTimer);
+            relationshipManifestRetryTimerActive_ = false;
             if (relationshipManifestSyncPending_) {
                 (void)SynchronizeRelationshipManifest(state_);
             }
@@ -27283,7 +27360,7 @@ private:
             return !stateRecoveryBlocked_;
         }
         if (stateRecoveryBlocked_) {
-            SetStatus(L"状态恢复待处理：不会覆盖原始损坏文件");
+            SetStatus(T("status.recovery_protected"));
             return false;
         }
         UpdateCoreRatios();
@@ -27293,7 +27370,7 @@ private:
             CreateHistoryBackup(false);
             return true;
         } else {
-            SetStatus(L"状态保存失败；当前内存中的布局仍然有效");
+            SetStatus(T("status.save_failed_memory_valid"));
             return false;
         }
     }
@@ -27365,8 +27442,10 @@ private:
     std::filesystem::path stateFile_;
     bool dirty_ = false;
     std::size_t saveRetryAttempt_ = 0;
+    bool saveTimerActive_ = false;
     bool relationshipManifestSyncPending_ = false;
     std::size_t relationshipManifestRetryAttempt_ = 0;
+    bool relationshipManifestRetryTimerActive_ = false;
     bool benchmarkMode_ = false;
     bool autoStartMode_ = false;
     bool initialized_ = false;
@@ -27388,6 +27467,8 @@ private:
     HWND trayIconOwner_ = nullptr;
     bool trayRebuildPending_ = false;
     bool shellHookRegistered_ = false;
+    bool desktopHostWatchTimerActive_ = false;
+    bool desktopPointerRecoveryTimerActive_ = false;
     HWND desktopHost_ = nullptr;
     HWND pendingDesktopHostMigration_ = nullptr;
     bool desktopChildHosted_ = false;
@@ -28110,7 +28191,8 @@ bool RunSelfTest() {
     const bool saveFailureWasNotReportedAsSuccess =
         saveFailureApp.dirty_ &&
         saveFailureApp.status_ != L"布局已保存" &&
-        saveFailureApp.status_.find(L"保存失败") != std::wstring::npos;
+        saveFailureApp.status_ ==
+            saveFailureApp.T("status.save_failed_memory_valid");
     DeleteFileW(saveBlocker.c_str());
     if (!saveFailureWasNotReportedAsSuccess) {
         return false;
