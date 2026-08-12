@@ -11326,7 +11326,8 @@ private:
             // The whole strip is interactive so users can drag it by any
             // non-button area; individual buttons still retain their normal
             // hit targets.
-            if (WorkspaceChromeSlideAnimationActive()) {
+            if (WorkspaceChromeSlideAnimationActive() &&
+                workspaceChromeSlideTargetCollapsed_) {
                 AddInteractionShape(
                     shapes, WorkspaceChromeRevealRectangle(client), 2.0f);
             } else {
@@ -11951,11 +11952,15 @@ private:
         const D2D1_POINT_2F cursor =
             PixelToDip(cursorPixels.x, cursorPixels.y);
         const bool fullyCollapsed = WorkspaceChromeCollapsed(client);
+        const float hiddenAmount = WorkspaceChromeRenderedSlideAmount();
 
-        if (fullyCollapsed) {
+        if (fullyCollapsed || hiddenAmount > 0.001f) {
             const D2D1_RECT_F reveal = WorkspaceChromeRevealRectangle(client);
             brush_->SetColor(D2D1::ColorF(
-                RgbFromColorRef(GetSysColor(COLOR_HIGHLIGHT)), 0.68f));
+                RgbFromColorRef(GetSysColor(COLOR_HIGHLIGHT)),
+                0.68f * (WorkspaceChromeSlideAnimationActive()
+                             ? hiddenAmount
+                             : 1.0f)));
             renderTarget_->FillRoundedRectangle(
                 D2D1::RoundedRect(reveal, 2.0f, 2.0f), brush_.Get());
             if (!WorkspaceChromeSlideAnimationActive()) {
@@ -11964,28 +11969,15 @@ private:
         }
 
         const D2D1_RECT_F group = WorkspaceChromeGroupRectangle(client);
-        const float slideAmount = WorkspaceChromeRenderedSlideAmount();
-        D2D1_POINT_2F slideOffset = D2D1::Point2F();
-        switch (WorkspaceChromeNearestEdge(client)) {
-        case 0:
-            slideOffset.y = -(group.bottom - 5.0f) * slideAmount;
-            break;
-        case 1:
-            slideOffset.x = (client.width - group.left - 5.0f) * slideAmount;
-            break;
-        case 2:
-            slideOffset.y = (client.height - group.top - 5.0f) * slideAmount;
-            break;
-        default:
-            slideOffset.x = -(group.right - 5.0f) * slideAmount;
-            break;
+        const float chromeOpacity = 1.0f - hiddenAmount;
+        const bool chromeLayered = chromeOpacity < 0.999f;
+        if (chromeLayered) {
+            D2D1_LAYER_PARAMETERS chromeLayer = D2D1::LayerParameters();
+            chromeLayer.opacity = chromeOpacity;
+            renderTarget_->PushLayer(chromeLayer, nullptr);
         }
-        renderTarget_->SetTransform(
-            D2D1::Matrix3x2F::Translation(slideOffset.x, slideOffset.y));
-        const D2D1_POINT_2F localCursor = D2D1::Point2F(
-            cursor.x - slideOffset.x, cursor.y - slideOffset.y);
         const bool stripHovered = workspaceChromeHovered_ ||
-            PointInside(localCursor, group);
+            PointInside(cursor, group);
         const bool stripActive = stripHovered || draggingWorkspaceChrome_;
         constexpr float stripAlpha = 1.0f;
         const D2D1_RECT_F shadow = D2D1::RectF(
@@ -12048,7 +12040,7 @@ private:
              index < kWorkspaceControlCount;
              ++index) {
             const D2D1_RECT_F button = WorkspaceControlRectangle(client, index);
-            const bool hovered = PointInside(localCursor, button);
+            const bool hovered = PointInside(cursor, button);
             const bool disabled = index == 2 && undoStack_.empty();
             const bool pinned = index == 0 && state_.workspaceChromePinned;
             if (hovered || pinned) {
@@ -12115,7 +12107,9 @@ private:
                     D2D1_DRAW_TEXT_OPTIONS_CLIP);
             }
         }
-        renderTarget_->SetTransform(D2D1::Matrix3x2F::Identity());
+        if (chromeLayered) {
+            renderTarget_->PopLayer();
+        }
     }
 
     void ShowGlobalArrangeMenu() {
