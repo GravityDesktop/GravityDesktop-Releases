@@ -3,8 +3,6 @@
 #include <winver.h>
 #include "GravityDesktopVersion.h"
 
-1 RT_MANIFEST "GravityDesktopRecovery.manifest"
-
 VS_VERSION_INFO VERSIONINFO
  FILEVERSION GRAVITY_DESKTOP_VERSION_TUPLE
  PRODUCTVERSION GRAVITY_DESKTOP_VERSION_TUPLE
