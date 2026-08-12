@@ -4,6 +4,7 @@
 #include "Localization.h"
 
 #include <algorithm>
+#include <array>
 #include <chrono>
 #include <cstdint>
 #include <cwctype>
@@ -45,6 +46,18 @@ struct PreviousRecoveryEntry {
     std::filesystem::path destination;
     std::wstring state;
 };
+
+struct RecoveryRunOptions {
+    std::filesystem::path desktopTarget;
+    bool interactive = false;
+    bool writeReport = true;
+    // Test-only fault injection. It is deliberately not exposed as a normal
+    // command-line option and stops only after the durable journal is written.
+    bool stopAfterJournal = false;
+};
+
+constexpr char kRecoveryIsolationMarker[] =
+    "GravityDesktopRecoveryIsolationTest\n";
 
 std::optional<std::string> ReadUtf8File(const std::filesystem::path& path) {
     std::ifstream stream(path, std::ios::binary);
@@ -431,6 +444,22 @@ bool MoveWithoutReplacement(const std::filesystem::path& source,
                        MOVEFILE_WRITE_THROUGH) != FALSE;
 }
 
+bool WriteManagedManifest(const std::filesystem::path& library,
+                          const std::vector<ManagedEntry>& entries) {
+    std::ostringstream output;
+    output << "{\"schema_version\":1,\"cores\":[{\"files\":[";
+    for (std::size_t index = 0; index < entries.size(); ++index) {
+        if (index != 0) output << ',';
+        const ManagedEntry& entry = entries[index];
+        output << "{\"file_stable_id\":" << entry.id
+               << ",\"original_path\":" << EscapeJson(entry.originalPath)
+               << ",\"managed_path\":" << EscapeJson(entry.source)
+               << ",\"storage_mode\":\"managed\"}";
+    }
+    output << "]}]}\n";
+    return WriteUtf8Atomic(library / L"恢复清单.json", output.str());
+}
+
 std::string BuildJournal(const std::vector<std::tuple<ManagedEntry,
                                                        std::filesystem::path,
                                                        std::wstring>>& items) {
@@ -469,13 +498,14 @@ std::wstring ResultText(const gravity::i18n::Localization& localization,
     return output.str();
 }
 
-bool RunRecovery(const std::filesystem::path& library, bool interactive,
+bool RunRecovery(const std::filesystem::path& library,
+                 const RecoveryRunOptions& options,
                  const gravity::i18n::Localization& localization,
                  RecoveryResult& result) {
     const std::filesystem::path manifest = library / L"恢复清单.json";
     std::vector<ManagedEntry> entries;
     if (!ReadManagedEntries(manifest, entries)) {
-        if (interactive) {
+        if (options.interactive) {
             MessageBoxW(nullptr, localization.Text("recovery.manifest_error").c_str(),
                         localization.Text("recovery.title").c_str(),
                         MB_OK | MB_ICONERROR);
@@ -483,16 +513,15 @@ bool RunRecovery(const std::filesystem::path& library, bool interactive,
         return false;
     }
     if (entries.empty()) {
-        if (interactive) {
+        if (options.interactive) {
             MessageBoxW(nullptr, localization.Text("recovery.no_files").c_str(),
                         localization.Text("recovery.title").c_str(),
                         MB_OK | MB_ICONINFORMATION);
         }
         return true;
     }
-    const auto desktop = CurrentDesktopPath();
-    if (!desktop) {
-        if (interactive) MessageBoxW(nullptr,
+    if (options.desktopTarget.empty()) {
+        if (options.interactive) MessageBoxW(nullptr,
                                      localization.Text("recovery.desktop_error").c_str(),
                                      localization.Text("recovery.title").c_str(),
                                      MB_OK | MB_ICONERROR);
@@ -512,14 +541,14 @@ bool RunRecovery(const std::filesystem::path& library, bool interactive,
         ++pendingEntryCount;
     }
     if (pendingEntryCount == 0) {
-        if (interactive) {
+        if (options.interactive) {
             MessageBoxW(nullptr, localization.Text("recovery.already_restored").c_str(),
                         localization.Text("recovery.title").c_str(),
                         MB_OK | MB_ICONINFORMATION);
         }
         return true;
     }
-    if (interactive) {
+    if (options.interactive) {
         const std::wstring prompt = localization.Format(
             "recovery.prompt", {{L"count", std::to_wstring(pendingEntryCount)}});
         if (MessageBoxW(nullptr, prompt.c_str(),
@@ -560,7 +589,7 @@ bool RunRecovery(const std::filesystem::path& library, bool interactive,
             destination = found->second.destination;
         } else {
             destination = AvailableRestoreDestination(
-                *desktop,
+                options.desktopTarget,
                 original.empty() ? source.filename() : original.filename(),
                 reservedDestinations);
         }
@@ -574,7 +603,7 @@ bool RunRecovery(const std::filesystem::path& library, bool interactive,
     }
 
     if (!WriteUtf8Atomic(journalPath, BuildJournal(journal))) {
-        if (interactive) MessageBoxW(nullptr,
+        if (options.interactive) MessageBoxW(nullptr,
                                      localization.Text("recovery.journal_error").c_str(),
                                      localization.Text("recovery.title").c_str(),
                                      MB_OK | MB_ICONERROR);
@@ -582,6 +611,10 @@ bool RunRecovery(const std::filesystem::path& library, bool interactive,
     }
     HideRecoveryMetadata(journalPath);
     HideRecoveryMetadata(journalPath.wstring() + L".bak");
+
+    if (options.stopAfterJournal) {
+        return false;
+    }
 
     for (auto& [entry, destination, status] : journal) {
         if (status != L"pending") continue;
@@ -602,16 +635,196 @@ bool RunRecovery(const std::filesystem::path& library, bool interactive,
         }
     }
 
-    const auto now = std::chrono::system_clock::to_time_t(
-        std::chrono::system_clock::now());
-    const std::filesystem::path report = library / L"恢复报告" /
-        (L"恢复结果-" + std::to_wstring(static_cast<long long>(now)) + L".txt");
-    const std::wstring summary = ResultText(localization, result);
-    (void)WriteUtf8Atomic(report, WideToUtf8(summary));
-    if (interactive) MessageBoxW(nullptr, summary.c_str(),
-                                 localization.Text("recovery.title").c_str(),
-                                 MB_OK | MB_ICONINFORMATION);
+    if (options.writeReport || options.interactive) {
+        const auto now = std::chrono::system_clock::to_time_t(
+            std::chrono::system_clock::now());
+        const std::filesystem::path report = library / L"恢复报告" /
+            (L"恢复结果-" +
+             std::to_wstring(static_cast<long long>(now)) + L".txt");
+        const std::wstring summary = ResultText(localization, result);
+        if (options.writeReport) (void)WriteUtf8Atomic(report, WideToUtf8(summary));
+        if (options.interactive) MessageBoxW(nullptr, summary.c_str(),
+                                             localization.Text("recovery.title").c_str(),
+                                             MB_OK | MB_ICONINFORMATION);
+    }
     return true;
+}
+
+bool RunRecovery(const std::filesystem::path& library, bool interactive,
+                 const gravity::i18n::Localization& localization,
+                 RecoveryResult& result) {
+    const auto desktop = CurrentDesktopPath();
+    if (!desktop) {
+        if (interactive) MessageBoxW(nullptr,
+                                     localization.Text("recovery.desktop_error").c_str(),
+                                     localization.Text("recovery.title").c_str(),
+                                     MB_OK | MB_ICONERROR);
+        return false;
+    }
+    return RunRecovery(library, RecoveryRunOptions{*desktop, interactive, true,
+                                                    false},
+                       localization, result);
+}
+
+std::optional<std::filesystem::path> CreateRecoveryIsolationRoot() {
+    wchar_t tempBuffer[MAX_PATH]{};
+    const DWORD length = GetTempPathW(static_cast<DWORD>(std::size(tempBuffer)),
+                                      tempBuffer);
+    if (length == 0 || length >= std::size(tempBuffer)) return std::nullopt;
+    GUID guid{};
+    if (FAILED(CoCreateGuid(&guid))) return std::nullopt;
+    wchar_t guidText[64]{};
+    if (StringFromGUID2(guid, guidText, static_cast<int>(std::size(guidText))) <= 0) {
+        return std::nullopt;
+    }
+    const std::filesystem::path base =
+        std::filesystem::path(tempBuffer) / L"GravityDesktop-Recovery-Test";
+    const std::filesystem::path root = base / guidText;
+    std::error_code error;
+    std::filesystem::create_directories(root, error);
+    if (error || !IsPathInside(root, base) ||
+        !WriteUtf8Atomic(root / L".gravitydesktop-recovery-test",
+                         kRecoveryIsolationMarker)) {
+        return std::nullopt;
+    }
+    return root;
+}
+
+bool IsRecoveryIsolationRoot(const std::filesystem::path& root) {
+    wchar_t tempBuffer[MAX_PATH]{};
+    const DWORD length = GetTempPathW(static_cast<DWORD>(std::size(tempBuffer)),
+                                      tempBuffer);
+    if (length == 0 || length >= std::size(tempBuffer)) return false;
+    const std::filesystem::path base =
+        std::filesystem::path(tempBuffer) / L"GravityDesktop-Recovery-Test";
+    const auto marker = ReadUtf8File(root / L".gravitydesktop-recovery-test");
+    return IsPathInside(root, base) && marker &&
+           *marker == kRecoveryIsolationMarker;
+}
+
+bool RemoveRecoveryIsolationRoot(const std::filesystem::path& root) {
+    if (!IsRecoveryIsolationRoot(root)) return false;
+    std::error_code error;
+    std::filesystem::remove_all(root, error);
+    return !error;
+}
+
+bool JournalContainsState(const std::filesystem::path& library,
+                          const std::filesystem::path& source,
+                          const std::wstring& expectedState) {
+    const auto entries = ReadPreviousRecoveryJournal(library / L"恢复事务.json");
+    const auto found = entries.find(NormalizePath(source));
+    return found != entries.end() && found->second.state == expectedState;
+}
+
+bool RunRecoveryIsolationSelfTest() {
+    const auto root = CreateRecoveryIsolationRoot();
+    if (!root || !IsRecoveryIsolationRoot(*root)) return false;
+    const std::filesystem::path library = *root / L"ManagedLibrary";
+    const std::filesystem::path desktop = *root / L"DesktopTarget";
+    std::error_code error;
+    std::filesystem::create_directories(library / L"managed", error);
+    std::filesystem::create_directories(desktop, error);
+    if (error) {
+        (void)RemoveRecoveryIsolationRoot(*root);
+        return false;
+    }
+
+    gravity::i18n::Localization localization;
+    const auto run = [&](const std::vector<ManagedEntry>& entries,
+                         bool stopAfterJournal, RecoveryResult& result) {
+        return WriteManagedManifest(library, entries) &&
+               RunRecovery(library,
+                           RecoveryRunOptions{desktop, false, false,
+                                              stopAfterJournal},
+                           localization, result);
+    };
+
+    bool passed = true;
+    const auto writeFile = [](const std::filesystem::path& path,
+                              const std::string& contents) {
+        std::error_code createError;
+        std::filesystem::create_directories(path.parent_path(), createError);
+        if (createError) return false;
+        std::ofstream output(path, std::ios::binary | std::ios::trunc);
+        output << contents;
+        return static_cast<bool>(output);
+    };
+
+    // 1. Normal recovery: same filename, size, and SHA-256 at destination.
+    const std::filesystem::path normalSource =
+        library / L"managed" / L"GravityDesktop-Recovery-Test.txt";
+    const std::filesystem::path normalDestination =
+        desktop / L"GravityDesktop-Recovery-Test.txt";
+    const std::string normalContents =
+        "Gravity Desktop MSIX Recovery Test\nTimestamp: " +
+        std::to_string(static_cast<unsigned long long>(GetTickCount64())) + "\n";
+    passed = passed && writeFile(normalSource, normalContents);
+    const std::uintmax_t normalSize = std::filesystem::file_size(normalSource, error);
+    RecoveryResult normalResult;
+    passed = passed && !error &&
+             run({ManagedEntry{1, normalSource.wstring(), normalDestination.wstring()}},
+                 false, normalResult) && normalResult.restored == 1 &&
+             normalResult.conflicts == 0 && normalResult.failed == 0 &&
+             !FileExists(normalSource) && FileExists(normalDestination) &&
+             std::filesystem::file_size(normalDestination, error) == normalSize &&
+             ReadUtf8File(normalDestination) == std::optional<std::string>{normalContents} &&
+             JournalContainsState(library, normalSource, L"restored");
+
+    // 2. Conflict: a different desktop file is preserved and the managed file
+    // is restored under the existing collision-safe destination policy.
+    const std::filesystem::path conflictSource =
+        library / L"managed" / L"GravityDesktop-Recovery-Conflict.txt";
+    const std::filesystem::path conflictDestination =
+        desktop / L"GravityDesktop-Recovery-Conflict.txt";
+    passed = passed && writeFile(conflictSource, "managed conflict content\n") &&
+             writeFile(conflictDestination, "existing desktop content\n");
+    const auto conflictSourceContents = ReadUtf8File(conflictSource);
+    const auto conflictExistingContents = ReadUtf8File(conflictDestination);
+    RecoveryResult conflictResult;
+    passed = passed && conflictSourceContents && conflictExistingContents &&
+             run({ManagedEntry{2, conflictSource.wstring(),
+                               conflictDestination.wstring()}},
+                 false, conflictResult) && conflictResult.restored == 1 &&
+             FileExists(conflictDestination) &&
+             ReadUtf8File(conflictDestination) == conflictExistingContents &&
+             !FileExists(conflictSource);
+    const auto conflictJournal = ReadPreviousRecoveryJournal(library / L"恢复事务.json");
+    const auto conflictEntry = conflictJournal.find(NormalizePath(conflictSource));
+    passed = passed && conflictEntry != conflictJournal.end() &&
+             conflictEntry->second.destination != conflictDestination &&
+             FileExists(conflictEntry->second.destination) &&
+             ReadUtf8File(conflictEntry->second.destination) == conflictSourceContents &&
+             conflictEntry->second.state == L"restored";
+
+    // 3. Controlled interruption: journal is durable before moving any file;
+    // rerunning the same transaction resumes safely.
+    const std::filesystem::path interruptedSource =
+        library / L"managed" / L"GravityDesktop-Recovery-Interrupted.txt";
+    const std::filesystem::path interruptedDestination =
+        desktop / L"GravityDesktop-Recovery-Interrupted.txt";
+    passed = passed && writeFile(interruptedSource, "interrupted recovery content\n");
+    const auto interruptedContents = ReadUtf8File(interruptedSource);
+    RecoveryResult interruptedResult;
+    const bool stoppedAfterJournal = WriteManagedManifest(
+        library, {ManagedEntry{3, interruptedSource.wstring(),
+                                interruptedDestination.wstring()}}) &&
+        !RunRecovery(library,
+                     RecoveryRunOptions{desktop, false, false, true},
+                     localization, interruptedResult);
+    passed = passed && interruptedContents && stoppedAfterJournal &&
+             FileExists(interruptedSource) && !FileExists(interruptedDestination) &&
+             JournalContainsState(library, interruptedSource, L"pending");
+    RecoveryResult resumedResult;
+    passed = passed && run({ManagedEntry{3, interruptedSource.wstring(),
+                                          interruptedDestination.wstring()}},
+                         false, resumedResult) && resumedResult.restored == 1 &&
+             !FileExists(interruptedSource) && FileExists(interruptedDestination) &&
+             ReadUtf8File(interruptedDestination) == interruptedContents &&
+             JournalContainsState(library, interruptedSource, L"restored");
+
+    const bool cleaned = RemoveRecoveryIsolationRoot(*root);
+    return passed && cleaned;
 }
 
 bool RunSelfTest() {
@@ -662,6 +875,10 @@ bool RunSelfTest() {
 } // namespace
 
 int APIENTRY wWinMain(HINSTANCE, HINSTANCE, PWSTR commandLine, int) {
+    if (commandLine != nullptr &&
+        wcsstr(commandLine, L"--recovery-self-test") != nullptr) {
+        return RunRecoveryIsolationSelfTest() ? 0 : 3;
+    }
     if (commandLine != nullptr && wcsstr(commandLine, L"--self-test") != nullptr) {
         return RunSelfTest() ? 0 : 2;
     }
