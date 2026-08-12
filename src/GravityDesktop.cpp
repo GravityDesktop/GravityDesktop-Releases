@@ -2451,6 +2451,75 @@ bool WriteUtf8Atomic(const std::filesystem::path& target, const std::string& dat
     return false;
 }
 
+// Recovery metadata is an integrity record, not an activity log.  Keeping
+// unchanged content byte-for-byte stable avoids needless writes to the
+// durable library while preserving the existing atomic replacement and backup
+// behavior whenever the record actually changes.
+bool WriteUtf8AtomicIfChanged(const std::filesystem::path& target,
+                              const std::string& data) {
+    const std::optional<std::string> existing = ReadUtf8File(target);
+    if (existing.has_value() && *existing == data) {
+        const std::filesystem::path backup = target.wstring() + L".bak";
+        if (GetFileAttributesW(backup.c_str()) == INVALID_FILE_ATTRIBUTES) {
+            return WriteUtf8Atomic(backup, data);
+        }
+        return true;
+    }
+    return WriteUtf8Atomic(target, data);
+}
+
+bool FilesHaveSameContents(const std::filesystem::path& first,
+                           const std::filesystem::path& second) {
+    std::error_code error;
+    if (!std::filesystem::is_regular_file(first, error) || error ||
+        !std::filesystem::is_regular_file(second, error) || error ||
+        std::filesystem::file_size(first, error) !=
+            std::filesystem::file_size(second, error) || error) {
+        return false;
+    }
+    std::ifstream firstStream(first, std::ios::binary);
+    std::ifstream secondStream(second, std::ios::binary);
+    if (!firstStream || !secondStream) return false;
+    std::array<char, 64 * 1024> firstBuffer{};
+    std::array<char, 64 * 1024> secondBuffer{};
+    while (firstStream && secondStream) {
+        firstStream.read(firstBuffer.data(), firstBuffer.size());
+        secondStream.read(secondBuffer.data(), secondBuffer.size());
+        const std::streamsize firstRead = firstStream.gcount();
+        const std::streamsize secondRead = secondStream.gcount();
+        if (firstRead != secondRead ||
+            !std::equal(firstBuffer.begin(), firstBuffer.begin() + firstRead,
+                        secondBuffer.begin())) {
+            return false;
+        }
+    }
+    return firstStream.eof() && secondStream.eof();
+}
+
+bool CopyFileAtomicallyIfChanged(const std::filesystem::path& source,
+                                 const std::filesystem::path& target) {
+    if (FilesHaveSameContents(source, target)) return true;
+    std::error_code error;
+    std::filesystem::create_directories(target.parent_path(), error);
+    if (error) return false;
+    const std::filesystem::path temporary = target.wstring() + L".new";
+    (void)DeleteFileW(temporary.c_str());
+    if (CopyFileW(source.c_str(), temporary.c_str(), TRUE) == FALSE) {
+        return false;
+    }
+    const bool targetExists =
+        GetFileAttributesW(target.c_str()) != INVALID_FILE_ATTRIBUTES;
+    const bool replaced = targetExists
+        ? ReplaceFileW(target.c_str(), temporary.c_str(), nullptr,
+                       REPLACEFILE_WRITE_THROUGH, nullptr, nullptr) != FALSE
+        : MoveFileExW(temporary.c_str(), target.c_str(),
+                      MOVEFILE_WRITE_THROUGH) != FALSE;
+    if (!replaced) {
+        (void)DeleteFileW(temporary.c_str());
+    }
+    return replaced;
+}
+
 void AppendZipUInt16(std::vector<std::uint8_t>& bytes, std::uint16_t value) {
     bytes.push_back(static_cast<std::uint8_t>(value & 0xFF));
     bytes.push_back(static_cast<std::uint8_t>((value >> 8) & 0xFF));
@@ -3202,7 +3271,6 @@ std::string SerializeRelationshipManifest(const WorkspaceState& state) {
     output.imbue(std::locale::classic());
     output << "{\n"
            << "  \"schema_version\": 1,\n"
-           << "  \"generated_at\": " << UnixTimeNow() << ",\n"
            << "  \"cores\": [\n";
     for (std::size_t coreIndex = 0; coreIndex < state.cores.size(); ++coreIndex) {
         const Core& core = state.cores[coreIndex];
@@ -4896,7 +4964,7 @@ public:
         const std::filesystem::path manifest = RelationshipManifestPath();
         if (manifest.empty()) return false;
         const std::string serialized = SerializeRelationshipManifest(snapshot);
-        const bool localSaved = WriteUtf8Atomic(manifest, serialized);
+        const bool localSaved = WriteUtf8AtomicIfChanged(manifest, serialized);
         if (!localSaved) {
             AppendRuntimeDiagnostic(
                 "relationship_manifest_write_failed", E_FAIL, GetLastError());
@@ -4912,7 +4980,7 @@ public:
         const std::filesystem::path recoveryManifest =
             recoveryLibrary / L"恢复清单.json";
         const bool recoverySaved =
-            WriteUtf8Atomic(recoveryManifest, serialized);
+            WriteUtf8AtomicIfChanged(recoveryManifest, serialized);
         if (!recoverySaved) {
             AppendRuntimeDiagnostic(
                 "recovery_manifest_write_failed", E_FAIL, GetLastError());
@@ -26208,8 +26276,8 @@ private:
             }
             bool recoveryAvailable = false;
             if (!error) {
-                recoveryAvailable = CopyFileW(
-                    sourceRecovery.c_str(), durableRecovery.c_str(), FALSE) != FALSE;
+                recoveryAvailable = CopyFileAtomicallyIfChanged(
+                    sourceRecovery, durableRecovery);
             }
             // A currently running recovery tool can temporarily prevent an
             // upgrade. Keep its already verified copy rather than breaking the
@@ -26241,7 +26309,7 @@ private:
             error.clear();
             std::filesystem::create_directories(durableLocales, error);
             if (error ||
-                CopyFileW(source.c_str(), destination.c_str(), FALSE) == FALSE) {
+                !CopyFileAtomicallyIfChanged(source, destination)) {
                 if (!FilePathExists(destination.wstring())) {
                     AppendRuntimeDiagnostic("recovery_locale_copy_failed",
                                             E_FAIL, GetLastError());
@@ -26256,8 +26324,8 @@ private:
             std::filesystem::create_directories(
                 durableLibraryIcon.parent_path(), error);
             if (!error &&
-                CopyFileW(packagedLibraryIcon.c_str(),
-                          durableLibraryIcon.c_str(), FALSE) != FALSE) {
+                CopyFileAtomicallyIfChanged(packagedLibraryIcon,
+                                            durableLibraryIcon)) {
                 libraryIconAvailable = true;
             } else if (!libraryIconAvailable) {
                 AppendRuntimeDiagnostic("managed_library_icon_copy_failed",
@@ -30738,6 +30806,43 @@ bool RunSelfTest() {
     if (!manifestApp.WriteStateWithRelationshipManifest(manifestSnapshot) ||
         !manifestApp.WriteRelationshipManifest(manifestSnapshot) ||
         !manifestApp.CreateHistoryBackup(true)) {
+        return false;
+    }
+    const std::filesystem::path recoveryManifestPath =
+        std::filesystem::path(manifestSnapshot.managedLibraryPath) /
+        L"恢复清单.json";
+    const auto manifestWriteTime = std::filesystem::last_write_time(
+        manifestStatePath.parent_path() / L"relationships.json", tempError);
+    const auto recoveryManifestWriteTime = std::filesystem::last_write_time(
+        recoveryManifestPath, tempError);
+    const std::string stableManifest =
+        SerializeRelationshipManifest(manifestSnapshot);
+    if (tempError ||
+        stableManifest != SerializeRelationshipManifest(manifestSnapshot) ||
+        !manifestApp.WriteRelationshipManifest(manifestSnapshot) ||
+        tempError ||
+        std::filesystem::last_write_time(
+            manifestStatePath.parent_path() / L"relationships.json", tempError) !=
+            manifestWriteTime ||
+        tempError || std::filesystem::last_write_time(
+            recoveryManifestPath, tempError) != recoveryManifestWriteTime) {
+        return false;
+    }
+    const std::filesystem::path assetSource =
+        relationTestDirectory / L"asset-source.bin";
+    const std::filesystem::path assetDestination =
+        relationTestDirectory / L"asset-target.bin";
+    if (!WriteUtf8Atomic(assetSource, "recovery asset v1") ||
+        !CopyFileAtomicallyIfChanged(assetSource, assetDestination)) {
+        return false;
+    }
+    const auto assetWriteTime = std::filesystem::last_write_time(
+        assetDestination, tempError);
+    if (tempError || !CopyFileAtomicallyIfChanged(assetSource, assetDestination) ||
+        std::filesystem::last_write_time(assetDestination, tempError) != assetWriteTime ||
+        tempError || !WriteUtf8Atomic(assetSource, "recovery asset v2") ||
+        !CopyFileAtomicallyIfChanged(assetSource, assetDestination) ||
+        ReadUtf8File(assetDestination) != std::optional<std::string>("recovery asset v2")) {
         return false;
     }
     const std::filesystem::path manifestPath =
