@@ -7264,7 +7264,8 @@ private:
         SyncSelectionDismissTimer();
         SyncCoreSelectionRippleTimer();
         if (FocusAnimationActive() ||
-            !coreExpansionFrom_.empty()) {
+            !coreExpansionFrom_.empty() ||
+            WorkspaceChromeSlideAnimationActive()) {
             const bool animationTimerStarted =
                 workspaceVisible_ && !state_.workspacePaused &&
                 SetTimer(window_, kAnimationTimer, 16, nullptr) != 0;
@@ -7276,6 +7277,7 @@ private:
                 animationCoreFrom_.clear();
                 animationFromFocus_.clear();
                 coreExpansionFrom_.clear();
+                workspaceChromeSlideAnimationActive_ = false;
                 layoutDirty_ = true;
             }
         }
@@ -11324,8 +11326,13 @@ private:
             // The whole strip is interactive so users can drag it by any
             // non-button area; individual buttons still retain their normal
             // hit targets.
-            AddInteractionShape(
-                shapes, WorkspaceChromeInteractionRectangle(client), 2.0f);
+            if (WorkspaceChromeSlideAnimationActive()) {
+                AddInteractionShape(
+                    shapes, WorkspaceChromeRevealRectangle(client), 2.0f);
+            } else {
+                AddInteractionShape(
+                    shapes, WorkspaceChromeInteractionRectangle(client), 2.0f);
+            }
             if (CoreDistanceSliderOpen()) {
                 AddInteractionShape(
                     shapes,
@@ -11719,10 +11726,14 @@ private:
         }
         workspaceChromeHovered_ = hovered;
         if (hovered) {
+            const bool wasCollapsed = workspaceChromeAutoHideReady_;
             if (window_ != nullptr) {
                 KillTimer(window_, kWorkspaceChromeRevealWatchTimer);
             }
             CancelWorkspaceChromeAutoHideDelay();
+            if (wasCollapsed) {
+                StartWorkspaceChromeSlide(false);
+            }
         } else {
             ScheduleWorkspaceChromeAutoHide();
         }
@@ -11939,19 +11950,42 @@ private:
         ScreenToClient(window_, &cursorPixels);
         const D2D1_POINT_2F cursor =
             PixelToDip(cursorPixels.x, cursorPixels.y);
+        const bool fullyCollapsed = WorkspaceChromeCollapsed(client);
 
-        if (WorkspaceChromeCollapsed(client)) {
+        if (fullyCollapsed) {
             const D2D1_RECT_F reveal = WorkspaceChromeRevealRectangle(client);
             brush_->SetColor(D2D1::ColorF(
                 RgbFromColorRef(GetSysColor(COLOR_HIGHLIGHT)), 0.68f));
             renderTarget_->FillRoundedRectangle(
                 D2D1::RoundedRect(reveal, 2.0f, 2.0f), brush_.Get());
-            return;
+            if (!WorkspaceChromeSlideAnimationActive()) {
+                return;
+            }
         }
 
         const D2D1_RECT_F group = WorkspaceChromeGroupRectangle(client);
+        const float slideAmount = WorkspaceChromeRenderedSlideAmount();
+        D2D1_POINT_2F slideOffset = D2D1::Point2F();
+        switch (WorkspaceChromeNearestEdge(client)) {
+        case 0:
+            slideOffset.y = -(group.bottom - 5.0f) * slideAmount;
+            break;
+        case 1:
+            slideOffset.x = (client.width - group.left - 5.0f) * slideAmount;
+            break;
+        case 2:
+            slideOffset.y = (client.height - group.top - 5.0f) * slideAmount;
+            break;
+        default:
+            slideOffset.x = -(group.right - 5.0f) * slideAmount;
+            break;
+        }
+        renderTarget_->SetTransform(
+            D2D1::Matrix3x2F::Translation(slideOffset.x, slideOffset.y));
+        const D2D1_POINT_2F localCursor = D2D1::Point2F(
+            cursor.x - slideOffset.x, cursor.y - slideOffset.y);
         const bool stripHovered = workspaceChromeHovered_ ||
-            PointInside(cursor, group);
+            PointInside(localCursor, group);
         const bool stripActive = stripHovered || draggingWorkspaceChrome_;
         constexpr float stripAlpha = 1.0f;
         const D2D1_RECT_F shadow = D2D1::RectF(
@@ -12014,7 +12048,7 @@ private:
              index < kWorkspaceControlCount;
              ++index) {
             const D2D1_RECT_F button = WorkspaceControlRectangle(client, index);
-            const bool hovered = PointInside(cursor, button);
+            const bool hovered = PointInside(localCursor, button);
             const bool disabled = index == 2 && undoStack_.empty();
             const bool pinned = index == 0 && state_.workspaceChromePinned;
             if (hovered || pinned) {
@@ -12081,6 +12115,7 @@ private:
                     D2D1_DRAW_TEXT_OPTIONS_CLIP);
             }
         }
+        renderTarget_->SetTransform(D2D1::Matrix3x2F::Identity());
     }
 
     void ShowGlobalArrangeMenu() {
@@ -25196,6 +25231,70 @@ private:
         }
     }
 
+    static float WorkspaceChromeSlideDurationForMode(AnimationMode mode) {
+        switch (mode) {
+        case AnimationMode::Off: return 0.0f;
+        case AnimationMode::Simple: return 110.0f;
+        case AnimationMode::Soft: return 260.0f;
+        case AnimationMode::Standard:
+        default: return 180.0f;
+        }
+    }
+
+    float WorkspaceChromeSlideDurationMilliseconds() const {
+        return WorkspaceChromeSlideDurationForMode(EffectiveAnimationMode());
+    }
+
+    bool WorkspaceChromeSlideAnimationActive() const {
+        return workspaceChromeSlideAnimationActive_;
+    }
+
+    float WorkspaceChromeSlideAmount() const {
+        if (!WorkspaceChromeSlideAnimationActive()) {
+            return workspaceChromeSlideTargetCollapsed_ ? 1.0f : 0.0f;
+        }
+        const float duration =
+            std::max(1.0f, WorkspaceChromeSlideDurationMilliseconds());
+        const float elapsed = std::chrono::duration<float, std::milli>(
+            std::chrono::steady_clock::now() -
+            workspaceChromeSlideStarted_).count();
+        const float raw = ClampUnit(elapsed / duration);
+        const float eased = raw * raw * (3.0f - 2.0f * raw);
+        const float target = workspaceChromeSlideTargetCollapsed_ ? 1.0f : 0.0f;
+        return workspaceChromeSlideFromAmount_ +
+            (target - workspaceChromeSlideFromAmount_) * eased;
+    }
+
+    float WorkspaceChromeRenderedSlideAmount() const {
+        // Auto-hide is a docked, unpinned state only.  The animation state may
+        // still contain its previous target while the strip is being dragged
+        // away from an edge or pinned, but it must not move a visible strip.
+        if (!state_.workspaceChromeDocked || state_.workspaceChromePinned) {
+            return 0.0f;
+        }
+        return WorkspaceChromeSlideAmount();
+    }
+
+    void StartWorkspaceChromeSlide(bool collapsed) {
+        const float target = collapsed ? 1.0f : 0.0f;
+        const float current = WorkspaceChromeSlideAmount();
+        workspaceChromeSlideTargetCollapsed_ = collapsed;
+        if (EffectiveAnimationMode() == AnimationMode::Off ||
+            std::abs(current - target) <= 0.001f || window_ == nullptr) {
+            workspaceChromeSlideAnimationActive_ = false;
+            workspaceChromeSlideFromAmount_ = target;
+            return;
+        }
+        workspaceChromeSlideFromAmount_ = current;
+        workspaceChromeSlideStarted_ = std::chrono::steady_clock::now();
+        workspaceChromeSlideAnimationActive_ =
+            SetTimer(window_, kAnimationTimer,
+                     kCoreExpansionFrameIntervalMs, nullptr) != 0;
+        if (!workspaceChromeSlideAnimationActive_) {
+            workspaceChromeSlideFromAmount_ = target;
+        }
+    }
+
     void PreserveDirtyStateForRecovery(const char* event) {
         const std::filesystem::path recovery = SessionEndRecoveryPath();
         if (!dirty_ || recovery.empty() ||
@@ -25267,6 +25366,9 @@ private:
                 !workspaceChromePointerPending_ &&
                 !workspaceChromeMenuOpen_ &&
                 !corePlacementMode_;
+            if (workspaceChromeAutoHideReady_) {
+                StartWorkspaceChromeSlide(true);
+            }
             SyncWorkspaceChromeRevealWatch();
             EnsureInteractionWindowPresented();
             Invalidate();
@@ -25299,7 +25401,20 @@ private:
                 coreExpansionFrom_.clear();
                 layoutDirty_ = true;
             }
-            if (!FocusAnimationActive() && coreExpansionFrom_.empty()) {
+            if (WorkspaceChromeSlideAnimationActive()) {
+                const float slideElapsed =
+                    std::chrono::duration<float, std::milli>(
+                        std::chrono::steady_clock::now() -
+                        workspaceChromeSlideStarted_).count();
+                if (slideElapsed >=
+                    WorkspaceChromeSlideDurationMilliseconds()) {
+                    workspaceChromeSlideAnimationActive_ = false;
+                    workspaceChromeSlideFromAmount_ =
+                        workspaceChromeSlideTargetCollapsed_ ? 1.0f : 0.0f;
+                }
+            }
+            if (!FocusAnimationActive() && coreExpansionFrom_.empty() &&
+                !WorkspaceChromeSlideAnimationActive()) {
                 KillTimer(window_, kAnimationTimer);
             }
             Invalidate();
@@ -27573,6 +27688,11 @@ private:
     bool workspaceChromeHovered_ = false;
     bool workspaceChromeMenuOpen_ = false;
     bool workspaceChromeAutoHideReady_ = true;
+    bool workspaceChromeSlideAnimationActive_ = false;
+    bool workspaceChromeSlideTargetCollapsed_ = true;
+    float workspaceChromeSlideFromAmount_ = 1.0f;
+    std::chrono::steady_clock::time_point workspaceChromeSlideStarted_ =
+        std::chrono::steady_clock::now();
     bool coreDistanceSliderActive_ = false;
     bool draggingCoreDistancePanel_ = false;
     bool draggingCoreDistanceSlider_ = false;
@@ -30300,9 +30420,38 @@ bool RunSelfTest() {
     chromePolicyApp.state_.workspaceChromePinned = true;
     const bool pinnedChromeRemainsVisible =
         !chromePolicyApp.WorkspaceChromeCollapsed(chromePolicyClient);
+    chromePolicyApp.workspaceChromeSlideTargetCollapsed_ = true;
+    chromePolicyApp.workspaceChromeSlideFromAmount_ = 1.0f;
+    const bool pinnedChromeIsNotTranslated =
+        chromePolicyApp.WorkspaceChromeRenderedSlideAmount() == 0.0f;
+    chromePolicyApp.state_.workspaceChromePinned = false;
+    const bool dockedChromeUsesCollapsedTranslation =
+        chromePolicyApp.WorkspaceChromeRenderedSlideAmount() == 1.0f;
+    chromePolicyApp.state_.workspaceChromeDocked = false;
+    const bool floatingChromeIsNotTranslated =
+        chromePolicyApp.WorkspaceChromeRenderedSlideAmount() == 0.0f;
     if (!freshChromeRemainsVisible ||
         !explicitlyDockedChromeCanCollapse ||
-        !pinnedChromeRemainsVisible) {
+        !pinnedChromeRemainsVisible ||
+        !pinnedChromeIsNotTranslated ||
+        !dockedChromeUsesCollapsedTranslation ||
+        !floatingChromeIsNotTranslated) {
+        return false;
+    }
+    if (GravityApp::WorkspaceChromeSlideDurationForMode(
+            AnimationMode::Off) != 0.0f) {
+        return false;
+    }
+    if (GravityApp::WorkspaceChromeSlideDurationForMode(
+            AnimationMode::Simple) != 110.0f) {
+        return false;
+    }
+    if (GravityApp::WorkspaceChromeSlideDurationForMode(
+            AnimationMode::Standard) != 180.0f) {
+        return false;
+    }
+    if (GravityApp::WorkspaceChromeSlideDurationForMode(
+            AnimationMode::Soft) != 260.0f) {
         return false;
     }
 
