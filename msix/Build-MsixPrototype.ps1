@@ -2,7 +2,7 @@ param(
     [ValidateSet('Release')]
     [string]$Configuration = 'Release',
     [ValidatePattern('^\d+\.\d+\.\d+\.\d+$')]
-    [string]$PackageVersion = '0.1.0.0',
+    [string]$PackageVersion = '1.0.11.0',
     [string]$PackageName = 'GravityDesktop-MSIX-Prototype-0.1.0-alpha.msix',
     [switch]$PackagedBuild
 )
@@ -34,7 +34,12 @@ New-Item -ItemType Directory -Force -Path (Join-Path $stagingRoot 'Assets'), (Jo
 New-Item -ItemType Directory -Force -Path $outputRoot | Out-Null
 
 $manifestText = Get-Content -LiteralPath (Join-Path $PSScriptRoot 'Package.appxmanifest') -Raw -Encoding utf8
-$manifestText = $manifestText -replace 'Version="0\.1\.0\.0"', "Version=`"$PackageVersion`""
+$manifestText = [regex]::Replace(
+    $manifestText,
+    '(<Identity\b[^>]*\bVersion=")[^"]+(")',
+    { param($match)
+        $match.Groups[1].Value + $PackageVersion + $match.Groups[2].Value
+    })
 [System.IO.File]::WriteAllText((Join-Path $stagingRoot 'AppxManifest.xml'), $manifestText, [System.Text.UTF8Encoding]::new($false))
 Copy-Item -LiteralPath (Join-Path $releaseRoot 'GravityDesktop.exe') -Destination $stagingRoot
 Copy-Item -LiteralPath (Join-Path $releaseRoot 'GravityDesktopRecovery.exe') -Destination $stagingRoot
