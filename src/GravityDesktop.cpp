@@ -2207,8 +2207,10 @@ bool AutoStartCommandMatches(
 enum class AutoStartRegistrationState : int {
     Disabled = 0,
     Enabled = 1,
-    NeedsRepair = 2,
-    Unavailable = 3,
+    DisabledByUser = 2,
+    DisabledByPolicy = 3,
+    NeedsRepair = 4,
+    Unavailable = 5,
 };
 
 struct AutoStartRegistrationStatus {
@@ -2218,6 +2220,105 @@ struct AutoStartRegistrationStatus {
     std::wstring valueName;
 };
 
+AutoStartRegistrationState ToAutoStartRegistrationState(
+    winrt::Windows::ApplicationModel::StartupTaskState state) {
+    using winrt::Windows::ApplicationModel::StartupTaskState;
+    switch (state) {
+    case StartupTaskState::Enabled:
+        return AutoStartRegistrationState::Enabled;
+    case StartupTaskState::DisabledByUser:
+        return AutoStartRegistrationState::DisabledByUser;
+    case StartupTaskState::DisabledByPolicy:
+        return AutoStartRegistrationState::DisabledByPolicy;
+    case StartupTaskState::Disabled:
+        return AutoStartRegistrationState::Disabled;
+    default:
+        return AutoStartRegistrationState::Unavailable;
+    }
+}
+
+// MSIX packages must never create a Run entry.  Only remove the exact legacy
+// value that earlier prototype builds created for this same package identity;
+// all other user startup values, including the development EXE value, remain
+// untouched.
+bool IsConfirmedLegacyPackagedRunCommand(
+    const std::wstring& command, const std::wstring& packageName) {
+    if (packageName.empty()) {
+        return false;
+    }
+    int argumentCount = 0;
+    LPWSTR* arguments = CommandLineToArgvW(command.c_str(), &argumentCount);
+    if (arguments == nullptr) {
+        return false;
+    }
+    const std::filesystem::path executable = arguments[0];
+    const std::wstring parent = executable.parent_path().filename().wstring();
+    const bool matches =
+        argumentCount == 2 &&
+        CompareStringOrdinal(arguments[1], -1, L"--autostart", -1, TRUE) ==
+            CSTR_EQUAL &&
+        CompareStringOrdinal(executable.filename().c_str(), -1,
+            L"GravityDesktop.exe", -1, TRUE) == CSTR_EQUAL &&
+        parent.rfind(packageName + L"_", 0) == 0;
+    LocalFree(arguments);
+    return matches;
+}
+
+bool RemoveConfirmedLegacyPackagedRunRegistration() {
+    if (!IsPackagedProcess()) {
+        return false;
+    }
+    UINT32 packageFullNameLength = 0;
+    if (GetCurrentPackageFullName(&packageFullNameLength, nullptr) !=
+        ERROR_INSUFFICIENT_BUFFER || packageFullNameLength == 0) {
+        return false;
+    }
+    std::wstring packageFullName(packageFullNameLength, L'\0');
+    if (GetCurrentPackageFullName(
+            &packageFullNameLength, packageFullName.data()) != ERROR_SUCCESS) {
+        return false;
+    }
+    packageFullName.resize(wcslen(packageFullName.c_str()));
+    const std::size_t separator = packageFullName.find(L'_');
+    const std::wstring packageName = separator == std::wstring::npos
+        ? packageFullName : packageFullName.substr(0, separator);
+
+    HKEY key = nullptr;
+    if (RegOpenKeyExW(HKEY_CURRENT_USER, kAutoStartRegistrySubkey, 0,
+            KEY_QUERY_VALUE | KEY_SET_VALUE, &key) != ERROR_SUCCESS) {
+        return false;
+    }
+    bool removed = false;
+    constexpr std::array<const wchar_t*, 2> kLegacyValueNames{{
+        kAutoStartRegistryValueName, L"GravityDesktop.exe"}};
+    for (const wchar_t* valueName : kLegacyValueNames) {
+        DWORD type = 0;
+        DWORD bytes = 0;
+        LONG query = RegQueryValueExW(key, valueName, nullptr,
+            &type, nullptr, &bytes);
+        if (query != ERROR_SUCCESS ||
+            (type != REG_SZ && type != REG_EXPAND_SZ) ||
+            bytes < sizeof(wchar_t)) {
+            continue;
+        }
+        std::wstring command(bytes / sizeof(wchar_t), L'\0');
+        query = RegQueryValueExW(key, valueName, nullptr,
+            &type, reinterpret_cast<BYTE*>(command.data()), &bytes);
+        if (query != ERROR_SUCCESS) {
+            continue;
+        }
+        while (!command.empty() && command.back() == L'\0') {
+            command.pop_back();
+        }
+        if (IsConfirmedLegacyPackagedRunCommand(command, packageName) &&
+            RegDeleteValueW(key, valueName) == ERROR_SUCCESS) {
+            removed = true;
+        }
+    }
+    RegCloseKey(key);
+    return removed;
+}
+
 AutoStartRegistrationStatus ReadAutoStartRegistration() {
     AutoStartRegistrationStatus status;
     if (IsPackagedProcess()) {
@@ -2226,19 +2327,7 @@ AutoStartRegistrationStatus ReadAutoStartRegistration() {
             const auto startupTask =
                 winrt::Windows::ApplicationModel::StartupTask::GetAsync(
                     kPackagedStartupTaskId).get();
-            switch (startupTask.State()) {
-            case winrt::Windows::ApplicationModel::StartupTaskState::Enabled:
-                status.state = AutoStartRegistrationState::Enabled;
-                break;
-            case winrt::Windows::ApplicationModel::StartupTaskState::Disabled:
-            case winrt::Windows::ApplicationModel::StartupTaskState::DisabledByUser:
-            case winrt::Windows::ApplicationModel::StartupTaskState::DisabledByPolicy:
-                status.state = AutoStartRegistrationState::Disabled;
-                break;
-            default:
-                status.state = AutoStartRegistrationState::Unavailable;
-                break;
-            }
+            status.state = ToAutoStartRegistrationState(startupTask.State());
         } catch (const winrt::hresult_error& error) {
             status.error = static_cast<LONG>(error.code().value);
         } catch (...) {
@@ -2333,8 +2422,14 @@ bool WriteAutoStartRegistration(bool enabled) {
                 winrt::Windows::ApplicationModel::StartupTask::GetAsync(
                     kPackagedStartupTaskId).get();
             if (enabled) {
-                const auto result = startupTask.RequestEnableAsync().get();
-                return result ==
+                const AutoStartRegistrationState state =
+                    ToAutoStartRegistrationState(startupTask.State());
+                if (state == AutoStartRegistrationState::DisabledByUser ||
+                    state == AutoStartRegistrationState::DisabledByPolicy) {
+                    return false;
+                }
+                (void)startupTask.RequestEnableAsync().get();
+                return startupTask.State() ==
                     winrt::Windows::ApplicationModel::StartupTaskState::Enabled;
             }
             startupTask.Disable();
@@ -5583,6 +5678,14 @@ public:
     bool Initialize(HWND window) {
         window_ = window;
         localization_.Load();
+        // An older MSIX prototype could leave a second HKCU Run entry behind.
+        // A packaged launch is allowed to remove only that verified legacy
+        // entry; the current package itself is represented solely by its
+        // StartupTask declaration.
+        if (IsPackagedProcess() &&
+            RemoveConfirmedLegacyPackagedRunRegistration()) {
+            AppendRuntimeDiagnostic("packaged_legacy_run_entry_removed");
+        }
         dpi_ = static_cast<float>(GetDpiForWindow(window_));
         RefreshWindowsVisualProfile();
         // The full-size window is now a visual-only layered surface.  File
@@ -12917,7 +13020,11 @@ private:
             const std::wstring autoStartDetail =
                 status.state == AutoStartRegistrationState::NeedsRepair
                     ? T("settings.autostart.repair")
-                    : T("settings.autostart.current_user");
+                    : status.state == AutoStartRegistrationState::DisabledByUser
+                        ? T("settings.autostart.disabled_by_user")
+                        : status.state == AutoStartRegistrationState::DisabledByPolicy
+                            ? T("settings.autostart.disabled_by_policy")
+                            : T("settings.autostart.current_user");
             CreateSettingsText(settingsContentWindow_, autoStartDetail.c_str(),
                 16, 208, contentWidth, english ? 48 : 34);
             break;
@@ -13816,6 +13923,15 @@ private:
             ReadAutoStartRegistration();
         if (before.state == AutoStartRegistrationState::Unavailable) {
             SetStatus(T("status.autostart_failed"));
+            return;
+        }
+        if (IsPackagedProcess() &&
+            (before.state == AutoStartRegistrationState::DisabledByUser ||
+             before.state == AutoStartRegistrationState::DisabledByPolicy)) {
+            SetStatus(T(before.state ==
+                AutoStartRegistrationState::DisabledByUser
+                    ? "status.autostart_disabled_by_user"
+                    : "status.autostart_disabled_by_policy"));
             return;
         }
         const bool shouldEnable =
@@ -28375,6 +28491,28 @@ bool RunSelfTest() {
         AutoStartCommandMatches(
             L"\"C:\\Program Files\\Gravity Desktop\\GravityDesktop.exe\"",
             testAutoStartPath)) {
+        return false;
+    }
+    if (ToAutoStartRegistrationState(
+            winrt::Windows::ApplicationModel::StartupTaskState::Enabled) !=
+            AutoStartRegistrationState::Enabled ||
+        ToAutoStartRegistrationState(
+            winrt::Windows::ApplicationModel::StartupTaskState::Disabled) !=
+            AutoStartRegistrationState::Disabled ||
+        ToAutoStartRegistrationState(
+            winrt::Windows::ApplicationModel::StartupTaskState::DisabledByUser) !=
+            AutoStartRegistrationState::DisabledByUser ||
+        ToAutoStartRegistrationState(
+            winrt::Windows::ApplicationModel::StartupTaskState::DisabledByPolicy) !=
+            AutoStartRegistrationState::DisabledByPolicy ||
+        IsConfirmedLegacyPackagedRunCommand(
+            L"GravityDesktop.exe", L"wbyhome.GravityDesktop") ||
+        IsConfirmedLegacyPackagedRunCommand(
+            L"\"C:\\Program Files\\WindowsApps\\other.App_1.0.0_x64__abc\\GravityDesktop.exe\" --autostart",
+            L"wbyhome.GravityDesktop") ||
+        !IsConfirmedLegacyPackagedRunCommand(
+            L"\"C:\\Program Files\\WindowsApps\\wbyhome.GravityDesktop_0.1.0.6_x64__4j298z9ac9h26\\GravityDesktop.exe\" --autostart",
+            L"wbyhome.GravityDesktop")) {
         return false;
     }
 
