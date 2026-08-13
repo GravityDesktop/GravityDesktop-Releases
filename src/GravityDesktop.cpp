@@ -357,7 +357,11 @@ struct ResponsiveMetrics {
     float normalIconSize = 42.0f;
     float importantIconSize = 48.0f;
     float minorIconSize = 36.0f;
+    // Layout geometry deliberately keeps its long-standing footprint.  The
+    // visual body is independent so a display/DPI correction never relocates
+    // cores, files, or ring slots.
     float coreSize = 56.0f;
+    float coreVisualSize = 48.0f;
     float fileFontSize = 12.0f;
     float coreFontSize = 14.0f;
     float helperFontSize = 11.0f;
@@ -379,6 +383,27 @@ struct ResponsiveMetrics {
     std::array<float, 3> focusedRingRadii = kDefaultRingRadii;
     std::array<int, 3> focusedRingCapacities{6, 13, 0};
 };
+
+// Core bodies are relationship anchors, not primary desktop content.  Derive
+// the visible diameter from the shell's logical icon size, then use only a
+// gentle logical-work-area adjustment.  Physical pixel resolution and Windows
+// DPI are intentionally absent here: both have already been converted to DIPs.
+float CalculateCoreVisualSizeDip(float desktopIconSizeDip,
+                                 float workspaceShortSideDip) {
+    constexpr float kReferenceShortSideDip = 1080.0f;
+    constexpr float kMinimumWorkspaceScale = 0.90f;
+    constexpr float kMaximumWorkspaceScale = 1.075f;
+    constexpr float kCoreToDesktopIconScale = 1.12f;
+
+    const float iconSize = std::clamp(desktopIconSizeDip, 32.0f, 96.0f);
+    const float shortSide = std::max(480.0f, workspaceShortSideDip);
+    const float workspaceScale = std::clamp(
+        std::pow(shortSide / kReferenceShortSideDip, 0.20f),
+        kMinimumWorkspaceScale, kMaximumWorkspaceScale);
+    return std::round(std::clamp(iconSize * kCoreToDesktopIconScale *
+                                     workspaceScale,
+                                 40.0f, 66.0f));
+}
 
 enum MenuCommand : UINT {
     MenuCreateCore = 1001,
@@ -8090,8 +8115,13 @@ private:
             metrics.normalIconSize * 1.15f, 36.0f, 110.0f));
         metrics.minorIconSize = std::round(std::clamp(
             metrics.normalIconSize * 0.85f, 28.0f, 82.0f));
+        // Keep layout geometry stable.  Only the visual core body follows the
+        // Windows desktop icon scale so a DPI/display change cannot write or
+        // rearrange user workspace coordinates.
         metrics.coreSize = std::round(std::clamp(
             metrics.normalIconSize * 1.33f, 56.0f, 80.0f));
+        metrics.coreVisualSize = CalculateCoreVisualSizeDip(
+            metrics.normalIconSize, metrics.shortSide);
 
         metrics.fileFontSize = std::round(std::clamp(
             desktopFileFontSizeDip_ + fontAdjustment,
@@ -9695,11 +9725,14 @@ private:
     D2D1_POINT_2F ClampDraggedCoreWorld(
         const Core& core, D2D1_POINT_2F candidateWorld) const {
         D2D1_POINT_2F center = WorldToScreen(candidateWorld);
-        const float radius = CoreScreenRadius(core);
+        const float radius = CoreLayoutScreenRadius(core);
+        // The persisted layout envelope remains unchanged, while label and
+        // badge placement follows the smaller visual body.
+        const float visualRadius = CoreScreenRadius(core);
         const D2D1_RECT_F name =
-            CoreNameRectangle(core, center, radius);
+            CoreNameRectangle(core, center, visualRadius);
         const D2D1_RECT_F badge =
-            CoreCapacityBadgeRectangle(core, center, radius);
+            CoreCapacityBadgeRectangle(core, center, visualRadius);
         D2D1_RECT_F bounds = D2D1::RectF(
             center.x - radius, center.y - radius,
             center.x + radius, center.y + radius);
@@ -11356,6 +11389,14 @@ private:
     }
 
     float CoreScreenRadius(const Core& core) const {
+        return metrics_.coreVisualSize * state_.zoom *
+               CoreVisualScale(core) / 2.0f;
+    }
+
+    float CoreLayoutScreenRadius(const Core& core) const {
+        // Preserve the established layout/collision envelope.  Visual sizing
+        // is intentionally not allowed to move a persisted core or reflow its
+        // surrounding files.
         return metrics_.coreSize * state_.zoom *
                CoreVisualScale(core) / 2.0f;
     }
@@ -11482,8 +11523,9 @@ private:
                     if (CoreBodyVisible(core)) {
                         const D2D1_POINT_2F center =
                             WorldToScreen(VisualCorePosition(core));
-                        const float radius =
-                            CoreScreenRadius(core);
+                        const float radius = std::max(
+                            CoreScreenRadius(core),
+                            CoreLayoutScreenRadius(core));
                         AddInteractionShape(
                             shapes,
                             D2D1::RectF(
@@ -16892,7 +16934,14 @@ private:
         const D2D1_POINT_2F center =
             WorldToScreen(VisualCorePosition(core));
         const float coreRadius = CoreScreenRadius(core);
-        const float outerRadius = coreRadius + 6.0f;
+        // Halo extents scale with the visible body instead of keeping a large
+        // fixed-DIP cushion around smaller cores.  The halo and selection
+        // ripple remain display-only and never participate in layout sizing.
+        const float ringGap = std::max(4.0f, coreRadius * 0.18f);
+        const float outerRadius = coreRadius + ringGap;
+        const float haloInnerSpread = std::max(3.0f, coreRadius * 0.10f);
+        const float haloMiddleSpread = std::max(5.0f, coreRadius * 0.24f);
+        const float haloOuterSpread = std::max(8.0f, coreRadius * 0.40f);
 
         // A layered, alpha-only halo makes the core legible without a blur
         // pass or a continuously animated effect.
@@ -16903,16 +16952,19 @@ private:
                 CoreGlowIntensity(core);
         brush_->SetColor(D2D1::ColorF(haloColor, 0.035f * haloStrength));
         renderTarget_->FillEllipse(
-            D2D1::Ellipse(center, outerRadius + 20.0f, outerRadius + 20.0f),
+            D2D1::Ellipse(center, coreRadius + haloOuterSpread,
+                            coreRadius + haloOuterSpread),
             brush_.Get());
         brush_->SetColor(D2D1::ColorF(haloColor, 0.070f * haloStrength));
         renderTarget_->FillEllipse(
-            D2D1::Ellipse(center, outerRadius + 12.0f, outerRadius + 12.0f),
+            D2D1::Ellipse(center, coreRadius + haloMiddleSpread,
+                            coreRadius + haloMiddleSpread),
             brush_.Get());
         brush_->SetColor(D2D1::ColorF(
             haloColor, dropTarget ? 0.26f : 0.14f * haloStrength));
         renderTarget_->FillEllipse(
-            D2D1::Ellipse(center, outerRadius + 5.0f, outerRadius + 5.0f),
+            D2D1::Ellipse(center, coreRadius + haloInnerSpread,
+                            coreRadius + haloInnerSpread),
             brush_.Get());
         brush_->SetColor(D2D1::ColorF(themeColor, 1.0f));
         renderTarget_->FillEllipse(
@@ -17783,8 +17835,11 @@ private:
                     VisualCorePosition(*iterator));
             const float coreRadius =
                 CoreScreenRadius(*iterator);
-            const float coreHitRadius =
-                coreRadius + 6.0f;
+            // Keep the pre-existing generous interaction island even when the
+            // visual body becomes smaller on a compact display.
+            const float coreHitRadius = std::max(
+                coreRadius + 6.0f,
+                CoreLayoutScreenRadius(*iterator) + 6.0f);
             D2D1_RECT_F name =
                 CoreNameRectangle(
                     *iterator, center, coreRadius);
@@ -19172,8 +19227,8 @@ private:
                     float distance = std::sqrt(
                         deltaX * deltaX + deltaY * deltaY);
                     const float required =
-                        CoreScreenRadius(first) +
-                        CoreScreenRadius(second) + 48.0f;
+                        CoreLayoutScreenRadius(first) +
+                        CoreLayoutScreenRadius(second) + 48.0f;
                     if (distance >= required) {
                         continue;
                     }
@@ -19208,9 +19263,9 @@ private:
                         secondScreen.y += unitY * shift;
                     }
                     const float firstRadius =
-                        CoreScreenRadius(first) + 8.0f;
+                        CoreLayoutScreenRadius(first) + 8.0f;
                     const float secondRadius =
-                        CoreScreenRadius(second) + 8.0f;
+                        CoreLayoutScreenRadius(second) + 8.0f;
                     firstScreen.x = std::clamp(
                         firstScreen.x, firstRadius,
                         std::max(
@@ -28230,6 +28285,30 @@ LRESULT CALLBACK SettingsContentWindowProcedure(
 }
 
 bool RunSelfTest() {
+    struct CoreVisualSizeCase {
+        float iconDip;
+        float shortSideDip;
+        float expectedDip;
+    };
+    // These cases cover the product's supported display/DPI matrix in logical
+    // DIPs.  A physical 1920x1080 display at 125% is 1536x864 DIP, while a
+    // 3840x2160 display at 200% is 1920x1080 DIP; neither is allowed to make
+    // the core visually double in size.
+    constexpr std::array<CoreVisualSizeCase, 5> kCoreVisualSizeCases{{
+        {48.0f, 768.0f, 50.0f},   // 1366x768 @ 100%
+        {48.0f, 1080.0f, 54.0f},  // 1920x1080 @ 100%
+        {48.0f, 864.0f, 51.0f},   // 1920x1080 @ 125%
+        {48.0f, 960.0f, 53.0f},   // 2560x1440 @ 150%
+        {48.0f, 1080.0f, 54.0f},  // 3840x2160 @ 200%
+    }};
+    for (const CoreVisualSizeCase& testCase : kCoreVisualSizeCases) {
+        if (std::abs(CalculateCoreVisualSizeDip(
+                         testCase.iconDip, testCase.shortSideDip) -
+                     testCase.expectedDip) >
+            0.01f) {
+            return false;
+        }
+    }
     if (!gravity::i18n::Localization::RunSelfTest() ||
         MigrateAutomaticCoreName(L"新核心 7") != L"文件核心 7" ||
         MigrateAutomaticCoreName(L"新核心设计") != L"新核心设计" ||
