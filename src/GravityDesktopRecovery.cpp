@@ -1,5 +1,4 @@
 #include <windows.h>
-#include <commctrl.h>
 #include <shlobj.h>
 
 #include "Localization.h"
@@ -21,7 +20,6 @@
 
 #pragma comment(lib, "shell32.lib")
 #pragma comment(lib, "ole32.lib")
-#pragma comment(lib, "comctl32.lib")
 
 namespace {
 
@@ -57,42 +55,6 @@ struct RecoveryRunOptions {
     // command-line option and stops only after the durable journal is written.
     bool stopAfterJournal = false;
 };
-
-enum class RecoveryDialogKind {
-    Information,
-    Warning,
-    Error,
-};
-
-// Recovery is deliberately a short-lived, standalone safety tool. Use the
-// modern common-control dialog for its confirmation and result UI instead of
-// the legacy MessageBox API.
-int ShowRecoveryDialog(const std::wstring& title, const std::wstring& content,
-                       RecoveryDialogKind kind, bool allowCancel = false) {
-    TASKDIALOGCONFIG dialog{};
-    dialog.cbSize = sizeof(dialog);
-    dialog.pszWindowTitle = title.c_str();
-    dialog.pszContent = content.c_str();
-    dialog.dwCommonButtons = allowCancel
-        ? TDCBF_OK_BUTTON | TDCBF_CANCEL_BUTTON
-        : TDCBF_OK_BUTTON;
-    dialog.nDefaultButton = allowCancel ? IDCANCEL : IDOK;
-    switch (kind) {
-    case RecoveryDialogKind::Information:
-        dialog.pszMainIcon = TD_INFORMATION_ICON;
-        break;
-    case RecoveryDialogKind::Warning:
-        dialog.pszMainIcon = TD_WARNING_ICON;
-        break;
-    case RecoveryDialogKind::Error:
-        dialog.pszMainIcon = TD_ERROR_ICON;
-        break;
-    }
-    int button = IDCANCEL;
-    return SUCCEEDED(TaskDialogIndirect(&dialog, &button, nullptr, nullptr))
-        ? button
-        : IDCANCEL;
-}
 
 constexpr char kRecoveryIsolationMarker[] =
     "GravityDesktopRecoveryIsolationTest\n";
@@ -544,25 +506,25 @@ bool RunRecovery(const std::filesystem::path& library,
     std::vector<ManagedEntry> entries;
     if (!ReadManagedEntries(manifest, entries)) {
         if (options.interactive) {
-            ShowRecoveryDialog(localization.Text("recovery.title"),
-                               localization.Text("recovery.manifest_error"),
-                               RecoveryDialogKind::Error);
+            MessageBoxW(nullptr, localization.Text("recovery.manifest_error").c_str(),
+                        localization.Text("recovery.title").c_str(),
+                        MB_OK | MB_ICONERROR);
         }
         return false;
     }
     if (entries.empty()) {
         if (options.interactive) {
-            ShowRecoveryDialog(localization.Text("recovery.title"),
-                               localization.Text("recovery.no_files"),
-                               RecoveryDialogKind::Information);
+            MessageBoxW(nullptr, localization.Text("recovery.no_files").c_str(),
+                        localization.Text("recovery.title").c_str(),
+                        MB_OK | MB_ICONINFORMATION);
         }
         return true;
     }
     if (options.desktopTarget.empty()) {
-        if (options.interactive) ShowRecoveryDialog(
-            localization.Text("recovery.title"),
-            localization.Text("recovery.desktop_error"),
-            RecoveryDialogKind::Error);
+        if (options.interactive) MessageBoxW(nullptr,
+                                     localization.Text("recovery.desktop_error").c_str(),
+                                     localization.Text("recovery.title").c_str(),
+                                     MB_OK | MB_ICONERROR);
         return false;
     }
     const std::filesystem::path journalPath = library / L"恢复事务.json";
@@ -580,17 +542,18 @@ bool RunRecovery(const std::filesystem::path& library,
     }
     if (pendingEntryCount == 0) {
         if (options.interactive) {
-            ShowRecoveryDialog(localization.Text("recovery.title"),
-                               localization.Text("recovery.already_restored"),
-                               RecoveryDialogKind::Information);
+            MessageBoxW(nullptr, localization.Text("recovery.already_restored").c_str(),
+                        localization.Text("recovery.title").c_str(),
+                        MB_OK | MB_ICONINFORMATION);
         }
         return true;
     }
     if (options.interactive) {
         const std::wstring prompt = localization.Format(
             "recovery.prompt", {{L"count", std::to_wstring(pendingEntryCount)}});
-        if (ShowRecoveryDialog(localization.Text("recovery.title"), prompt,
-                               RecoveryDialogKind::Warning, true) != IDOK) {
+        if (MessageBoxW(nullptr, prompt.c_str(),
+                        localization.Text("recovery.title").c_str(),
+                        MB_OKCANCEL | MB_ICONWARNING | MB_DEFBUTTON2) != IDOK) {
             return true;
         }
     }
@@ -640,10 +603,10 @@ bool RunRecovery(const std::filesystem::path& library,
     }
 
     if (!WriteUtf8Atomic(journalPath, BuildJournal(journal))) {
-        if (options.interactive) ShowRecoveryDialog(
-            localization.Text("recovery.title"),
-            localization.Text("recovery.journal_error"),
-            RecoveryDialogKind::Error);
+        if (options.interactive) MessageBoxW(nullptr,
+                                     localization.Text("recovery.journal_error").c_str(),
+                                     localization.Text("recovery.title").c_str(),
+                                     MB_OK | MB_ICONERROR);
         return false;
     }
     HideRecoveryMetadata(journalPath);
@@ -680,9 +643,9 @@ bool RunRecovery(const std::filesystem::path& library,
              std::to_wstring(static_cast<long long>(now)) + L".txt");
         const std::wstring summary = ResultText(localization, result);
         if (options.writeReport) (void)WriteUtf8Atomic(report, WideToUtf8(summary));
-        if (options.interactive) ShowRecoveryDialog(
-            localization.Text("recovery.title"), summary,
-            RecoveryDialogKind::Information);
+        if (options.interactive) MessageBoxW(nullptr, summary.c_str(),
+                                             localization.Text("recovery.title").c_str(),
+                                             MB_OK | MB_ICONINFORMATION);
     }
     return true;
 }
@@ -692,10 +655,10 @@ bool RunRecovery(const std::filesystem::path& library, bool interactive,
                  RecoveryResult& result) {
     const auto desktop = CurrentDesktopPath();
     if (!desktop) {
-        if (interactive) ShowRecoveryDialog(
-            localization.Text("recovery.title"),
-            localization.Text("recovery.desktop_error"),
-            RecoveryDialogKind::Error);
+        if (interactive) MessageBoxW(nullptr,
+                                     localization.Text("recovery.desktop_error").c_str(),
+                                     localization.Text("recovery.title").c_str(),
+                                     MB_OK | MB_ICONERROR);
         return false;
     }
     return RunRecovery(library, RecoveryRunOptions{*desktop, interactive, true,
@@ -932,9 +895,10 @@ int APIENTRY wWinMain(HINSTANCE, HINSTANCE, PWSTR commandLine, int) {
     HANDLE main = OpenMutexW(SYNCHRONIZE, FALSE, kMainMutex);
     if (main != nullptr) {
         CloseHandle(main);
-        ShowRecoveryDialog(localization.Text("recovery.title"),
-                           localization.Text("recovery.main_running"),
-                           RecoveryDialogKind::Warning);
+        MessageBoxW(nullptr,
+                    localization.Text("recovery.main_running").c_str(),
+                    localization.Text("recovery.title").c_str(),
+                    MB_OK | MB_ICONWARNING);
         CloseHandle(mutex);
         OleUninitialize();
         return 0;
