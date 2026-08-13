@@ -21,6 +21,19 @@ def save_square(source: Image.Image, destination: Path, size: int) -> None:
     resized.save(destination, format="PNG", optimize=True)
 
 
+def save_unplated_square(source: Image.Image, destination: Path, size: int) -> None:
+    # Windows 11 Start/Search can prefer the unplated alternate form.  The
+    # canonical artwork already includes its circular visual boundary, so keep
+    # a narrow 2% safe zone rather than letting the shell add a second plate
+    # that makes the actual brand mark look undersized.
+    canvas = Image.new("RGBA", (size, size), (0, 0, 0, 0))
+    icon_side = max(1, round(size * 0.96))
+    icon = source.resize((icon_side, icon_side), Image.Resampling.LANCZOS)
+    offset = (size - icon_side) // 2
+    canvas.alpha_composite(icon, (offset, offset))
+    canvas.save(destination, format="PNG", optimize=True)
+
+
 def save_wide(source: Image.Image, destination: Path, width: int, height: int) -> None:
     canvas = Image.new("RGBA", (width, height), (0, 0, 0, 0))
     side = min(width, height)
@@ -57,6 +70,14 @@ def main() -> None:
         save_square(source,
                     ASSETS / f"Square44x44Logo.targetsize-{target_size}.png",
                     target_size)
+        # `altform-unplated` is selected by the Windows shell where it can
+        # render the application's own round mark directly (notably Start and
+        # Search) while taskbar/Alt+Tab retain their regular target-size form.
+        save_unplated_square(
+            source,
+            ASSETS / (
+                f"Square44x44Logo.targetsize-{target_size}_altform-unplated.png"),
+            target_size)
 
 
 if __name__ == "__main__":
