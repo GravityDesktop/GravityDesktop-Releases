@@ -393,7 +393,10 @@ float CalculateCoreVisualSizeDip(float desktopIconSizeDip,
     constexpr float kReferenceShortSideDip = 1080.0f;
     constexpr float kMinimumWorkspaceScale = 0.90f;
     constexpr float kMaximumWorkspaceScale = 1.075f;
-    constexpr float kCoreToDesktopIconScale = 1.12f;
+    // The visible core body deliberately matches the Windows desktop icon
+    // body at the standard appearance scale.  Per-core appearance scaling is
+    // applied later as a relative multiplier, never as a persisted pixel size.
+    constexpr float kCoreToDesktopIconScale = 1.00f;
 
     const float iconSize = std::clamp(desktopIconSizeDip, 32.0f, 96.0f);
     const float shortSide = std::max(480.0f, workspaceShortSideDip);
@@ -402,7 +405,7 @@ float CalculateCoreVisualSizeDip(float desktopIconSizeDip,
         kMinimumWorkspaceScale, kMaximumWorkspaceScale);
     return std::round(std::clamp(iconSize * kCoreToDesktopIconScale *
                                      workspaceScale,
-                                 40.0f, 66.0f));
+                                 40.0f, 60.0f));
 }
 
 enum MenuCommand : UINT {
@@ -28411,11 +28414,11 @@ bool RunSelfTest() {
     // 3840x2160 display at 200% is 1920x1080 DIP; neither is allowed to make
     // the core visually double in size.
     constexpr std::array<CoreVisualSizeCase, 5> kCoreVisualSizeCases{{
-        {48.0f, 768.0f, 50.0f},   // 1366x768 @ 100%
-        {48.0f, 1080.0f, 54.0f},  // 1920x1080 @ 100%
-        {48.0f, 864.0f, 51.0f},   // 1920x1080 @ 125%
-        {48.0f, 960.0f, 53.0f},   // 2560x1440 @ 150%
-        {48.0f, 1080.0f, 54.0f},  // 3840x2160 @ 200%
+        {48.0f, 768.0f, 45.0f},   // 1366x768 @ 100%
+        {48.0f, 1080.0f, 48.0f},  // 1920x1080 @ 100%
+        {48.0f, 864.0f, 46.0f},   // 1920x1080 @ 125%
+        {48.0f, 960.0f, 47.0f},   // 2560x1440 @ 150%
+        {48.0f, 1080.0f, 48.0f},  // 3840x2160 @ 200%
     }};
     for (const CoreVisualSizeCase& testCase : kCoreVisualSizeCases) {
         if (std::abs(CalculateCoreVisualSizeDip(
