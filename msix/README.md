@@ -15,7 +15,7 @@ not replace `installer/GravityDesktop-Setup.iss` or alter application behavior.
 - `Assets`: transparent high-resolution logo assets. The Square44 resource has
   target-size and DPI-scale variants so the shell can select an exact taskbar,
   Alt+Tab, Start, Search, and Task View icon instead of enlarging one small
-  bitmap. Both application entries use this same branded resource family.
+  bitmap. The single Store application uses this branded resource family.
 - `Build-MsixPrototype.ps1`: Windows SDK MakeAppx fallback that stages the
   current Release binaries, six runtime locale resources, and package assets.
 
@@ -45,6 +45,29 @@ The script writes only under `out/msix-prototype`, which is ignored by Git. It
 creates an unsigned MSIX package for structure inspection. Sideloading it
 requires a trusted development certificate. Store submission uses this Partner
 Center-reserved identity and the Store signing workflow.
+
+## Activation and recovery entry
+
+The only package activation entry is the AUMID derived from the package family
+name and `GravityDesktop`: `wbyhome.GravityDesktop_4j298z9ac9h26!GravityDesktop`
+for the current Store identity. Start and test the MSIX through that registered
+application entry. Do **not** start `GravityDesktop.exe` or
+`GravityDesktopRecovery.exe` by bare filename, `Invoke-CommandInDesktopPackage
+-Command`, a working-directory-relative command, or a stale AppsFolder entry.
+Those are not MSIX activation contracts and can produce Windows "file not found"
+errors.
+
+Use `Invoke-MsixApp.ps1 -PackageFamilyName <PFN>` for a controlled local
+activation test. It uses `IApplicationActivationManager::ActivateApplication`
+with the current package family name and the declared application ID; it does
+not invoke an executable by filename.
+
+`GravityDesktopRecovery.exe` remains an internal package payload. After the
+main Store app has run once, the existing safety-center provisioning creates its
+verified durable recovery copy under the Documents managed library; its
+`恢复全部文件到桌面` shortcut starts that durable copy. It never restarts the
+main application after recovery. The Inno Setup edition still exposes its own
+independent Recovery shortcut directly.
 
 ## Compatibility boundaries
 
