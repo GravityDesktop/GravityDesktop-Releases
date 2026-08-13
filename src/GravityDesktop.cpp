@@ -21804,17 +21804,11 @@ private:
     bool ConfirmManagedCollection(
         const std::wstring& sourcePath,
         const Core& target) {
-        const bool fromPublicDesktop = IsPublicDesktopManagedFile(sourcePath);
-        // Public Desktop entries are shared by every Windows user. Keep their
-        // confirmation explicit even while the regular desktop has a short
-        // confirmation grace period.
-        if (!fromPublicDesktop && !ManagedCollectionConfirmationRequired()) {
+        if (!ManagedCollectionConfirmationRequired()) {
             return true;
         }
         const std::wstring message = localization_.Format(
-            fromPublicDesktop
-                ? "dialog.store.public_message"
-                : "dialog.store.message",
+            "dialog.store.message",
             {{L"file", FileDisplayName(sourcePath)},
              {L"core", target.name}});
         const std::wstring store = T("dialog.store.confirm");
@@ -21824,10 +21818,7 @@ private:
             {IDCANCEL, cancel.c_str()},
         };
         const std::wstring title = T("dialog.store.title");
-        const std::wstring footer = T(
-            fromPublicDesktop
-                ? "dialog.store.public_footer"
-                : "dialog.store.footer");
+        const std::wstring footer = T("dialog.store.footer");
         TASKDIALOGCONFIG dialog{sizeof(dialog)};
         dialog.hwndParent = window_;
         dialog.dwFlags = TDF_ALLOW_DIALOG_CANCELLATION |
@@ -22780,6 +22771,27 @@ private:
         }
         DragFinish(drop);
         if (paths.empty()) {
+            return;
+        }
+        const auto rejectUnsupportedDesktopSource =
+            [this](const std::wstring& path) {
+            if (IsPublicDesktopManagedFile(path)) {
+                SetStatus(T("status.store_shared_desktop"));
+                AppendRuntimeDiagnostic(
+                    "external_drop_public_desktop_rejected");
+                return true;
+            }
+            if (IsShellVirtualDesktopObjectPath(path)) {
+                SetStatus(T("status.store_shell_item_unsupported"));
+                AppendRuntimeDiagnostic(
+                    "external_drop_shell_object_rejected");
+                return true;
+            }
+            return false;
+        };
+        if (std::any_of(paths.begin(), paths.end(),
+                        rejectUnsupportedDesktopSource)) {
+            ClearExternalDropPreview();
             return;
         }
         if (paths.size() > 1) {
@@ -26580,9 +26592,11 @@ private:
         if (MoveFileExW(
                 source.c_str(), destination.c_str(),
                 MOVEFILE_WRITE_THROUGH) == FALSE) {
+            const DWORD moveError = GetLastError();
+            AppendRuntimeDiagnostic("managed_file_move_failed",
+                                    HRESULT_FROM_WIN32(moveError), moveError);
             if (error != nullptr) {
-                *error = L"移动真实文件失败（Windows 错误 " +
-                    std::to_wstring(GetLastError()) + L"）";
+                *error = T("status.store_move_failed");
             }
             return false;
         }
@@ -26830,6 +26844,60 @@ private:
         return PathEquals(parent, NormalizePath(publicDesktop->wstring()));
     }
 
+    enum class DesktopManagedItemEligibility {
+        Eligible,
+        PublicDesktop,
+        ShellVirtualObject,
+        OutsideCurrentUserDesktop,
+        TransientArtifact,
+        Missing,
+        UnsupportedAttributes,
+    };
+
+    static bool IsShellVirtualDesktopObjectPath(const std::wstring& path) {
+        const std::wstring trimmed = Trim(path);
+        return trimmed.rfind(L"::{", 0) == 0 ||
+               trimmed.rfind(L"shell:", 0) == 0;
+    }
+
+    // The classifier is the ownership boundary for managed-file transactions.
+    // Public Desktop is shared by all Windows users, so it is never a valid
+    // source even if a particular machine's ACL happens to grant delete rights.
+    DesktopManagedItemEligibility ClassifyDesktopManagedItem(
+        const std::wstring& path,
+        const std::filesystem::path& currentUserDesktop,
+        const std::optional<std::filesystem::path>& publicDesktop,
+        std::optional<DWORD> attributesOverride = std::nullopt) const {
+        const std::wstring trimmed = Trim(path);
+        if (IsShellVirtualDesktopObjectPath(trimmed)) {
+            return DesktopManagedItemEligibility::ShellVirtualObject;
+        }
+        const std::wstring normalized = NormalizePath(trimmed);
+        const std::wstring parent = NormalizePath(
+            std::filesystem::path(normalized).parent_path().wstring());
+        if (publicDesktop.has_value() &&
+            PathEquals(parent, NormalizePath(publicDesktop->wstring()))) {
+            return DesktopManagedItemEligibility::PublicDesktop;
+        }
+        if (!PathEquals(parent, NormalizePath(currentUserDesktop.wstring()))) {
+            return DesktopManagedItemEligibility::OutsideCurrentUserDesktop;
+        }
+        if (IsTransientDesktopArtifactName(normalized)) {
+            return DesktopManagedItemEligibility::TransientArtifact;
+        }
+        const DWORD attributes = attributesOverride.value_or(
+            GetFileAttributesW(normalized.c_str()));
+        if (attributes == INVALID_FILE_ATTRIBUTES) {
+            return DesktopManagedItemEligibility::Missing;
+        }
+        if ((attributes & FILE_ATTRIBUTE_DIRECTORY) != 0 ||
+            (attributes & FILE_ATTRIBUTE_REPARSE_POINT) != 0 ||
+            (attributes & FILE_ATTRIBUTE_OFFLINE) != 0) {
+            return DesktopManagedItemEligibility::UnsupportedAttributes;
+        }
+        return DesktopManagedItemEligibility::Eligible;
+    }
+
     bool IsEligibleDesktopManagedFile(
         const std::wstring& path,
         std::wstring* reason = nullptr) const {
@@ -26856,33 +26924,41 @@ private:
             }
             return false;
         }
-        const std::wstring parent = NormalizePath(
-            std::filesystem::path(normalized).parent_path().wstring());
-        const bool onCurrentUserDesktop =
-            PathEquals(parent, NormalizePath(desktop->wstring()));
-        const bool onPublicDesktop = IsPublicDesktopManagedFile(normalized);
-        if (!onCurrentUserDesktop && !onPublicDesktop) {
+        const DesktopManagedItemEligibility eligibility =
+            ClassifyDesktopManagedItem(normalized, *desktop, PublicDesktopPath());
+        if (eligibility == DesktopManagedItemEligibility::PublicDesktop) {
             if (reason != nullptr) {
-                *reason = L"该文件不在当前用户桌面或公共桌面目录";
+                *reason = T("status.store_shared_desktop");
+            }
+            AppendRuntimeDiagnostic("managed_store_public_desktop_rejected");
+            return false;
+        }
+        if (eligibility == DesktopManagedItemEligibility::ShellVirtualObject) {
+            if (reason != nullptr) {
+                *reason = T("status.store_shell_item_unsupported");
+            }
+            AppendRuntimeDiagnostic("managed_store_shell_object_rejected");
+            return false;
+        }
+        if (eligibility == DesktopManagedItemEligibility::OutsideCurrentUserDesktop) {
+            if (reason != nullptr) {
+                *reason = T("status.store_not_current_desktop");
             }
             return false;
         }
-        if (IsTransientDesktopArtifactName(normalized)) {
+        if (eligibility == DesktopManagedItemEligibility::TransientArtifact) {
             if (reason != nullptr) {
                 *reason = L"临时或系统桌面文件不能收纳";
             }
             return false;
         }
-        const DWORD attributes = GetFileAttributesW(normalized.c_str());
-        if (attributes == INVALID_FILE_ATTRIBUTES) {
+        if (eligibility == DesktopManagedItemEligibility::Missing) {
             if (reason != nullptr) *reason = L"源文件不存在";
             return false;
         }
-        if ((attributes & FILE_ATTRIBUTE_DIRECTORY) != 0 ||
-            (attributes & FILE_ATTRIBUTE_REPARSE_POINT) != 0 ||
-            (attributes & FILE_ATTRIBUTE_OFFLINE) != 0) {
+        if (eligibility == DesktopManagedItemEligibility::UnsupportedAttributes) {
             if (reason != nullptr) {
-                *reason = L"当前仅支持收纳本地普通文件和快捷方式";
+                *reason = T("status.store_shell_item_unsupported");
             }
             return false;
         }
@@ -28169,6 +28245,39 @@ bool RunSelfTest() {
             L"C:\\Users\\test\\Desktop\\desktop.ini") ||
         IsTransientDesktopArtifactName(
             L"C:\\Users\\test\\Desktop\\ordinary.docx")) {
+        return false;
+    }
+
+    // Managed-file moves must be restricted to the current user's physical
+    // Desktop before any transaction journal or MoveFileEx call is reached.
+    GravityApp managedSourceSafetyApp;
+    if (!managedSourceSafetyApp.localization_.Load()) return false;
+    const std::filesystem::path testDesktop =
+        L"C:\\Users\\TestUser\\Desktop";
+    const std::filesystem::path testPublicDesktop =
+        L"C:\\Users\\Public\\Desktop";
+    if (managedSourceSafetyApp.ClassifyDesktopManagedItem(
+            (testDesktop / L"owned.txt").wstring(), testDesktop,
+            testPublicDesktop, FILE_ATTRIBUTE_NORMAL) !=
+            GravityApp::DesktopManagedItemEligibility::Eligible ||
+        managedSourceSafetyApp.ClassifyDesktopManagedItem(
+            (testDesktop / L"owned.lnk").wstring(), testDesktop,
+            testPublicDesktop, FILE_ATTRIBUTE_NORMAL) !=
+            GravityApp::DesktopManagedItemEligibility::Eligible ||
+        managedSourceSafetyApp.ClassifyDesktopManagedItem(
+            (testPublicDesktop / L"Microsoft Edge.lnk").wstring(),
+            testDesktop, testPublicDesktop, FILE_ATTRIBUTE_NORMAL) !=
+            GravityApp::DesktopManagedItemEligibility::PublicDesktop ||
+        managedSourceSafetyApp.ClassifyDesktopManagedItem(
+            L"::{20D04FE0-3AEA-1069-A2D8-08002B30309D}", testDesktop,
+            testPublicDesktop, INVALID_FILE_ATTRIBUTES) !=
+            GravityApp::DesktopManagedItemEligibility::ShellVirtualObject ||
+        !GravityApp::IsShellVirtualDesktopObjectPath(
+            L"shell:RecycleBinFolder") ||
+        GravityApp::IsShellVirtualDesktopObjectPath(
+            (testDesktop / L"owned.url").wstring()) ||
+        managedSourceSafetyApp.T("status.store_move_failed").find(
+            L"Error" + std::wstring(L" 5")) != std::wstring::npos) {
         return false;
     }
 
