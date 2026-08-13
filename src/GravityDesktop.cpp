@@ -26779,8 +26779,18 @@ private:
         const std::filesystem::path packagedLibraryIcon =
             std::filesystem::path(CurrentExecutablePath()).parent_path() /
             L"GravityDesktopLibrary.ico";
-        const std::filesystem::path durableLibraryIcon =
-            durableRecovery.parent_path() / L"GravityDesktopLibrary-v3.ico";
+        std::filesystem::path durableLibraryIcon =
+            durableRecovery.parent_path() / L"GravityDesktopLibrary.ico";
+        if (const std::optional<std::string> iconBytes =
+                ReadUtf8File(packagedLibraryIcon);
+            iconBytes.has_value()) {
+            const std::uint32_t fingerprint = Crc32ForZip(*iconBytes);
+            std::wostringstream fileName;
+            fileName << L"GravityDesktopLibrary-" << std::hex
+                     << std::setw(8) << std::setfill(L'0') << fingerprint
+                     << L".ico";
+            durableLibraryIcon = durableRecovery.parent_path() / fileName.str();
+        }
         if (FilePathExists(sourceRecovery.wstring())) {
             std::filesystem::create_directories(
                 durableRecovery.parent_path(), error);
@@ -26960,13 +26970,18 @@ private:
                                legacySafetyShortcutPath->c_str(), nullptr);
             }
         }
-        if (FilePathExists(durableRecovery.wstring()) &&
-            !createOrUpdateShortcut(
+        const bool recoveryShortcutReady =
+            FilePathExists(durableRecovery.wstring()) &&
+            createOrUpdateShortcut(
                 durableRecovery, RecoveryShortcutPath(),
                 L"将所有引力桌面托管文件安全恢复到 Windows 桌面",
-                isKnownRecoveryShortcut, true)) {
+                isKnownRecoveryShortcut, true);
+        if (!recoveryShortcutReady) {
             AppendRuntimeDiagnostic("recovery_shortcut_create_failed", E_FAIL,
                                     GetLastError());
+        } else {
+            SHChangeNotify(SHCNE_UPDATEITEM, SHCNF_PATHW,
+                           RecoveryShortcutPath().c_str(), nullptr);
         }
     }
 
