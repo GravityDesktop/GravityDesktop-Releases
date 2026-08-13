@@ -113,6 +113,15 @@ constexpr UINT_PTR kRelationshipManifestRetryTimer = 16;
 constexpr UINT_PTR kWorkspaceChromeAutoHideTimer = 17;
 constexpr UINT_PTR kWorkspaceChromeRevealWatchTimer = 18;
 constexpr UINT_PTR kDesktopPointerRecoveryTimer = 19;
+
+// The in-process self-test creates many synthetic state files.  It must never
+// write the durable Documents recovery mirror used by a real workspace.
+bool gRunningSelfTest = false;
+struct SelfTestModeScope {
+    SelfTestModeScope() : previous(gRunningSelfTest) { gRunningSelfTest = true; }
+    ~SelfTestModeScope() { gRunningSelfTest = previous; }
+    bool previous;
+};
 constexpr UINT kWorkspaceChromeAutoHideDelayMs = 180;
 constexpr UINT kWorkspaceChromeRevealWatchIntervalMs = 100;
 constexpr UINT kDesktopPointerRecoveryIntervalMs = 125;
@@ -4342,6 +4351,88 @@ bool DeserializeState(const std::string& json, WorkspaceState& state,
     return true;
 }
 
+// The package-local state remains the normal runtime authority.  This envelope
+// is an independently durable *mirror* of that same state for the one case in
+// which MSIX uninstall removes LocalAppData.  It intentionally reuses the
+// state serializer and parser instead of inventing a second workspace model.
+constexpr int kWorkspaceRecoveryFormatVersion = 1;
+
+struct WorkspaceRecoveryMirror {
+    WorkspaceState state;
+    std::uint64_t generation = 0;
+    std::int64_t writtenAtUtc = 0;
+};
+
+std::string SerializeWorkspaceRecoveryMirror(const WorkspaceState& state,
+                                             std::uint64_t generation,
+                                             std::int64_t writtenAtUtc) {
+    std::string serialized = SerializeState(state);
+    const std::size_t closingBrace = serialized.find_last_of('}');
+    if (closingBrace == std::string::npos) return {};
+    std::ostringstream metadata;
+    metadata.imbue(std::locale::classic());
+    metadata << ",\n"
+             << "  \"recovery_format_version\": "
+             << kWorkspaceRecoveryFormatVersion << ",\n"
+             << "  \"app_version\": \""
+             << GRAVITY_DESKTOP_VERSION_STRING << "\",\n"
+             << "  \"generation\": " << generation << ",\n"
+             << "  \"written_at_utc\": " << writtenAtUtc << "\n";
+    serialized.insert(closingBrace, metadata.str());
+    return serialized;
+}
+
+bool DeserializeWorkspaceRecoveryMirror(const std::string& json,
+                                        WorkspaceRecoveryMirror& mirror) {
+    JsonValue rootValue;
+    JsonParser parser(json);
+    if (!parser.Parse(rootValue)) return false;
+    const JsonValue::Object* root = rootValue.AsObject();
+    if (root == nullptr ||
+        static_cast<int>(NumberMember(
+            *root, "recovery_format_version", 0.0)) !=
+            kWorkspaceRecoveryFormatVersion) {
+        return false;
+    }
+    const double generationValue = NumberMember(*root, "generation", 0.0);
+    const double writtenAtValue = NumberMember(*root, "written_at_utc", 0.0);
+    if (!std::isfinite(generationValue) || !std::isfinite(writtenAtValue) ||
+        generationValue < 1.0 ||
+        generationValue >
+            static_cast<double>(std::numeric_limits<std::uint64_t>::max()) ||
+        writtenAtValue <= 0.0 ||
+        writtenAtValue >
+            static_cast<double>(std::numeric_limits<std::int64_t>::max())) {
+        return false;
+    }
+    WorkspaceState restored;
+    if (!DeserializeState(json, restored)) return false;
+    mirror.state = std::move(restored);
+    mirror.generation = static_cast<std::uint64_t>(generationValue);
+    mirror.writtenAtUtc = static_cast<std::int64_t>(writtenAtValue);
+    return true;
+}
+
+bool WorkspaceStatesMatchForPersistence(const WorkspaceState& first,
+                                        const WorkspaceState& second) {
+    WorkspaceState normalizedFirst;
+    WorkspaceState normalizedSecond;
+    if (!DeserializeState(SerializeState(first), normalizedFirst) ||
+        !DeserializeState(SerializeState(second), normalizedSecond)) {
+        return false;
+    }
+    return SerializeState(normalizedFirst) == SerializeState(normalizedSecond);
+}
+
+std::size_t UserCoreCount(const WorkspaceState& state) {
+    return static_cast<std::size_t>(std::count_if(
+        state.cores.begin(), state.cores.end(), [](const Core& core) {
+            return core.id != kUnclassifiedCoreId;
+        }));
+}
+
+bool RunWorkspaceRecoveryMirrorSelfTest();
+
 struct RelationValidationIssue {
     std::wstring code;
     std::wstring subject;
@@ -4931,6 +5022,7 @@ public:
           benchmarkMode_(benchmarkMode), autoStartMode_(autoStartMode) {}
 
     friend bool RunSelfTest();
+    friend bool RunWorkspaceRecoveryMirrorSelfTest();
 
     void AttachWindow(HWND window) { window_ = window; }
     void AttachInteractionWindow(HWND window) {
@@ -4986,6 +5078,103 @@ public:
     std::filesystem::path RelationshipManifestPath() const {
         if (stateFile_.empty()) return {};
         return stateFile_.parent_path() / L"relationships.json";
+    }
+
+    std::filesystem::path WorkspaceRecoveryMirrorPath() const {
+        // This bootstrap location deliberately never follows a user-selected
+        // managed-library path.  After MSIX uninstall we must be able to find
+        // the mirror before recovering that setting from the mirror itself.
+        const std::filesystem::path root = workspaceRecoveryRootOverride_.empty()
+            ? DefaultManagedLibraryPath()
+            : workspaceRecoveryRootOverride_;
+        return root / L"工作关系恢复" / L"workspace-recovery.json";
+    }
+
+    static bool IsNewerWorkspaceRecoveryMirror(
+        const WorkspaceRecoveryMirror& candidate,
+        const WorkspaceRecoveryMirror& current) {
+        return candidate.generation > current.generation ||
+            (candidate.generation == current.generation &&
+             candidate.writtenAtUtc > current.writtenAtUtc);
+    }
+
+    bool ReadBestWorkspaceRecoveryMirror(
+        WorkspaceRecoveryMirror& mirror,
+        std::filesystem::path* sourcePath = nullptr) const {
+        const std::filesystem::path primary = WorkspaceRecoveryMirrorPath();
+        const std::array<std::filesystem::path, 2> candidates{
+            primary, std::filesystem::path(primary.wstring() + L".bak")};
+        bool found = false;
+        WorkspaceRecoveryMirror best;
+        std::filesystem::path bestPath;
+        for (const std::filesystem::path& candidatePath : candidates) {
+            const std::optional<std::string> text = ReadUtf8File(candidatePath);
+            WorkspaceRecoveryMirror candidate;
+            if (!text || !DeserializeWorkspaceRecoveryMirror(*text, candidate) ||
+                !ValidateRelationState(candidate.state).IsValid()) {
+                continue;
+            }
+            if (!found || IsNewerWorkspaceRecoveryMirror(candidate, best)) {
+                found = true;
+                best = std::move(candidate);
+                bestPath = candidatePath;
+            }
+        }
+        if (!found) return false;
+        mirror = std::move(best);
+        if (sourcePath != nullptr) *sourcePath = std::move(bestPath);
+        return true;
+    }
+
+    bool WriteWorkspaceRecoveryMirror(const WorkspaceState& snapshot) {
+        if (gRunningSelfTest && workspaceRecoveryRootOverride_.empty()) {
+            return true;
+        }
+        const std::filesystem::path target = WorkspaceRecoveryMirrorPath();
+        if (target.empty()) return false;
+
+        WorkspaceRecoveryMirror existing;
+        const std::optional<std::string> existingText = ReadUtf8File(target);
+        if (existingText &&
+            DeserializeWorkspaceRecoveryMirror(*existingText, existing) &&
+            ValidateRelationState(existing.state).IsValid() &&
+            WorkspaceStatesMatchForPersistence(existing.state, snapshot)) {
+            workspaceRecoveryGeneration_ = existing.generation;
+            const std::filesystem::path backup = target.wstring() + L".bak";
+            if (GetFileAttributesW(backup.c_str()) == INVALID_FILE_ATTRIBUTES) {
+                return WriteUtf8Atomic(backup, *existingText);
+            }
+            return true;
+        }
+
+        WorkspaceRecoveryMirror previous;
+        const bool hasPrevious = ReadBestWorkspaceRecoveryMirror(previous);
+        const std::uint64_t generation = hasPrevious
+            ? (previous.generation == std::numeric_limits<std::uint64_t>::max()
+                ? previous.generation : previous.generation + 1)
+            : 1;
+        const std::string serialized = SerializeWorkspaceRecoveryMirror(
+            snapshot, generation, UnixTimeNow());
+        if (serialized.empty() || !WriteUtf8Atomic(target, serialized)) {
+            AppendRuntimeDiagnostic(
+                "workspace_recovery_mirror_write_failed", E_FAIL,
+                GetLastError());
+            return false;
+        }
+        workspaceRecoveryGeneration_ = generation;
+        const auto hideRecoveryMetadata = [](const std::filesystem::path& path) {
+            const DWORD attributes = GetFileAttributesW(path.c_str());
+            if (attributes != INVALID_FILE_ATTRIBUTES) {
+                (void)SetFileAttributesW(
+                    path.c_str(), attributes | FILE_ATTRIBUTE_HIDDEN |
+                                      FILE_ATTRIBUTE_SYSTEM);
+            }
+        };
+        hideRecoveryMetadata(target.parent_path());
+        hideRecoveryMetadata(target);
+        hideRecoveryMetadata(target.wstring() + L".bak");
+        AppendRuntimeDiagnostic("workspace_recovery_mirror_written");
+        return true;
     }
 
     void RotateRuntimeDiagnosticLogsIfNeeded(
@@ -5172,28 +5361,66 @@ public:
         return false;
     }
 
-    // The state file is authoritative.  A manifest write failure is logged but
-    // must never turn a successfully committed state/file transaction into a
-    // rollback: that would reduce real-file safety rather than improve it.
+    // The package-local state is authoritative during normal operation, but a
+    // successful state-changing transaction is not complete until the durable
+    // recovery mirror is current as well.  This prevents MSIX uninstall from
+    // becoming the single point of loss for newly managed files.
     bool WriteStateWithRelationshipManifest(
         const WorkspaceState& snapshot,
         bool forceRelationshipManifestWrite = false) {
-        if (stateFile_.empty() ||
-            !WriteUtf8Atomic(stateFile_, SerializeState(snapshot))) {
+        if (stateFile_.empty()) {
             return false;
         }
-        // A completed emergency recovery intentionally keeps its original
-        // manifest as a re-import record.  Ordinary visual saves must not
-        // overwrite that record with the now-detached workspace state.
+        const std::optional<std::string> previousState = ReadUtf8File(stateFile_);
+        const std::string serializedState = SerializeState(snapshot);
+        if (!WriteUtf8Atomic(stateFile_, serializedState)) return false;
+        if (!WriteWorkspaceRecoveryMirror(snapshot)) {
+            // A failed durable mirror must not leave a new package-only state
+            // looking committed.  Keep the previous valid state when possible;
+            // callers retain their transaction journal and roll back real-file
+            // moves through the existing recovery paths.
+            bool reverted = false;
+            if (previousState.has_value()) {
+                reverted = WriteUtf8Atomic(stateFile_, *previousState);
+            } else {
+                reverted = DeleteFileW(stateFile_.c_str()) != FALSE ||
+                    GetLastError() == ERROR_FILE_NOT_FOUND;
+            }
+            AppendRuntimeDiagnostic(
+                reverted
+                    ? "workspace_recovery_mirror_required_state_reverted"
+                    : "workspace_recovery_mirror_required_state_revert_failed",
+                reverted ? S_OK : E_FAIL, reverted ? ERROR_SUCCESS : GetLastError());
+            return false;
+        }
+        // The legacy lightweight manifest can remain a historical emergency
+        // recovery evidence record.  It is never used in preference to the
+        // current complete durable mirror.
         if (forceRelationshipManifestWrite ||
-            !preserveExistingRelationshipManifest_) {
+            !preserveHistoricalRecoveryEvidence_) {
             (void)SynchronizeRelationshipManifest(snapshot, true);
         }
         return true;
     }
 
+    void DiscoverWorkspaceRecoveryMirror() {
+        if ((!freshWorkspaceWithoutState_ && !stateRecoveryBlocked_) ||
+            pendingWorkspaceRecovery_.has_value()) {
+            return;
+        }
+        WorkspaceRecoveryMirror mirror;
+        std::filesystem::path source;
+        if (!ReadBestWorkspaceRecoveryMirror(mirror, &source)) return;
+        pendingWorkspaceRecovery_ = std::move(mirror);
+        AppendRuntimeDiagnostic(
+            source.extension() == L".bak"
+                ? "workspace_recovery_mirror_discovered_backup"
+                : "workspace_recovery_mirror_discovered_external");
+    }
+
     void DiscoverRelationshipRecoveryManifest() {
-        if (!freshWorkspaceWithoutState_ && !stateRecoveryBlocked_) {
+        if ((!freshWorkspaceWithoutState_ && !stateRecoveryBlocked_) ||
+            pendingWorkspaceRecovery_.has_value()) {
             return;
         }
         const std::filesystem::path local = RelationshipManifestPath();
@@ -5217,7 +5444,7 @@ public:
                 continue;
             }
             pendingRelationshipRecovery_ = std::move(manifest);
-            preserveExistingRelationshipManifest_ = true;
+            preserveHistoricalRecoveryEvidence_ = true;
             AppendRuntimeDiagnostic(
                 index == 0
                     ? "relationship_recovery_manifest_discovered_local"
@@ -5363,7 +5590,7 @@ public:
         state_ = std::move(restored);
         dirty_ = false;
         stateRecoveryBlocked_ = false;
-        preserveExistingRelationshipManifest_ = false;
+        preserveHistoricalRecoveryEvidence_ = false;
         pendingRelationshipRecovery_.reset();
         ApplyCoreRatiosToWorkspace();
         RefreshResponsiveMetrics(true);
@@ -5381,6 +5608,61 @@ public:
         return true;
     }
 
+    bool RestoreWorkspaceRecoveryMirror(
+        const WorkspaceRecoveryMirror& mirror) {
+        const RelationValidationResult validation =
+            ValidateRelationState(mirror.state);
+        if (!validation.IsValid() ||
+            !WriteStateWithRelationshipManifest(mirror.state, true)) {
+            AppendRuntimeDiagnostic("workspace_recovery_mirror_restore_failed");
+            return false;
+        }
+        state_ = mirror.state;
+        dirty_ = false;
+        stateRecoveryBlocked_ = false;
+        freshWorkspaceWithoutState_ = false;
+        pendingWorkspaceRecovery_.reset();
+        ApplyCoreRatiosToWorkspace();
+        RefreshResponsiveMetrics(true);
+        layoutCache_.clear();
+        iconCache_.clear();
+        iconShadowCache_.clear();
+        layoutDirty_ = true;
+        AppendRuntimeDiagnostic("workspace_recovery_mirror_restored");
+        return true;
+    }
+
+    void PromptWorkspaceRecoveryIfNeeded() {
+        if (!pendingWorkspaceRecovery_.has_value() || window_ == nullptr ||
+            autoStartMode_) {
+            return;
+        }
+        const WorkspaceRecoveryMirror& mirror = *pendingWorkspaceRecovery_;
+        const std::size_t userCoreCount = UserCoreCount(mirror.state);
+        std::size_t fileCount = 0;
+        for (const Core& core : mirror.state.cores) {
+            fileCount += core.files.size();
+        }
+        const std::wstring message = localization_.Format(
+            "dialog.restore_relations.message",
+            {{L"coreCount", std::to_wstring(userCoreCount)},
+             {L"fileCount", std::to_wstring(fileCount)}});
+        const std::wstring title = T("dialog.restore_relations.title");
+        const int result = MessageBoxW(
+            window_, message.c_str(), title.c_str(),
+            MB_YESNO | MB_ICONQUESTION | MB_DEFBUTTON2);
+        if (result == IDYES) {
+            if (!RestoreWorkspaceRecoveryMirror(mirror)) {
+                MessageBoxW(window_, T("dialog.restore_relations.failed").c_str(),
+                            title.c_str(), MB_OK | MB_ICONWARNING);
+            }
+            return;
+        }
+        pendingWorkspaceRecovery_.reset();
+        dirty_ = false;
+        AppendRuntimeDiagnostic("workspace_recovery_mirror_declined");
+    }
+
     void PromptRelationshipRecoveryIfNeeded() {
         if (!pendingRelationshipRecovery_.has_value() ||
             window_ == nullptr || autoStartMode_) {
@@ -5391,13 +5673,17 @@ public:
         constexpr int kRestoreAll = 2001;
         constexpr int kRestoreSelected = 2002;
         constexpr int kKeepOrdinaryDesktop = 2003;
+        std::size_t userCoreCount = 0;
         std::size_t fileCount = 0;
         for (const RelationshipRecoveryCore& core : manifest.cores) {
+            if (core.stableId != kUnclassifiedCoreId) {
+                ++userCoreCount;
+            }
             fileCount += core.files.size();
         }
         const std::wstring message = localization_.Format(
             "dialog.restore_relations.message",
-            {{L"coreCount", std::to_wstring(manifest.cores.size())},
+            {{L"coreCount", std::to_wstring(userCoreCount)},
              {L"fileCount", std::to_wstring(fileCount)}});
 
         int choice = kKeepOrdinaryDesktop;
@@ -5569,12 +5855,12 @@ public:
         }
         if (restoredSources.empty()) return;
 
-        // The independent manifest remains the recovery/re-import record even
-        // after active nodes are retired.  Never replace it with the reduced
-        // post-recovery state during normal saves.
+        // Preserve only the historical lightweight evidence for a future
+        // re-import decision.  The complete durable workspace mirror remains
+        // current and must continue to record all later changes.
         const bool priorManifestPreservation =
-            preserveExistingRelationshipManifest_;
-        preserveExistingRelationshipManifest_ = true;
+            preserveHistoricalRecoveryEvidence_;
+        preserveHistoricalRecoveryEvidence_ = true;
 
         WorkspaceState candidate = state_;
         std::unordered_set<std::uint64_t> removedIds;
@@ -5600,6 +5886,7 @@ public:
             }
         }
         if (removedIds.empty()) {
+            preserveHistoricalRecoveryEvidence_ = priorManifestPreservation;
             AppendRuntimeDiagnostic("emergency_recovery_already_reconciled");
             return;
         }
@@ -5660,7 +5947,7 @@ public:
         if (!validation.IsValid() || stateRecoveryBlocked_ ||
             stateFile_.empty() ||
             !WriteStateWithRelationshipManifest(candidate)) {
-            preserveExistingRelationshipManifest_ = priorManifestPreservation;
+            preserveHistoricalRecoveryEvidence_ = priorManifestPreservation;
             AppendRuntimeDiagnostic("emergency_recovery_reconcile_failed");
             SetStatus(T("status.emergency_cleanup_failed"));
             return;
@@ -5719,14 +6006,24 @@ public:
             ReconcileCompletedEmergencyRecovery();
             MigrateLegacyManagedLibraryItems();
             LoadCoreShortLabelOverrides();
+            DiscoverWorkspaceRecoveryMirror();
+            PromptWorkspaceRecoveryIfNeeded();
             DiscoverRelationshipRecoveryManifest();
             PromptRelationshipRecoveryIfNeeded();
         }
         NormalizeStateModel();
         if (!benchmarkMode_) {
             EnsureManagedLibrarySafetyCenter();
+            // Existing users may have a valid package-local state but no
+            // durable full mirror yet.  Seed it once without treating the
+            // older lightweight manifest as an authority.
             if (!stateRecoveryBlocked_ &&
-                !preserveExistingRelationshipManifest_) {
+                !WriteWorkspaceRecoveryMirror(state_)) {
+                AppendRuntimeDiagnostic("workspace_recovery_mirror_initial_sync_failed");
+                SetStatus(L"工作关系恢复镜像尚未同步；当前状态仍保持在本机。请检查文件库写入权限。");
+            }
+            if (!stateRecoveryBlocked_ &&
+                !preserveHistoricalRecoveryEvidence_) {
                 (void)SynchronizeRelationshipManifest(state_, true);
             }
         }
@@ -28053,7 +28350,14 @@ private:
     bool sessionEndRecoveryWritten_ = false;
     bool stateRecoveryBlocked_ = false;
     bool freshWorkspaceWithoutState_ = false;
-    bool preserveExistingRelationshipManifest_ = false;
+    // Legacy manifest preservation applies only to historical emergency
+    // recovery evidence.  It must never suppress the current full mirror.
+    bool preserveHistoricalRecoveryEvidence_ = false;
+    std::uint64_t workspaceRecoveryGeneration_ = 0;
+    // Test-only override used by the isolated recovery mirror self-test.  The
+    // production mirror always lives under the durable Documents library root.
+    std::filesystem::path workspaceRecoveryRootOverride_;
+    std::optional<WorkspaceRecoveryMirror> pendingWorkspaceRecovery_;
     std::optional<RelationshipRecoveryManifest>
         pendingRelationshipRecovery_;
     bool applyingWorkspaceFrame_ = false;
@@ -28403,7 +28707,160 @@ LRESULT CALLBACK SettingsContentWindowProcedure(
     return DefWindowProcW(window, message, wParam, lParam);
 }
 
+bool RunWorkspaceRecoveryMirrorSelfTest() {
+    const std::filesystem::path root = std::filesystem::temp_directory_path() /
+        (L"GravityDesktop-workspace-recovery-" +
+         std::to_wstring(GetCurrentProcessId()) + L"-" +
+         std::to_wstring(GetTickCount64()));
+    std::error_code error;
+    const auto cleanup = [&]() {
+        std::filesystem::remove_all(root, error);
+        return !error;
+    };
+    const auto fail = [&]() {
+        (void)cleanup();
+        return false;
+    };
+    const std::filesystem::path mirrorRoot = root / L"managed-library";
+    WorkspaceState original;
+    Core unclassified;
+    unclassified.id = kUnclassifiedCoreId;
+    unclassified.name = L"Unclassified";
+    original.cores.push_back(unclassified);
+    Core firstCore;
+    firstCore.id = 2;
+    firstCore.name = L"Mirror A";
+    firstCore.position = D2D1::Point2F(640.0f, 420.0f);
+    firstCore.xRatio = 0.71f;
+    firstCore.yRatio = 0.43f;
+    FileItem firstFile;
+    firstFile.id = 3;
+    firstFile.path = (mirrorRoot / L"managed-files" / L"mirror-a.txt").wstring();
+    firstFile.managedPath = firstFile.path;
+    firstFile.originalPath = (root / L"desktop" / L"mirror-a.txt").wstring();
+    firstFile.storageMode = FileStorageMode::Managed;
+    firstCore.files.push_back(firstFile);
+    original.cores.push_back(firstCore);
+    original.nextId = 4;
+    original.managedLibraryPath = mirrorRoot.wstring();
+
+    GravityApp writer;
+    writer.stateFile_ = root / L"package-state" / L"state.json";
+    writer.workspaceRecoveryRootOverride_ = mirrorRoot;
+    writer.state_ = original;
+    if (!writer.WriteStateWithRelationshipManifest(original)) return fail();
+
+    const std::filesystem::path primary = writer.WorkspaceRecoveryMirrorPath();
+    const auto initialTime = std::filesystem::last_write_time(primary, error);
+    WorkspaceRecoveryMirror firstMirror;
+    if (error || !writer.ReadBestWorkspaceRecoveryMirror(firstMirror) ||
+        firstMirror.generation != 1 || UserCoreCount(firstMirror.state) != 1 ||
+        firstMirror.state.cores.size() != 2 ||
+        firstMirror.state.cores.back().files.size() != 1) {
+        return fail();
+    }
+    // A no-op persistence cycle must retain both its generation and timestamp.
+    if (!writer.WriteWorkspaceRecoveryMirror(original) ||
+        std::filesystem::last_write_time(primary, error) != initialTime || error) {
+        return fail();
+    }
+
+    WorkspaceState changed = original;
+    changed.workspaceWidthRatio = 0.61f;
+    Core secondCore;
+    secondCore.id = 4;
+    secondCore.name = L"Mirror B";
+    secondCore.position = D2D1::Point2F(880.0f, 520.0f);
+    secondCore.xRatio = 0.82f;
+    secondCore.yRatio = 0.54f;
+    FileItem child;
+    child.id = 5;
+    child.path = (mirrorRoot / L"managed-files" / L"mirror-b.txt").wstring();
+    child.managedPath = child.path;
+    child.originalPath = (root / L"desktop" / L"mirror-b.txt").wstring();
+    child.parentFileId = 0;
+    child.storageMode = FileStorageMode::Managed;
+    secondCore.files.push_back(child);
+    changed.cores.push_back(secondCore);
+    FileItem childOfFirst = child;
+    childOfFirst.id = 6;
+    childOfFirst.path = (mirrorRoot / L"managed-files" / L"mirror-child.txt").wstring();
+    childOfFirst.managedPath = childOfFirst.path;
+    childOfFirst.originalPath = (root / L"desktop" / L"mirror-child.txt").wstring();
+    childOfFirst.parentFileId = firstFile.id;
+    childOfFirst.familyId = 7;
+    changed.cores[1].files.front().familyId = 7;
+    changed.cores[1].files.push_back(childOfFirst);
+    FileFamily family;
+    family.id = 7;
+    family.coreId = firstCore.id;
+    family.rootFileId = firstFile.id;
+    family.currentFileId = childOfFirst.id;
+    changed.families.push_back(family);
+    changed.nextId = 7;
+    if (WorkspaceStatesMatchForPersistence(original, changed)) {
+        return fail();
+    }
+    if (!writer.WriteStateWithRelationshipManifest(changed)) return fail();
+    const std::optional<std::string> changedMirrorText = ReadUtf8File(primary);
+    if (!changedMirrorText) {
+        return fail();
+    }
+    WorkspaceRecoveryMirror directMirror;
+    const RelationValidationResult directValidation =
+        DeserializeWorkspaceRecoveryMirror(*changedMirrorText, directMirror)
+            ? ValidateRelationState(directMirror.state)
+            : RelationValidationResult{};
+    if (!directValidation.IsValid()) {
+        return fail();
+    }
+    WorkspaceRecoveryMirror newest;
+    if (!writer.ReadBestWorkspaceRecoveryMirror(newest) || newest.generation != 2 ||
+        UserCoreCount(newest.state) != 2 || newest.state.cores.size() != 3 ||
+        newest.state.cores[1].files.size() != 2 ||
+        newest.state.cores[1].files.back().parentFileId != firstFile.id ||
+        std::abs(newest.state.workspaceWidthRatio - 0.61f) > 0.001f) {
+        return fail();
+    }
+
+    // Simulate MSIX uninstall: package state disappears while Documents keeps
+    // the complete recovery mirror. Restoring it rebuilds only relationship
+    // state; the managed files themselves are never moved or copied.
+    std::filesystem::remove_all(writer.stateFile_.parent_path(), error);
+    if (error || std::filesystem::exists(writer.stateFile_)) return fail();
+    GravityApp reinstalled;
+    reinstalled.stateFile_ = root / L"package-state-reinstalled" / L"state.json";
+    reinstalled.workspaceRecoveryRootOverride_ = mirrorRoot;
+    reinstalled.freshWorkspaceWithoutState_ = true;
+    reinstalled.DiscoverWorkspaceRecoveryMirror();
+    if (!reinstalled.pendingWorkspaceRecovery_.has_value() ||
+        reinstalled.pendingWorkspaceRecovery_->generation != 2 ||
+        !reinstalled.RestoreWorkspaceRecoveryMirror(
+            *reinstalled.pendingWorkspaceRecovery_)) {
+        return fail();
+    }
+    const std::optional<std::string> restoredState =
+        ReadUtf8File(reinstalled.stateFile_);
+    WorkspaceState restored;
+    if (!restoredState || !DeserializeState(*restoredState, restored) ||
+        !WorkspaceStatesMatchForPersistence(restored, changed) ||
+        UserCoreCount(restored) != 2) {
+        return fail();
+    }
+
+    // A broken primary must fall back to the last atomic backup without using
+    // the legacy lightweight manifest or touching real user data.
+    if (!WriteUtf8Atomic(primary, "{broken")) return fail();
+    WorkspaceRecoveryMirror backupMirror;
+    if (!reinstalled.ReadBestWorkspaceRecoveryMirror(backupMirror) ||
+        backupMirror.generation != 2) {
+        return fail();
+    }
+    return cleanup();
+}
+
 bool RunSelfTest() {
+    const SelfTestModeScope selfTestMode;
     struct CoreVisualSizeCase {
         float iconDip;
         float shortSideDip;
@@ -28428,7 +28885,8 @@ bool RunSelfTest() {
             return false;
         }
     }
-    if (!gravity::i18n::Localization::RunSelfTest() ||
+    if (!RunWorkspaceRecoveryMirrorSelfTest() ||
+        !gravity::i18n::Localization::RunSelfTest() ||
         MigrateAutomaticCoreName(L"新核心 7") != L"文件核心 7" ||
         MigrateAutomaticCoreName(L"新核心设计") != L"新核心设计" ||
         MigrateAutomaticCoreName(L"文件核心 7") != L"文件核心 7" ||
@@ -31157,6 +31615,7 @@ bool RunSelfTest() {
             recoveryManifestPath, tempError) != recoveryManifestWriteTime) {
         return false;
     }
+
     const std::filesystem::path assetSource =
         relationTestDirectory / L"asset-source.bin";
     const std::filesystem::path assetDestination =
@@ -31218,7 +31677,7 @@ bool RunSelfTest() {
     externalManifestDiscoveryApp.DiscoverRelationshipRecoveryManifest();
     if (!externalManifestDiscoveryApp.pendingRelationshipRecovery_.has_value() ||
         externalManifestDiscoveryApp.pendingRelationshipRecovery_->cores.size() != 1 ||
-        !externalManifestDiscoveryApp.preserveExistingRelationshipManifest_) {
+        !externalManifestDiscoveryApp.preserveHistoricalRecoveryEvidence_) {
         return false;
     }
     GravityApp blockedManifestDiscoveryApp;
