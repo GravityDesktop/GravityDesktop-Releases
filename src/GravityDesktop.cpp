@@ -12244,6 +12244,25 @@ private:
         return state_.workspaceChromeOrientation == 1;
     }
 
+    bool WorkspaceChromeIsAtAutoHideEdge(
+        const D2D1_SIZE_F& client) const {
+        if (!state_.workspaceChromeDocked) return false;
+        const D2D1_RECT_F group = WorkspaceChromeGroupRectangle(client);
+        const float nearest = std::min({
+            group.top, group.left,
+            client.width - group.right,
+            client.height - group.bottom});
+        return nearest <= 14.0f;
+    }
+
+    static bool WorkspaceChromeCanAutoHide(
+        bool docked, bool pinned, bool hovered,
+        bool dragging, bool pointerPending, bool menuOpen,
+        bool placementMode, bool atEdge) {
+        return docked && !pinned && !hovered && !dragging &&
+            !pointerPending && !menuOpen && !placementMode && atEdge;
+    }
+
     bool WorkspaceChromeUsesCompactLabels(
         const D2D1_SIZE_F& client) const {
         // Reserve the non-Chinese strip for the longest supported localized
@@ -12378,15 +12397,22 @@ private:
         workspaceChromeAutoHideReady_ = false;
     }
 
-    void ScheduleWorkspaceChromeAutoHide() {
+    void ScheduleWorkspaceChromeAutoHide(
+        bool ignoreCurrentPointerOverGroup = false) {
         CancelWorkspaceChromeAutoHideDelay();
-        if (!state_.workspaceChromeDocked ||
-            state_.workspaceChromePinned ||
-            draggingWorkspaceChrome_ || workspaceChromePointerPending_ ||
-            workspaceChromeMenuOpen_ || corePlacementMode_ ||
+        if (!WorkspaceChromeCanAutoHide(
+                state_.workspaceChromeDocked,
+                state_.workspaceChromePinned,
+                workspaceChromeHovered_,
+                draggingWorkspaceChrome_,
+                workspaceChromePointerPending_,
+                workspaceChromeMenuOpen_,
+                corePlacementMode_,
+                WorkspaceChromeIsAtAutoHideEdge(ClientDipSize())) ||
             window_ == nullptr ||
-            WorkspaceChromePointerOverGroup(
-                WorkspaceChromeGroupRectangle(ClientDipSize()))) {
+            (!ignoreCurrentPointerOverGroup &&
+             WorkspaceChromePointerOverGroup(
+                WorkspaceChromeGroupRectangle(ClientDipSize())))) {
             return;
         }
         if (SetTimer(window_, kWorkspaceChromeAutoHideTimer,
@@ -12530,11 +12556,7 @@ private:
             workspaceChromeMenuOpen_ || corePlacementMode_) {
             return false;
         }
-        const float nearest = std::min({
-            group.top, group.left,
-            client.width - group.right,
-            client.height - group.bottom});
-        return nearest <= 14.0f;
+        return WorkspaceChromeIsAtAutoHideEdge(client);
     }
 
     D2D1_RECT_F WorkspaceChromeRevealRectangle(
@@ -12788,6 +12810,27 @@ private:
         if (chromeLayered) {
             renderTarget_->PopLayer();
         }
+    }
+
+    // Pin changes and a completed drag must enter auto-hide through this same
+    // transition.  The input button itself is part of the strip, so its hover
+    // bit has to be released before scheduling the edge delay; otherwise an
+    // unpinned, already-docked strip incorrectly waits for a later drag.
+    void RefreshWorkspaceChromeDockedAutoHide(bool pointerRemainsOverChrome) {
+        if (state_.workspaceChromePinned || !state_.workspaceChromeDocked) {
+            workspaceChromeHovered_ = false;
+            CancelWorkspaceChromeAutoHideDelay();
+            SyncWorkspaceChromeRevealWatch();
+            return;
+        }
+        workspaceChromeHovered_ = pointerRemainsOverChrome;
+        if (pointerRemainsOverChrome) {
+            CancelWorkspaceChromeAutoHideDelay();
+        } else {
+            ScheduleWorkspaceChromeAutoHide(true);
+        }
+        SyncWorkspaceChromeRevealWatch();
+        EnsureInteractionWindowPresented();
     }
 
     void ShowGlobalArrangeMenu() {
@@ -15697,11 +15740,7 @@ private:
         switch (index) {
         case 0:
             state_.workspaceChromePinned = !state_.workspaceChromePinned;
-            if (state_.workspaceChromePinned) {
-                CancelWorkspaceChromeAutoHideDelay();
-            } else {
-                ScheduleWorkspaceChromeAutoHide();
-            }
+            RefreshWorkspaceChromeDockedAutoHide(false);
             ScheduleSave(false);
             SetStatus(state_.workspaceChromePinned
                 ? L"控制条已固定显示"
@@ -15865,11 +15904,7 @@ private:
                 centerY / std::max(1.0f, client.height), 0.0f, 1.0f);
         }
         state_.workspaceChromeDocked = docked;
-        if (docked) {
-            ScheduleWorkspaceChromeAutoHide();
-        } else {
-            CancelWorkspaceChromeAutoHideDelay();
-        }
+        RefreshWorkspaceChromeDockedAutoHide(false);
         if (GetCapture() == window_) ReleaseCapture();
         ScheduleSave(false);
         Invalidate();
@@ -26849,17 +26884,35 @@ private:
                    value == kLegacySafetyDescription;
         };
 
+        const auto isKnownRecoveryShortcut =
+            [&](const std::filesystem::path& shortcut) {
+            ComPtr<IShellLinkW> shellLink;
+            HRESULT result = CoCreateInstance(
+                CLSID_ShellLink, nullptr, CLSCTX_INPROC_SERVER,
+                IID_PPV_ARGS(shellLink.ReleaseAndGetAddressOf()));
+            ComPtr<IPersistFile> persist;
+            if (SUCCEEDED(result)) result = shellLink.As(&persist);
+            if (SUCCEEDED(result)) result = persist->Load(
+                shortcut.c_str(), STGM_READ);
+            std::array<wchar_t, 32768> target{};
+            if (SUCCEEDED(result)) result = shellLink->GetPath(
+                target.data(), static_cast<int>(target.size()), nullptr,
+                SLGP_RAWPATH);
+            return SUCCEEDED(result) && PathEquals(
+                NormalizePath(target.data()),
+                NormalizePath(durableRecovery.wstring()));
+        };
+
         const auto createOrUpdateShortcut =
             [&](const std::filesystem::path& target,
                 const std::filesystem::path& destination,
                 const wchar_t* description,
-                bool updateKnownLibraryShortcut,
+                const auto& isKnownShortcut,
                 bool useLibraryIcon) {
             std::error_code existsError;
             if (std::filesystem::exists(destination, existsError) &&
                 !existsError &&
-                (!updateKnownLibraryShortcut ||
-                 !isKnownManagedLibraryShortcut(destination))) {
+                !isKnownShortcut(destination)) {
                 return true; // Never overwrite a user-created shortcut.
             }
             ComPtr<IShellLinkW> shellLink;
@@ -26887,7 +26940,7 @@ private:
 
         const bool libraryShortcutReady = createOrUpdateShortcut(
             library, *libraryShortcutPath, kLibraryDescription,
-            true, true);
+            isKnownManagedLibraryShortcut, true);
         if (!libraryShortcutReady) {
             AppendRuntimeDiagnostic("managed_library_shortcut_failed",
                                     E_FAIL, GetLastError());
@@ -26911,7 +26964,7 @@ private:
             !createOrUpdateShortcut(
                 durableRecovery, RecoveryShortcutPath(),
                 L"将所有引力桌面托管文件安全恢复到 Windows 桌面",
-                false, false)) {
+                isKnownRecoveryShortcut, true)) {
             AppendRuntimeDiagnostic("recovery_shortcut_create_failed", E_FAIL,
                                     GetLastError());
         }
@@ -31420,8 +31473,17 @@ bool RunSelfTest() {
     const bool freshChromeRemainsVisible =
         !chromePolicyApp.WorkspaceChromeCollapsed(chromePolicyClient);
     chromePolicyApp.state_.workspaceChromeDocked = true;
+    chromePolicyApp.state_.workspaceChromePositionValid = true;
+    chromePolicyApp.state_.workspaceChromeXRatio = 0.5f;
+    chromePolicyApp.state_.workspaceChromeYRatio = 0.03f;
     const bool explicitlyDockedChromeCanCollapse =
         chromePolicyApp.WorkspaceChromeCollapsed(chromePolicyClient);
+    const bool unpinnedDockedChromeEntersAutoHide =
+        GravityApp::WorkspaceChromeCanAutoHide(
+            true, false, false, false, false, false, false, true);
+    const bool unpinnedFloatingChromeStaysVisible =
+        !GravityApp::WorkspaceChromeCanAutoHide(
+            false, false, false, false, false, false, false, false);
     chromePolicyApp.state_.workspaceChromePinned = true;
     const bool pinnedChromeRemainsVisible =
         !chromePolicyApp.WorkspaceChromeCollapsed(chromePolicyClient);
@@ -31437,6 +31499,8 @@ bool RunSelfTest() {
         chromePolicyApp.WorkspaceChromeRenderedSlideAmount() == 0.0f;
     if (!freshChromeRemainsVisible ||
         !explicitlyDockedChromeCanCollapse ||
+        !unpinnedDockedChromeEntersAutoHide ||
+        !unpinnedFloatingChromeStaysVisible ||
         !pinnedChromeRemainsVisible ||
         !pinnedChromeIsNotTranslated ||
         !dockedChromeUsesCollapsedTranslation ||
