@@ -18032,38 +18032,87 @@ private:
             return nullptr;
         }
 
-        // .url files may declare IconFile/IconIndex for an application or
-        // game. The system image-list index only identifies the .url class
-        // and can therefore lose that per-shortcut icon after the file moves.
-        // Ask the Shell item itself first, matching Explorer's resolution.
-        ComPtr<IShellItemImageFactory> imageFactory;
-        if (FAILED(SHCreateItemFromParsingName(
-                item.path.c_str(), nullptr,
-                IID_PPV_ARGS(imageFactory.ReleaseAndGetAddressOf())))) {
-            return nullptr;
+        // Explorer asks the containing Shell folder for a per-item
+        // IExtractIcon implementation. IShellItemImageFactory instead returns
+        // the generic Internet Shortcut class icon for these physical .url
+        // files, even when their IconFile/IconIndex is valid.
+        PIDLIST_ABSOLUTE absoluteItem = nullptr;
+        HRESULT result = SHParseDisplayName(
+            item.path.c_str(), nullptr, &absoluteItem, 0, nullptr);
+        ComPtr<IShellFolder> parentFolder;
+        PCUITEMID_CHILD childItem = nullptr;
+        if (SUCCEEDED(result)) {
+            result = SHBindToParent(
+                absoluteItem,
+                IID_PPV_ARGS(parentFolder.ReleaseAndGetAddressOf()),
+                &childItem);
         }
 
-        HBITMAP icon = nullptr;
-        const SIZE requested{256, 256};
-        const HRESULT result = imageFactory->GetImage(
-            requested,
-            static_cast<SIIGBF>(SIIGBF_ICONONLY |
-                                SIIGBF_BIGGERSIZEOK |
-                                SIIGBF_RESIZETOFIT),
-            &icon);
+        ComPtr<IExtractIconW> extractor;
+        if (SUCCEEDED(result)) {
+            PCUITEMID_CHILD children[1]{childItem};
+            void* extractedInterface = nullptr;
+            result = parentFolder->GetUIObjectOf(
+                nullptr, 1, children, IID_IExtractIconW, nullptr,
+                &extractedInterface);
+            if (SUCCEEDED(result)) {
+                extractor.Attach(
+                    static_cast<IExtractIconW*>(extractedInterface));
+            }
+        }
+
+        std::array<wchar_t, 32768> iconLocation{};
+        int iconIndex = 0;
+        UINT iconFlags = 0;
+        if (SUCCEEDED(result)) {
+            result = extractor->GetIconLocation(
+                GIL_FORSHELL, iconLocation.data(),
+                static_cast<UINT>(iconLocation.size()),
+                &iconIndex, &iconFlags);
+        }
+
+        // The .url handler succeeds up to 96 physical pixels on current
+        // Windows versions. That covers a 48-DIP desktop icon at 200% DPI and
+        // avoids asking the handler for a size that makes it return E_FAIL.
+        const int requestedPixels = std::clamp(
+            static_cast<int>(std::lround(
+                TierIconPixels(item.sizeTier) * dpi_ / 96.0f)),
+            32, 96);
+        HICON largeIcon = nullptr;
+        HICON smallIcon = nullptr;
+        if (SUCCEEDED(result)) {
+            result = extractor->Extract(
+                iconLocation.data(), iconIndex,
+                &largeIcon, &smallIcon,
+                MAKELONG(requestedPixels, requestedPixels));
+        }
+        CoTaskMemFree(absoluteItem);
+
+        HICON icon = largeIcon != nullptr ? largeIcon : smallIcon;
         if (FAILED(result) || icon == nullptr) {
+            if (largeIcon != nullptr) DestroyIcon(largeIcon);
+            if (smallIcon != nullptr && smallIcon != largeIcon) {
+                DestroyIcon(smallIcon);
+            }
             return nullptr;
         }
 
         ComPtr<IWICBitmap> wicBitmap;
         ComPtr<ID2D1Bitmap> bitmap;
-        if (SUCCEEDED(wicFactory_->CreateBitmapFromHBITMAP(
-                icon, nullptr, WICBitmapUsePremultipliedAlpha,
+        if (SUCCEEDED(wicFactory_->CreateBitmapFromHICON(
+                icon,
                 wicBitmap.ReleaseAndGetAddressOf()))) {
             bitmap = BitmapFromCroppedIconSource(
                 wicBitmap.Get(), shadowOutput);
         }
-        DeleteObject(icon);
+        DestroyIcon(icon);
+        if (largeIcon != nullptr && largeIcon != icon) {
+            DestroyIcon(largeIcon);
+        }
+        if (smallIcon != nullptr && smallIcon != icon &&
+            smallIcon != largeIcon) {
+            DestroyIcon(smallIcon);
+        }
         return bitmap;
     }
 
