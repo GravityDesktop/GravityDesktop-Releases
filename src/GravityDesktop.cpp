@@ -17743,6 +17743,15 @@ private:
             });
     }
 
+    static bool IsInternetShortcutPath(const std::wstring& path) {
+        std::wstring extension = PathFindExtensionW(path.c_str());
+        std::transform(extension.begin(), extension.end(), extension.begin(),
+                       [](wchar_t ch) {
+                           return static_cast<wchar_t>(std::towlower(ch));
+                       });
+        return extension == L".url";
+    }
+
     ComPtr<ID2D1Bitmap> BitmapFromHBitmap(HBITMAP source) {
         if (source == nullptr) {
             return nullptr;
@@ -18015,6 +18024,49 @@ private:
         return bitmap;
     }
 
+    ComPtr<ID2D1Bitmap> GetInternetShortcutIcon(
+        const FileItem& item,
+        ComPtr<ID2D1Bitmap>* shadowOutput) {
+        if (item.missing || item.isDirectory ||
+            !IsInternetShortcutPath(item.path)) {
+            return nullptr;
+        }
+
+        // .url files may declare IconFile/IconIndex for an application or
+        // game. The system image-list index only identifies the .url class
+        // and can therefore lose that per-shortcut icon after the file moves.
+        // Ask the Shell item itself first, matching Explorer's resolution.
+        ComPtr<IShellItemImageFactory> imageFactory;
+        if (FAILED(SHCreateItemFromParsingName(
+                item.path.c_str(), nullptr,
+                IID_PPV_ARGS(imageFactory.ReleaseAndGetAddressOf())))) {
+            return nullptr;
+        }
+
+        HBITMAP icon = nullptr;
+        const SIZE requested{256, 256};
+        const HRESULT result = imageFactory->GetImage(
+            requested,
+            static_cast<SIIGBF>(SIIGBF_ICONONLY |
+                                SIIGBF_BIGGERSIZEOK |
+                                SIIGBF_RESIZETOFIT),
+            &icon);
+        if (FAILED(result) || icon == nullptr) {
+            return nullptr;
+        }
+
+        ComPtr<IWICBitmap> wicBitmap;
+        ComPtr<ID2D1Bitmap> bitmap;
+        if (SUCCEEDED(wicFactory_->CreateBitmapFromHBITMAP(
+                icon, nullptr, WICBitmapUsePremultipliedAlpha,
+                wicBitmap.ReleaseAndGetAddressOf()))) {
+            bitmap = BitmapFromCroppedIconSource(
+                wicBitmap.Get(), shadowOutput);
+        }
+        DeleteObject(icon);
+        return bitmap;
+    }
+
     ComPtr<ID2D1Bitmap> GetIconBitmap(const FileItem& item) {
         std::wstring key = item.path.empty() ? L"<unknown>" : item.path;
         std::transform(key.begin(), key.end(), key.begin(),
@@ -18030,6 +18082,14 @@ private:
             iconCache_.insert_or_assign(key, thumbnail);
             iconShadowCache_.insert_or_assign(key, shadow);
             return thumbnail;
+        }
+
+        if (ComPtr<ID2D1Bitmap> internetShortcutIcon =
+                GetInternetShortcutIcon(item, &shadow);
+            internetShortcutIcon != nullptr) {
+            iconCache_.insert_or_assign(key, internetShortcutIcon);
+            iconShadowCache_.insert_or_assign(key, shadow);
+            return internetShortcutIcon;
         }
 
         SHFILEINFOW info{};
@@ -28955,6 +29015,14 @@ bool RunSelfTest() {
     }
     if (!RunWorkspaceRecoveryMirrorSelfTest() ||
         !gravity::i18n::Localization::RunSelfTest() ||
+        !GravityApp::IsInternetShortcutPath(
+            L"C:\\Users\\TestUser\\Desktop\\game.url") ||
+        !GravityApp::IsInternetShortcutPath(
+            L"C:\\Users\\TestUser\\Desktop\\GAME.URL") ||
+        GravityApp::IsInternetShortcutPath(
+            L"C:\\Users\\TestUser\\Desktop\\game.lnk") ||
+        GravityApp::IsInternetShortcutPath(
+            L"C:\\Users\\TestUser\\Desktop\\notes.txt") ||
         MigrateAutomaticCoreName(L"新核心 7") != L"文件核心 7" ||
         MigrateAutomaticCoreName(L"新核心设计") != L"新核心设计" ||
         MigrateAutomaticCoreName(L"文件核心 7") != L"文件核心 7" ||
