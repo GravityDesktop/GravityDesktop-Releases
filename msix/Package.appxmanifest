@@ -7,7 +7,7 @@
          IgnorableNamespaces="uap desktop rescap">
   <Identity Name="wbyhome.GravityDesktop"
             Publisher="CN=00AA024B-6408-4EF0-B53F-F515553B964E"
-            Version="1.0.11.0"
+            Version="1.0.12.0"
             ProcessorArchitecture="x64" />
 
   <Properties>

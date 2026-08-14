@@ -2,7 +2,7 @@ param(
     [ValidateSet('Release')]
     [string]$Configuration = 'Release',
     [ValidatePattern('^\d+\.\d+\.\d+\.\d+$')]
-    [string]$PackageVersion = '1.0.11.0',
+    [string]$PackageVersion = '1.0.12.0',
     [string]$PackageName = 'GravityDesktop-MSIX-Prototype-0.1.0-alpha.msix',
     [switch]$PackagedBuild
 )
