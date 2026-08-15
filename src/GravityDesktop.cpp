@@ -117,6 +117,8 @@ constexpr UINT_PTR kDesktopPointerRecoveryTimer = 19;
 // The in-process self-test creates many synthetic state files.  It must never
 // write the durable Documents recovery mirror used by a real workspace.
 bool gRunningSelfTest = false;
+bool gSelfTestPathViolation = false;
+bool ValidateSelfTestPath(const std::filesystem::path& candidate);
 struct SelfTestModeScope {
     SelfTestModeScope() : previous(gRunningSelfTest) { gRunningSelfTest = true; }
     ~SelfTestModeScope() { gRunningSelfTest = previous; }
@@ -2047,6 +2049,57 @@ std::wstring NormalizePath(const std::wstring& path) {
     return normalized;
 }
 
+std::optional<std::filesystem::path> KnownFolderPathForSelfTest(
+    REFKNOWNFOLDERID folderId) {
+    PWSTR value = nullptr;
+    if (FAILED(SHGetKnownFolderPath(
+            folderId, KF_FLAG_DEFAULT, nullptr, &value))) {
+        return std::nullopt;
+    }
+    std::filesystem::path result(value);
+    CoTaskMemFree(value);
+    return result;
+}
+
+bool IsPathEqualOrInside(const std::filesystem::path& candidate,
+                         const std::filesystem::path& root) {
+    const std::wstring normalizedCandidate =
+        NormalizePath(candidate.wstring());
+    std::wstring normalizedRoot = NormalizePath(root.wstring());
+    if (normalizedCandidate.empty() || normalizedRoot.empty()) return false;
+    if (PathEquals(normalizedCandidate, normalizedRoot)) return true;
+    if (normalizedRoot.back() != L'\\') normalizedRoot.push_back(L'\\');
+    return normalizedCandidate.rfind(normalizedRoot, 0) == 0;
+}
+
+bool IsProtectedUserDataPath(const std::filesystem::path& candidate) {
+    const auto documents = KnownFolderPathForSelfTest(FOLDERID_Documents);
+    const auto localAppData =
+        KnownFolderPathForSelfTest(FOLDERID_LocalAppData);
+    return (documents.has_value() && IsPathEqualOrInside(
+                candidate, *documents / L"Gravity Desktop Files")) ||
+           (localAppData.has_value() && IsPathEqualOrInside(
+                candidate, *localAppData / L"GravityDesktop"));
+}
+
+std::filesystem::path SelfTestTempRoot() {
+    wchar_t buffer[MAX_PATH]{};
+    const DWORD length = GetTempPathW(
+        static_cast<DWORD>(std::size(buffer)), buffer);
+    if (length == 0 || length >= std::size(buffer)) return {};
+    return std::filesystem::path(buffer);
+}
+
+bool ValidateSelfTestPath(const std::filesystem::path& candidate) {
+    if (!gRunningSelfTest) return true;
+    const std::filesystem::path tempRoot = SelfTestTempRoot();
+    const bool safe = !candidate.empty() && !tempRoot.empty() &&
+        IsPathEqualOrInside(candidate, tempRoot) &&
+        !IsProtectedUserDataPath(candidate);
+    if (!safe) gSelfTestPathViolation = true;
+    return safe;
+}
+
 std::wstring CurrentExecutablePath() {
     // Windows executable paths may exceed MAX_PATH when long-path support is
     // enabled. Keep the registry command exact rather than silently truncating
@@ -2543,6 +2596,7 @@ std::optional<std::string> ReadUtf8File(const std::filesystem::path& path) {
 }
 
 bool WriteUtf8Atomic(const std::filesystem::path& target, const std::string& data) {
+    if (gRunningSelfTest && !ValidateSelfTestPath(target)) return false;
     std::error_code error;
     std::filesystem::create_directories(target.parent_path(), error);
     if (error) {
@@ -5127,8 +5181,11 @@ public:
     }
 
     bool WriteWorkspaceRecoveryMirror(const WorkspaceState& snapshot) {
-        if (gRunningSelfTest && workspaceRecoveryRootOverride_.empty()) {
-            return true;
+        if (gRunningSelfTest) {
+            if (workspaceRecoveryRootOverride_.empty()) return true;
+            if (!ValidateSelfTestPath(workspaceRecoveryRootOverride_)) {
+                return false;
+            }
         }
         const std::filesystem::path target = WorkspaceRecoveryMirrorPath();
         if (target.empty()) return false;
@@ -5272,10 +5329,24 @@ public:
             << " win32=" << std::dec << win32Error << '\n';
     }
 
+    bool PrepareSelfTestSnapshot(WorkspaceState& snapshot) const {
+        if (!gRunningSelfTest) return true;
+        if (!ValidateSelfTestPath(stateFile_)) return false;
+        if (snapshot.managedLibraryPath.empty()) {
+            snapshot.managedLibraryPath =
+                (stateFile_.parent_path() / L"managed-library").wstring();
+        }
+        return ValidateSelfTestPath(
+            std::filesystem::path(snapshot.managedLibraryPath));
+    }
+
     bool WriteRelationshipManifest(const WorkspaceState& snapshot) const {
+        WorkspaceState safeSnapshot = snapshot;
+        if (!PrepareSelfTestSnapshot(safeSnapshot)) return false;
         const std::filesystem::path manifest = RelationshipManifestPath();
         if (manifest.empty()) return false;
-        const std::string serialized = SerializeRelationshipManifest(snapshot);
+        const std::string serialized =
+            SerializeRelationshipManifest(safeSnapshot);
         const bool localSaved = WriteUtf8AtomicIfChanged(manifest, serialized);
         if (!localSaved) {
             AppendRuntimeDiagnostic(
@@ -5286,9 +5357,7 @@ public:
         // executable can work when the main program or its state directory is
         // unavailable, and it never needs to guess which files are managed.
         const std::filesystem::path recoveryLibrary =
-            snapshot.managedLibraryPath.empty()
-                ? DefaultManagedLibraryPath()
-                : std::filesystem::path(snapshot.managedLibraryPath);
+            std::filesystem::path(safeSnapshot.managedLibraryPath);
         const std::filesystem::path recoveryManifest =
             recoveryLibrary / L"恢复清单.json";
         const bool recoverySaved =
@@ -5368,13 +5437,13 @@ public:
     bool WriteStateWithRelationshipManifest(
         const WorkspaceState& snapshot,
         bool forceRelationshipManifestWrite = false) {
-        if (stateFile_.empty()) {
-            return false;
-        }
+        WorkspaceState safeSnapshot = snapshot;
+        if (!PrepareSelfTestSnapshot(safeSnapshot)) return false;
+        if (stateFile_.empty()) return false;
         const std::optional<std::string> previousState = ReadUtf8File(stateFile_);
-        const std::string serializedState = SerializeState(snapshot);
+        const std::string serializedState = SerializeState(safeSnapshot);
         if (!WriteUtf8Atomic(stateFile_, serializedState)) return false;
-        if (!WriteWorkspaceRecoveryMirror(snapshot)) {
+        if (!WriteWorkspaceRecoveryMirror(safeSnapshot)) {
             // A failed durable mirror must not leave a new package-only state
             // looking committed.  Keep the previous valid state when possible;
             // callers retain their transaction journal and roll back real-file
@@ -5398,7 +5467,7 @@ public:
         // current complete durable mirror.
         if (forceRelationshipManifestWrite ||
             !preserveHistoricalRecoveryEvidence_) {
-            (void)SynchronizeRelationshipManifest(snapshot, true);
+            (void)SynchronizeRelationshipManifest(safeSnapshot, true);
         }
         return true;
     }
@@ -26570,9 +26639,16 @@ private:
     }
 
     std::filesystem::path ManagedLibraryPath() const {
-        return state_.managedLibraryPath.empty()
-            ? DefaultManagedLibraryPath()
-            : std::filesystem::path(state_.managedLibraryPath);
+        if (state_.managedLibraryPath.empty()) {
+            if (gRunningSelfTest) {
+                gSelfTestPathViolation = true;
+                return {};
+            }
+            return DefaultManagedLibraryPath();
+        }
+        const std::filesystem::path result(state_.managedLibraryPath);
+        if (gRunningSelfTest && !ValidateSelfTestPath(result)) return {};
+        return result;
     }
 
     // Keep the visible library root calm: recovery is the only direct action
@@ -27220,6 +27296,12 @@ private:
         const std::wstring& source,
         const std::wstring& destination,
         std::wstring* error = nullptr) const {
+        if (gRunningSelfTest &&
+            (!ValidateSelfTestPath(std::filesystem::path(source)) ||
+             !ValidateSelfTestPath(std::filesystem::path(destination)))) {
+            if (error != nullptr) *error = L"self-test path rejected";
+            return false;
+        }
         if (source.empty() || destination.empty() ||
             !FilePathExists(source)) {
             if (error != nullptr) *error = L"源文件不存在";
@@ -29037,6 +29119,7 @@ bool RunWorkspaceRecoveryMirrorSelfTest() {
 }
 
 bool RunSelfTest() {
+    gSelfTestPathViolation = false;
     const SelfTestModeScope selfTestMode;
     struct CoreVisualSizeCase {
         float iconDip;
@@ -29426,6 +29509,10 @@ bool RunSelfTest() {
     }
 
     GravityApp managedCollectionSessionApp;
+    managedCollectionSessionApp.state_.managedLibraryPath =
+        (std::filesystem::temp_directory_path() /
+         (L"GravityDesktop-selftest-managed-collection-" +
+          std::to_wstring(GetCurrentProcessId()))).wstring();
     managedCollectionSessionApp.managedCollectionSessionLibraryPath_ =
         NormalizePath(
             managedCollectionSessionApp.ManagedLibraryPath().wstring());
@@ -29445,7 +29532,9 @@ bool RunSelfTest() {
     managedCollectionSessionApp.lastManagedCollectionSuccess_ =
         std::chrono::steady_clock::now();
     managedCollectionSessionApp.state_.managedLibraryPath =
-        L"C:\\ManagedLibraryChanged";
+        (std::filesystem::temp_directory_path() /
+         (L"GravityDesktop-selftest-managed-collection-changed-" +
+          std::to_wstring(GetCurrentProcessId()))).wstring();
     if (!managedCollectionSessionApp.
             ManagedCollectionConfirmationRequired()) {
         return false;
@@ -31678,7 +31767,7 @@ bool RunSelfTest() {
     source.connectionLineWidth = 1.47f;
     source.coreGlowIntensity = 1.32f;
     source.managedLibraryPath =
-        L"D:\\Gravity Desktop Files Test";
+        (relationTestDirectory / L"managed-library").wstring();
     source.workspaceWidthRatio = 0.41f;
     source.workspaceChromePositionValid = true;
     source.workspaceChromeXRatio = 0.62f;
@@ -32626,7 +32715,8 @@ bool RunSelfTest() {
     if (!migratedState.tutorialCompleted) {
         return false;
     }
-    return std::abs(restored.zoom - source.zoom) < 0.001f;
+    return !gSelfTestPathViolation &&
+        std::abs(restored.zoom - source.zoom) < 0.001f;
 }
 
 } // namespace

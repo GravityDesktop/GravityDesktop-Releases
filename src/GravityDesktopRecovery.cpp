@@ -58,6 +58,18 @@ struct RecoveryRunOptions {
 
 constexpr char kRecoveryIsolationMarker[] =
     "GravityDesktopRecoveryIsolationTest\n";
+bool gRecoverySelfTestMode = false;
+bool gRecoverySelfTestPathViolation = false;
+bool ValidateRecoverySelfTestPath(const std::filesystem::path& path);
+struct RecoverySelfTestModeScope {
+    RecoverySelfTestModeScope()
+        : previous(gRecoverySelfTestMode) {
+        gRecoverySelfTestMode = true;
+        gRecoverySelfTestPathViolation = false;
+    }
+    ~RecoverySelfTestModeScope() { gRecoverySelfTestMode = previous; }
+    bool previous;
+};
 
 std::optional<std::string> ReadUtf8File(const std::filesystem::path& path) {
     std::ifstream stream(path, std::ios::binary);
@@ -67,6 +79,9 @@ std::optional<std::string> ReadUtf8File(const std::filesystem::path& path) {
 
 bool WriteUtf8Atomic(const std::filesystem::path& target,
                      const std::string& data) {
+    if (gRecoverySelfTestMode && !ValidateRecoverySelfTestPath(target)) {
+        return false;
+    }
     std::error_code error;
     std::filesystem::create_directories(target.parent_path(), error);
     if (error) return false;
@@ -219,6 +234,43 @@ std::optional<std::filesystem::path> DefaultLibraryPath() {
         L"Gravity Desktop Files";
     CoTaskMemFree(documents);
     return value;
+}
+
+bool IsPathEqualOrInside(const std::filesystem::path& path,
+                         const std::filesystem::path& root) {
+    return NormalizePath(path) == NormalizePath(root) ||
+        IsPathInside(path, root);
+}
+
+bool IsProtectedUserDataPath(const std::filesystem::path& path) {
+    const auto library = DefaultLibraryPath();
+    PWSTR localAppData = nullptr;
+    const bool localPathAvailable = SUCCEEDED(SHGetKnownFolderPath(
+        FOLDERID_LocalAppData, KF_FLAG_DEFAULT, nullptr, &localAppData));
+    const std::filesystem::path localRoot = localPathAvailable
+        ? std::filesystem::path(localAppData) / L"GravityDesktop"
+        : std::filesystem::path{};
+    if (localPathAvailable) CoTaskMemFree(localAppData);
+    return (library.has_value() && IsPathEqualOrInside(path, *library)) ||
+           (localPathAvailable && IsPathEqualOrInside(path, localRoot));
+}
+
+std::filesystem::path RecoverySelfTestTempRoot() {
+    wchar_t buffer[MAX_PATH]{};
+    const DWORD length = GetTempPathW(
+        static_cast<DWORD>(std::size(buffer)), buffer);
+    if (length == 0 || length >= std::size(buffer)) return {};
+    return std::filesystem::path(buffer);
+}
+
+bool ValidateRecoverySelfTestPath(const std::filesystem::path& path) {
+    if (!gRecoverySelfTestMode) return true;
+    const std::filesystem::path tempRoot = RecoverySelfTestTempRoot();
+    const bool safe = !path.empty() && !tempRoot.empty() &&
+        IsPathEqualOrInside(path, tempRoot) &&
+        !IsProtectedUserDataPath(path);
+    if (!safe) gRecoverySelfTestPathViolation = true;
+    return safe;
 }
 
 std::filesystem::path RunningLibraryPath() {
@@ -436,6 +488,8 @@ std::filesystem::path AvailableRestoreDestination(
 
 bool MoveWithoutReplacement(const std::filesystem::path& source,
                             const std::filesystem::path& destination) {
+    if (!ValidateRecoverySelfTestPath(source) ||
+        !ValidateRecoverySelfTestPath(destination)) return false;
     if (!FileExists(source) || FileExists(destination)) return false;
     std::error_code error;
     std::filesystem::create_directories(destination.parent_path(), error);
@@ -446,6 +500,14 @@ bool MoveWithoutReplacement(const std::filesystem::path& source,
 
 bool WriteManagedManifest(const std::filesystem::path& library,
                           const std::vector<ManagedEntry>& entries) {
+    if (!ValidateRecoverySelfTestPath(library)) return false;
+    for (const ManagedEntry& entry : entries) {
+        if (!ValidateRecoverySelfTestPath(entry.source) ||
+            (!entry.originalPath.empty() &&
+             !ValidateRecoverySelfTestPath(entry.originalPath))) {
+            return false;
+        }
+    }
     std::ostringstream output;
     output << "{\"schema_version\":1,\"cores\":[{\"files\":[";
     for (std::size_t index = 0; index < entries.size(); ++index) {
@@ -502,6 +564,10 @@ bool RunRecovery(const std::filesystem::path& library,
                  const RecoveryRunOptions& options,
                  const gravity::i18n::Localization& localization,
                  RecoveryResult& result) {
+    if (!ValidateRecoverySelfTestPath(library) ||
+        !ValidateRecoverySelfTestPath(options.desktopTarget)) {
+        return false;
+    }
     const std::filesystem::path manifest = library / L"恢复清单.json";
     std::vector<ManagedEntry> entries;
     if (!ReadManagedEntries(manifest, entries)) {
@@ -703,7 +769,8 @@ bool IsRecoveryIsolationRoot(const std::filesystem::path& root) {
 }
 
 bool RemoveRecoveryIsolationRoot(const std::filesystem::path& root) {
-    if (!IsRecoveryIsolationRoot(root)) return false;
+    if (!IsRecoveryIsolationRoot(root) ||
+        !ValidateRecoverySelfTestPath(root)) return false;
     std::error_code error;
     std::filesystem::remove_all(root, error);
     return !error;
@@ -718,8 +785,10 @@ bool JournalContainsState(const std::filesystem::path& library,
 }
 
 bool RunRecoveryIsolationSelfTest() {
+    const RecoverySelfTestModeScope selfTestMode;
     const auto root = CreateRecoveryIsolationRoot();
-    if (!root || !IsRecoveryIsolationRoot(*root)) return false;
+    if (!root || !IsRecoveryIsolationRoot(*root) ||
+        !ValidateRecoverySelfTestPath(*root)) return false;
     const std::filesystem::path library = *root / L"ManagedLibrary";
     const std::filesystem::path desktop = *root / L"DesktopTarget";
     std::error_code error;
@@ -824,14 +893,16 @@ bool RunRecoveryIsolationSelfTest() {
              JournalContainsState(library, interruptedSource, L"restored");
 
     const bool cleaned = RemoveRecoveryIsolationRoot(*root);
-    return passed && cleaned;
+    return passed && cleaned && !gRecoverySelfTestPathViolation;
 }
 
 bool RunSelfTest() {
+    const RecoverySelfTestModeScope selfTestMode;
     if (!gravity::i18n::Localization::RunSelfTest()) return false;
     const std::filesystem::path root = std::filesystem::temp_directory_path() /
         (L"GravityDesktopRecoveryTest-" +
          std::to_wstring(static_cast<unsigned long long>(GetTickCount64())));
+    if (!ValidateRecoverySelfTestPath(root)) return false;
     const std::filesystem::path desktop = root / L"desktop";
     const std::filesystem::path source = root / L"已托管文件" / L"sample.txt";
     std::error_code error;
@@ -869,7 +940,7 @@ bool RunSelfTest() {
         !alternate.empty() &&
         NormalizePath(alternate) != NormalizePath(restored);
     std::filesystem::remove_all(root, error);
-    return parsed;
+    return parsed && !gRecoverySelfTestPathViolation;
 }
 
 } // namespace

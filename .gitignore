@@ -1,10 +1,40 @@
 .vs/
 out/
+.codex-smoke-layout-cache/
+
+# Visual C++ and linker outputs
+*.pdb
+*.obj
+*.ipdb
+*.iobj
+*.ilk
+*.tlog/
+
+# Local build, test, and diagnostic outputs
+artifacts/
+tmp/
+*.log
+*.dmp
+*.tmp
+*.bak
+
+# Local application state and recovery snapshots
+**/state.json
+**/preferences.json
+**/relationships.json
+**/relationships.json.bak
+**/恢复清单.json
+**/恢复清单.json.bak
+**/workspace-recovery.json
+**/workspace-recovery.json.bak
+**/history/
+**/snapshots/
+Gravity Desktop Files/
+logs/
+Temp/
+
+# Per-user IDE settings
 *.user
 *.suo
 *.VC.db
 *.VC.VC.opendb
-
-
-artifacts/
-tmp/
