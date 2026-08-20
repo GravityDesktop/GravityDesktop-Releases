@@ -23,7 +23,7 @@ BEGIN
     BEGIN
         BLOCK "080404B0"
         BEGIN
-            VALUE "FileDescription", "桌面文件工作关系整理工具"
+            VALUE "FileDescription", "Desktop file work relationship organizer"
             VALUE "FileVersion", GRAVITY_DESKTOP_VERSION_STRING
             VALUE "InternalName", "GravityDesktop"
             VALUE "OriginalFilename", "GravityDesktop.exe"
@@ -31,7 +31,7 @@ BEGIN
             VALUE "ProductVersion", GRAVITY_DESKTOP_VERSION_STRING
             VALUE "CompanyName", ""
             VALUE "LegalCopyright", "© 2026 wangboyun. All rights reserved."
-            VALUE "Comments", "引力桌面 / Gravity Desktop; Developer: 王博赟 (wangboyun); Website: https://gravitydesktop.com"
+            VALUE "Comments", "Gravity Desktop; Developer: wangboyun; Website: https://gravitydesktop.com"
         END
     END
     BLOCK "VarFileInfo"

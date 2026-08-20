@@ -194,6 +194,11 @@ std::wstring ResolveRequestedLanguage(std::wstring requested) {
         requested == L"zh-hans" || StartsWith(requested, L"zh-hans-")) {
         return L"zh-CN";
     }
+    if (requested == L"zh-tw" || requested == L"zh-hk" ||
+        requested == L"zh-mo" || requested == L"zh-hant" ||
+        StartsWith(requested, L"zh-hant-")) {
+        return L"zh-TW";
+    }
     if (StartsWith(requested, L"en-")) return L"en-US";
     if (requested == L"ja" || StartsWith(requested, L"ja-")) return L"ja-JP";
     if (requested == L"de" || StartsWith(requested, L"de-")) return L"de-DE";
@@ -204,7 +209,8 @@ std::wstring ResolveRequestedLanguage(std::wstring requested) {
 
 bool IsSupportedLocale(std::wstring_view locale) {
     const std::wstring normalized = Lowercase(std::wstring(locale));
-    return normalized == L"zh-cn" || normalized == L"en-us" ||
+    return normalized == L"zh-cn" || normalized == L"zh-tw" ||
+           normalized == L"en-us" ||
            normalized == L"ja-jp" || normalized == L"de-de" ||
            normalized == L"es-es" || normalized == L"fr-fr";
 }
@@ -212,6 +218,11 @@ bool IsSupportedLocale(std::wstring_view locale) {
 std::wstring CanonicalLocale(std::wstring_view locale) {
     const std::wstring normalized = Lowercase(std::wstring(locale));
     if (normalized == L"zh-cn") return L"zh-CN";
+    if (normalized == L"zh-tw" || normalized == L"zh-hk" ||
+        normalized == L"zh-mo" || normalized == L"zh-hant" ||
+        StartsWith(normalized, L"zh-hant-")) {
+        return L"zh-TW";
+    }
     if (normalized == L"ja-jp") return L"ja-JP";
     if (normalized == L"de-de") return L"de-DE";
     if (normalized == L"es-es") return L"es-ES";
@@ -258,11 +269,34 @@ std::filesystem::path ExecutableDirectory() {
 
 std::optional<std::unordered_map<std::string, std::wstring>>
 LoadLocaleFile(std::wstring_view locale) {
+    // Traditional Chinese derives from the complete Simplified Chinese pack
+    // through Windows' Unicode conversion table. This avoids a second
+    // hand-maintained resource copy that could silently miss keys.
+    const bool traditionalChinese = locale == L"zh-TW";
+    const std::wstring_view resourceLocale =
+        traditionalChinese ? L"zh-CN" : locale;
     const std::filesystem::path path =
-        ExecutableDirectory() / L"locales" / (std::wstring(locale) + L".json");
+        ExecutableDirectory() / L"locales" /
+        (std::wstring(resourceLocale) + L".json");
     const auto text = ReadUtf8File(path);
     if (!text.has_value()) return std::nullopt;
-    return ParseStringMap(*text);
+    auto strings = ParseStringMap(*text);
+    if (!strings.has_value() || !traditionalChinese) return strings;
+    for (auto& [key, value] : *strings) {
+        const int length = LCMapStringEx(
+            L"zh-TW", LCMAP_TRADITIONAL_CHINESE, value.c_str(),
+            static_cast<int>(value.size()), nullptr, 0, nullptr, nullptr, 0);
+        if (length <= 0) return std::nullopt;
+        std::wstring converted(static_cast<std::size_t>(length), L'\0');
+        if (LCMapStringEx(
+                L"zh-TW", LCMAP_TRADITIONAL_CHINESE, value.c_str(),
+                static_cast<int>(value.size()), converted.data(), length,
+                nullptr, nullptr, 0) <= 0) {
+            return std::nullopt;
+        }
+        value = std::move(converted);
+    }
+    return strings;
 }
 
 std::vector<std::wstring> ExtractPlaceholders(std::wstring_view text) {
@@ -284,8 +318,8 @@ std::vector<std::wstring> ExtractPlaceholders(std::wstring_view text) {
 bool ValidateLocaleFiles() {
     const auto english = LoadLocaleFile(L"en-US");
     if (!english.has_value() || english->empty()) return false;
-    constexpr std::array<std::wstring_view, 5> locales{
-        L"zh-CN", L"ja-JP", L"de-DE", L"es-ES", L"fr-FR"};
+    constexpr std::array<std::wstring_view, 6> locales{
+        L"zh-CN", L"zh-TW", L"ja-JP", L"de-DE", L"es-ES", L"fr-FR"};
     for (const std::wstring_view locale : locales) {
         const auto translated = LoadLocaleFile(locale);
         if (!translated.has_value() ||
@@ -305,8 +339,9 @@ bool ValidateLocaleFiles() {
 }
 
 bool ValidateSettingsLayoutAtSupportedDpis() {
-    constexpr std::array<std::wstring_view, 6> locales{
-        L"zh-CN", L"en-US", L"ja-JP", L"de-DE", L"es-ES", L"fr-FR"};
+    constexpr std::array<std::wstring_view, 7> locales{
+        L"zh-CN", L"zh-TW", L"en-US", L"ja-JP", L"de-DE", L"es-ES",
+        L"fr-FR"};
     constexpr std::array<int, 4> dpis{96, 120, 144, 192};
     struct ControlTextLimit {
         std::string_view key;
@@ -371,7 +406,7 @@ bool ValidateSettingsLayoutAtSupportedDpis() {
                     break;
                 }
             }
-            const bool chinese = locale == L"zh-CN";
+            const bool chinese = locale == L"zh-CN" || locale == L"zh-TW";
             const int densityWidth = chinese ? 82 : 118;
             const int animationWidth = chinese ? 70 : 88;
             for (const std::string_view key : densityKeys) {
@@ -464,6 +499,16 @@ std::unordered_map<std::string, std::wstring> BuiltInEnglish() {
     };
 }
 
+std::unordered_map<std::string, std::wstring> CompleteEnglishResources() {
+    std::unordered_map<std::string, std::wstring> resources = BuiltInEnglish();
+    if (const auto pack = LoadLocaleFile(L"en-US"); pack.has_value()) {
+        for (const auto& [key, value] : *pack) {
+            resources[key] = value;
+        }
+    }
+    return resources;
+}
+
 Preferences ParsePreferences(const std::string& text) {
     Preferences result;
     const auto map = ParseStringMap(text);
@@ -514,12 +559,7 @@ bool Localization::Load() {
     if (const auto text = ReadUtf8File(PreferencesPath()); text.has_value()) {
         preferences_ = ParsePreferences(*text);
     }
-    english_ = BuiltInEnglish();
-    if (const auto pack = LoadLocaleFile(L"en-US"); pack.has_value()) {
-        for (const auto& [key, value] : *pack) {
-            english_[key] = value;
-        }
-    }
+    english_ = CompleteEnglishResources();
     ResolveAndLoadLanguage();
     return true;
 }
@@ -605,6 +645,107 @@ std::wstring Localization::Text(std::string_view key) const {
     return std::wstring(key.begin(), key.end());
 }
 
+std::wstring Localization::LocalizeLegacyText(
+    std::wstring_view literal) const {
+    const auto hasChinese = [](std::wstring_view value) {
+        return std::any_of(value.begin(), value.end(), [](wchar_t character) {
+            return character >= 0x4E00 && character <= 0x9FFF;
+        });
+    };
+    if (!hasChinese(literal) || currentLocale_ == L"zh-CN") {
+        return std::wstring(literal);
+    }
+
+    // A deliberately small compatibility map for old menu/control captions.
+    // It maps source text to semantic keys, so every supported locale gets its
+    // native resource instead of an English-only replacement.
+    static const std::unordered_map<std::wstring, std::string> kKnown{
+        {L"常规", "settings.general"},
+        {L"外观与动效", "settings.appearance"},
+        {L"工作区", "settings.workspace"},
+        {L"数据与备份", "settings.data"},
+        {L"核心管理", "settings.core_management"},
+        {L"帮助", "settings.help"},
+        {L"高级", "settings.advanced"},
+        {L"登录Windows后自动启动引力桌面", "settings.autostart"},
+        {L"布局密度", "settings.density"},
+        {L"紧凑", "settings.density.compact"},
+        {L"标准", "settings.density.standard"},
+        {L"清晰", "settings.density.clear"},
+        {L"全局动画强度", "settings.animation_strength"},
+        {L"关闭", "settings.animation.off"},
+        {L"简洁", "settings.animation.simple"},
+        {L"柔和", "settings.animation.soft"},
+        {L"恢复系统推荐布局", "core.restore_recommended_layout"},
+        {L"向空白处生长", "core.grow_to_space"},
+        {L"保存当前布局为我的布局", "core.save_layout"},
+        {L"恢复我的布局", "core.restore_layout"},
+        {L"锁定核心与文件位置", "core.lock_positions"},
+        {L"解除核心与文件位置锁定", "core.unlock_positions"},
+        {L"核心外观设置…", "core.appearance"},
+        {L"收起核心", "core.collapse"},
+        {L"展开核心", "core.expand"},
+        {L"归档核心", "core.archive"},
+        {L"移除核心及所有引用", "core.remove_all"},
+        {L"解散核心并还原文件到桌面", "core.dissolve_restore"},
+        {L"打开", "file.open"},
+        {L"打开所在文件夹", "file.open_folder"},
+        {L"在资源管理器中选中", "file.reveal"},
+        {L"重命名", "file.rename"},
+        {L"从核心移除引用", "file.remove_reference"},
+        {L"从核心移除并还原到桌面", "file.remove_restore"},
+        {L"固定", "file.pin"},
+        {L"收藏", "file.favorite"},
+        {L"取消收藏", "file.unfavorite"},
+        {L"撤销", "toolbar.undo"},
+        {L"创建核心", "toolbar.create_core"},
+        {L"设置", "toolbar.settings"},
+    };
+    if (const auto found = kKnown.find(std::wstring(literal));
+        found != kKnown.end()) {
+        return Text(found->second);
+    }
+
+    if (currentLocale_ == L"zh-TW") {
+        const int length = LCMapStringEx(
+            L"zh-TW", LCMAP_TRADITIONAL_CHINESE, literal.data(),
+            static_cast<int>(literal.size()), nullptr, 0, nullptr, nullptr, 0);
+        if (length > 0) {
+            std::wstring translated(static_cast<std::size_t>(length), L'\0');
+            if (LCMapStringEx(
+                    L"zh-TW", LCMAP_TRADITIONAL_CHINESE, literal.data(),
+                    static_cast<int>(literal.size()), translated.data(), length,
+                    nullptr, nullptr, 0) > 0) {
+                return translated;
+            }
+        }
+    }
+
+    // Do not leak Simplified Chinese from an unconverted legacy status/error
+    // into another language. The fallback remains localized, but we retain the
+    // source literal in diagnostic logs at its call site when needed.
+    const std::wstring source(literal);
+    if (source.find(L"取消") != std::wstring::npos) {
+        return Text("legacy.cancelled");
+    }
+    if (source.find(L"失败") != std::wstring::npos ||
+        source.find(L"无法") != std::wstring::npos ||
+        source.find(L"错误") != std::wstring::npos ||
+        source.find(L"不存在") != std::wstring::npos ||
+        source.find(L"不足") != std::wstring::npos ||
+        source.find(L"无效") != std::wstring::npos) {
+        return Text("legacy.operation_failed");
+    }
+    if (source.find(L"已") != std::wstring::npos ||
+        source.find(L"完成") != std::wstring::npos ||
+        source.find(L"保存") != std::wstring::npos ||
+        source.find(L"恢复") != std::wstring::npos ||
+        source.find(L"更新") != std::wstring::npos) {
+        return Text("legacy.operation_completed");
+    }
+    return Text("legacy.information");
+}
+
 std::wstring Localization::Format(
     std::string_view key,
     const std::unordered_map<std::wstring, std::wstring>& values) const {
@@ -622,6 +763,7 @@ std::wstring Localization::Format(
 
 std::wstring Localization::DisplayName(std::wstring_view locale) {
     if (locale == L"zh-CN") return L"简体中文";
+    if (locale == L"zh-TW") return L"繁體中文";
     if (locale == L"en-US") return L"English";
     if (locale == L"ja-JP") return L"日本語";
     if (locale == L"de-DE") return L"Deutsch";
@@ -632,7 +774,7 @@ std::wstring Localization::DisplayName(std::wstring_view locale) {
 
 bool Localization::RunSelfTest() {
     Localization localization;
-    localization.english_ = BuiltInEnglish();
+    localization.english_ = CompleteEnglishResources();
     localization.active_ = localization.english_;
     const auto parsed = ParseStringMap(
         "{\"text\":\"Fran\\u00e7ais \\u00fc \\u65e5\\u672c\\u8a9e\"}");
@@ -642,16 +784,49 @@ bool Localization::RunSelfTest() {
             L"Current language: English" &&
         localization.Text("missing.key") == L"missing.key" &&
         DisplayName(L"zh-CN") == L"简体中文" &&
+        DisplayName(L"zh-TW") == L"繁體中文" &&
         ResolveRequestedLanguage(L"zh-SG") == L"zh-CN" &&
+        ResolveRequestedLanguage(L"zh-TW") == L"zh-TW" &&
+        ResolveRequestedLanguage(L"zh-HK") == L"zh-TW" &&
         ResolveRequestedLanguage(L"en-GB") == L"en-US" &&
-        ResolveRequestedLanguage(L"zh-Hant") == L"en-US" &&
+        ResolveRequestedLanguage(L"zh-Hant") == L"zh-TW" &&
         ResolveRequestedLanguage(L"ja-JP") == L"ja-JP" &&
         ResolveRequestedLanguage(L"de-AT") == L"de-DE" &&
         ResolveRequestedLanguage(L"es-MX") == L"es-ES" &&
         ResolveRequestedLanguage(L"fr-CA") == L"fr-FR" &&
+        ResourceText(L"unsupported-locale", "toolbar.create_core") ==
+            L"Create Core" &&
         parsed.has_value() && parsed->at("text") == L"Français ü 日本語" &&
         ValidateLocaleFiles() &&
         ValidateSettingsLayoutAtSupportedDpis();
+}
+
+std::wstring Localization::ResourceText(std::wstring_view locale,
+                                        std::string_view key) {
+    const std::wstring canonical = CanonicalLocale(locale);
+    if (const auto pack = LoadLocaleFile(canonical); pack.has_value()) {
+        const auto found = pack->find(std::string(key));
+        if (found != pack->end()) return found->second;
+    }
+    const auto english = CompleteEnglishResources();
+    if (const auto fallback = english.find(std::string(key));
+        fallback != english.end()) {
+        return fallback->second;
+    }
+    return std::wstring(key.begin(), key.end());
+}
+
+bool Localization::SetInitialLanguageIfUnset(std::wstring_view locale) {
+    if (!IsSupportedLocale(locale)) return false;
+    std::error_code error;
+    if (std::filesystem::exists(PreferencesPath(), error) || error) {
+        return !error;
+    }
+    preferences_.languageMode = LanguageMode::Explicit;
+    preferences_.preferredLanguage = CanonicalLocale(locale);
+    if (!SavePreferences()) return false;
+    ResolveAndLoadLanguage();
+    return true;
 }
 
 } // namespace gravity::i18n

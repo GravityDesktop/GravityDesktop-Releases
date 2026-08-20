@@ -280,8 +280,12 @@ std::filesystem::path RunningLibraryPath() {
     if (written != 0 && written < buffer.size()) {
         buffer.resize(written);
         const std::filesystem::path executable(buffer);
-        // A durable copy lives in <library>\\恢复工具\\GravityDesktopRecovery.exe.
-        if (executable.parent_path().filename() == L"恢复工具") {
+        // A durable copy lives in <library>\\Recovery Tools\\GravityDesktopRecovery.exe.
+        // Accept the prior Chinese folder name only to keep an already
+        // installed recovery shortcut operational; new installations never
+        // create it.
+        if (executable.parent_path().filename() == L"Recovery Tools" ||
+            executable.parent_path().filename() == L"恢复工具") {
             return executable.parent_path().parent_path();
         }
     }
@@ -466,7 +470,8 @@ std::map<std::wstring, PreviousRecoveryEntry> ReadPreviousRecoveryJournal(
 
 std::filesystem::path AvailableRestoreDestination(
     const std::filesystem::path& desktop, const std::filesystem::path& name,
-    const std::set<std::wstring>& reservedDestinations) {
+    const std::set<std::wstring>& reservedDestinations,
+    const gravity::i18n::Localization* localization = nullptr) {
     const std::filesystem::path requested = desktop / name.filename();
     if (!FileExists(requested) &&
         !reservedDestinations.contains(NormalizePath(requested.wstring()))) {
@@ -475,9 +480,13 @@ std::filesystem::path AvailableRestoreDestination(
     const std::wstring stem = name.stem().wstring();
     const std::wstring extension = name.extension().wstring();
     for (int index = 2; index <= 9999; ++index) {
+        const std::wstring suffix = localization == nullptr
+            ? L" (Gravity Desktop Recovery " + std::to_wstring(index) + L")"
+            : localization->Format(
+                "recovery.conflict_suffix",
+                {{L"index", std::to_wstring(index)}});
         const std::filesystem::path candidate = desktop /
-            (stem + L"（引力桌面恢复 " + std::to_wstring(index) + L"）" +
-             extension);
+            (stem + suffix + extension);
         if (!FileExists(candidate) &&
             !reservedDestinations.contains(NormalizePath(candidate.wstring()))) {
             return candidate;
@@ -519,7 +528,22 @@ bool WriteManagedManifest(const std::filesystem::path& library,
                << ",\"storage_mode\":\"managed\"}";
     }
     output << "]}]}\n";
-    return WriteUtf8Atomic(library / L"恢复清单.json", output.str());
+    return WriteUtf8Atomic(library / L"recovery-manifest.json", output.str());
+}
+
+std::filesystem::path RecoveryManifestPath(const std::filesystem::path& library) {
+    const std::filesystem::path current = library / L"recovery-manifest.json";
+    if (FileExists(current)) return current;
+    const std::filesystem::path legacy = library / L"恢复清单.json";
+    return FileExists(legacy) ? legacy : current;
+}
+
+std::filesystem::path RecoveryJournalPath(const std::filesystem::path& library) {
+    const std::filesystem::path current = library / L"recovery-transaction.json";
+    if (FileExists(current)) return current;
+    const std::filesystem::path legacy = library / L"恢复事务.json";
+    // An interrupted legacy recovery must keep using its existing journal.
+    return FileExists(legacy) ? legacy : current;
 }
 
 std::string BuildJournal(const std::vector<std::tuple<ManagedEntry,
@@ -568,7 +592,7 @@ bool RunRecovery(const std::filesystem::path& library,
         !ValidateRecoverySelfTestPath(options.desktopTarget)) {
         return false;
     }
-    const std::filesystem::path manifest = library / L"恢复清单.json";
+    const std::filesystem::path manifest = RecoveryManifestPath(library);
     std::vector<ManagedEntry> entries;
     if (!ReadManagedEntries(manifest, entries)) {
         if (options.interactive) {
@@ -593,7 +617,7 @@ bool RunRecovery(const std::filesystem::path& library,
                                      MB_OK | MB_ICONERROR);
         return false;
     }
-    const std::filesystem::path journalPath = library / L"恢复事务.json";
+    const std::filesystem::path journalPath = RecoveryJournalPath(library);
     const auto previous = ReadPreviousRecoveryJournal(journalPath);
     int pendingEntryCount = 0;
     for (const ManagedEntry& entry : entries) {
@@ -657,7 +681,7 @@ bool RunRecovery(const std::filesystem::path& library,
             destination = AvailableRestoreDestination(
                 options.desktopTarget,
                 original.empty() ? source.filename() : original.filename(),
-                reservedDestinations);
+                reservedDestinations, &localization);
         }
         if (destination.empty()) {
             ++result.conflicts;
@@ -704,8 +728,10 @@ bool RunRecovery(const std::filesystem::path& library,
     if (options.writeReport || options.interactive) {
         const auto now = std::chrono::system_clock::to_time_t(
             std::chrono::system_clock::now());
-        const std::filesystem::path report = library / L"恢复报告" /
-            (L"恢复结果-" +
+        // A report is a historical audit record. Localize its name when it is
+        // created, but never rename older reports after a language change.
+        const std::filesystem::path report = library / L"Recovery Reports" /
+            (localization.Text("recovery.report_prefix") + L"-" +
              std::to_wstring(static_cast<long long>(now)) + L".txt");
         const std::wstring summary = ResultText(localization, result);
         if (options.writeReport) (void)WriteUtf8Atomic(report, WideToUtf8(summary));
@@ -779,7 +805,8 @@ bool RemoveRecoveryIsolationRoot(const std::filesystem::path& root) {
 bool JournalContainsState(const std::filesystem::path& library,
                           const std::filesystem::path& source,
                           const std::wstring& expectedState) {
-    const auto entries = ReadPreviousRecoveryJournal(library / L"恢复事务.json");
+    const auto entries = ReadPreviousRecoveryJournal(
+        RecoveryJournalPath(library));
     const auto found = entries.find(NormalizePath(source));
     return found != entries.end() && found->second.state == expectedState;
 }
@@ -858,7 +885,8 @@ bool RunRecoveryIsolationSelfTest() {
              FileExists(conflictDestination) &&
              ReadUtf8File(conflictDestination) == conflictExistingContents &&
              !FileExists(conflictSource);
-    const auto conflictJournal = ReadPreviousRecoveryJournal(library / L"恢复事务.json");
+    const auto conflictJournal = ReadPreviousRecoveryJournal(
+        RecoveryJournalPath(library));
     const auto conflictEntry = conflictJournal.find(NormalizePath(conflictSource));
     passed = passed && conflictEntry != conflictJournal.end() &&
              conflictEntry->second.destination != conflictDestination &&

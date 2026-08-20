@@ -1,5 +1,6 @@
 #include <windows.h>
 #include <windowsx.h>
+#include <bcrypt.h>
 #include <commctrl.h>
 #include <commoncontrols.h>
 #include <commdlg.h>
@@ -68,6 +69,7 @@
 #pragma comment(lib, "comdlg32.lib")
 #pragma comment(lib, "comctl32.lib")
 #pragma comment(lib, "windowsapp.lib")
+#pragma comment(lib, "bcrypt.lib")
 
 using Microsoft::WRL::ComPtr;
 
@@ -84,7 +86,10 @@ constexpr wchar_t kSettingsContentWindowClass[] =
     L"GravityDesktop.SettingsContent";
 constexpr wchar_t kShellLifecycleWindowClass[] =
     L"GravityDesktop.ShellLifecycle";
-constexpr wchar_t kWindowTitle[] = L"引力桌面系统";
+// Window titles are process metadata rather than workspace content. Keep the
+// product brand neutral so an English or non-Chinese desktop never receives a
+// Chinese title before the localization service has loaded.
+constexpr wchar_t kWindowTitle[] = L"Gravity Desktop";
 constexpr std::uint64_t kUnclassifiedCoreId = 1;
 constexpr int kCoreFileCapacity = 18;
 constexpr int kPriorityPlacementSlots = 19;
@@ -113,11 +118,49 @@ constexpr UINT_PTR kRelationshipManifestRetryTimer = 16;
 constexpr UINT_PTR kWorkspaceChromeAutoHideTimer = 17;
 constexpr UINT_PTR kWorkspaceChromeRevealWatchTimer = 18;
 constexpr UINT_PTR kDesktopPointerRecoveryTimer = 19;
+constexpr UINT_PTR kCoreEventTimer = 20;
+constexpr UINT kCoreEventFrameIntervalMs = 33;
 
 // The in-process self-test creates many synthetic state files.  It must never
 // write the durable Documents recovery mirror used by a real workspace.
 bool gRunningSelfTest = false;
 bool gSelfTestPathViolation = false;
+thread_local const gravity::i18n::Localization* gVisibleTextLocalization =
+    nullptr;
+
+BOOL WINAPI GravityLocalizedAppendMenuW(HMENU menu, UINT flags,
+                                        UINT_PTR command,
+                                        LPCWSTR text) {
+    std::wstring translated;
+    if ((flags & MF_STRING) != 0 && text != nullptr &&
+        gVisibleTextLocalization != nullptr) {
+        translated = gVisibleTextLocalization->LocalizeLegacyText(text);
+        text = translated.c_str();
+    }
+    return ::AppendMenuW(menu, flags, command, text);
+}
+
+int WINAPI GravityLocalizedMessageBoxW(HWND parent, LPCWSTR text,
+                                       LPCWSTR caption, UINT type) {
+    std::wstring translatedText;
+    std::wstring translatedCaption;
+    if (gVisibleTextLocalization != nullptr) {
+        if (text != nullptr) {
+            translatedText = gVisibleTextLocalization->LocalizeLegacyText(text);
+            text = translatedText.c_str();
+        }
+        if (caption != nullptr) {
+            translatedCaption =
+                gVisibleTextLocalization->LocalizeLegacyText(caption);
+            caption = translatedCaption.c_str();
+        }
+    }
+    return ::MessageBoxW(parent, text, caption, type);
+}
+
+#define AppendMenuW GravityLocalizedAppendMenuW
+#define MessageBoxW GravityLocalizedMessageBoxW
+
 bool ValidateSelfTestPath(const std::filesystem::path& candidate);
 struct SelfTestModeScope {
     SelfTestModeScope() : previous(gRunningSelfTest) { gRunningSelfTest = true; }
@@ -147,6 +190,30 @@ constexpr float kCollisionSpatialCellDip = 128.0f;
 constexpr std::uintmax_t kRuntimeDiagnosticLogMaximumBytes =
     2U * 1024U * 1024U;
 constexpr int kRuntimeDiagnosticLogFileCount = 5;
+
+// A short-lived visual acknowledgement of an already completed core
+// operation.  This deliberately contains only screen-space drawing data: it
+// is never serialized and cannot influence positions, hit testing, undo or
+// the relationship model.
+enum class CoreEventEffectType {
+    Prepare,
+    Add,
+    Release,
+    Reject,
+};
+
+struct CoreEventEffect {
+    CoreEventEffectType type = CoreEventEffectType::Add;
+    std::uint64_t coreId = 0;
+    std::uint64_t itemId = 0;
+    D2D1_POINT_2F coreCenter = D2D1::Point2F();
+    float coreRadius = 0.0f;
+    UINT32 coreColor = 0x4A90E2;
+    float strength = 1.0f;
+    std::chrono::steady_clock::time_point started =
+        std::chrono::steady_clock::now();
+    float durationMilliseconds = 0.0f;
+};
 
 struct CollisionFootprintRecord {
     std::uint64_t coreId = 0;
@@ -2682,6 +2749,67 @@ bool FilesHaveSameContents(const std::filesystem::path& first,
     return firstStream.eof() && secondStream.eof();
 }
 
+std::optional<std::array<std::uint8_t, 32>> Sha256File(
+    const std::filesystem::path& path) {
+    BCRYPT_ALG_HANDLE algorithm = nullptr;
+    BCRYPT_HASH_HANDLE hash = nullptr;
+    DWORD objectLength = 0;
+    DWORD hashLength = 0;
+    DWORD received = 0;
+    if (!BCRYPT_SUCCESS(BCryptOpenAlgorithmProvider(
+            &algorithm, BCRYPT_SHA256_ALGORITHM, nullptr, 0)) ||
+        !BCRYPT_SUCCESS(BCryptGetProperty(
+            algorithm, BCRYPT_OBJECT_LENGTH,
+            reinterpret_cast<PUCHAR>(&objectLength), sizeof(objectLength),
+            &received, 0)) ||
+        !BCRYPT_SUCCESS(BCryptGetProperty(
+            algorithm, BCRYPT_HASH_LENGTH,
+            reinterpret_cast<PUCHAR>(&hashLength), sizeof(hashLength),
+            &received, 0)) ||
+        hashLength != 32) {
+        if (algorithm != nullptr) BCryptCloseAlgorithmProvider(algorithm, 0);
+        return std::nullopt;
+    }
+    std::vector<UCHAR> object(objectLength);
+    std::array<std::uint8_t, 32> digest{};
+    if (!BCRYPT_SUCCESS(BCryptCreateHash(
+            algorithm, &hash, object.data(),
+            static_cast<ULONG>(object.size()), nullptr, 0, 0))) {
+        BCryptCloseAlgorithmProvider(algorithm, 0);
+        return std::nullopt;
+    }
+    std::ifstream input(path, std::ios::binary);
+    std::array<char, 64 * 1024> buffer{};
+    bool succeeded = static_cast<bool>(input);
+    while (succeeded && input) {
+        input.read(buffer.data(), buffer.size());
+        const std::streamsize count = input.gcount();
+        if (count > 0 && !BCRYPT_SUCCESS(BCryptHashData(
+                hash, reinterpret_cast<PUCHAR>(buffer.data()),
+                static_cast<ULONG>(count), 0))) {
+            succeeded = false;
+        }
+    }
+    if (succeeded && input.bad()) succeeded = false;
+    if (succeeded && !BCRYPT_SUCCESS(BCryptFinishHash(
+            hash, digest.data(), static_cast<ULONG>(digest.size()), 0))) {
+        succeeded = false;
+    }
+    BCryptDestroyHash(hash);
+    BCryptCloseAlgorithmProvider(algorithm, 0);
+    if (!succeeded) return std::nullopt;
+    return digest;
+}
+
+std::string Sha256Hex(const std::array<std::uint8_t, 32>& digest) {
+    std::ostringstream output;
+    output << std::hex << std::setfill('0');
+    for (const std::uint8_t byte : digest) {
+        output << std::setw(2) << static_cast<unsigned int>(byte);
+    }
+    return output.str();
+}
+
 bool CopyFileAtomicallyIfChanged(const std::filesystem::path& source,
                                  const std::filesystem::path& target) {
     if (FilesHaveSameContents(source, target)) return true;
@@ -3235,6 +3363,95 @@ std::string SerializeState(const WorkspaceState& state) {
     }
     output << "]\n}\n";
     return output.str();
+}
+
+std::string SerializeWorkspaceBackup(const WorkspaceState& state) {
+    const std::string serializedState = SerializeState(state);
+    if (!serializedState.starts_with("{\n")) {
+        return serializedState;
+    }
+
+    std::size_t fileCount = 0;
+    std::size_t managedCount = 0;
+    std::size_t referenceCount = 0;
+    for (const Core& core : state.cores) {
+        fileCount += core.files.size();
+        for (const FileItem& item : core.files) {
+            if (item.storageMode == FileStorageMode::Managed) {
+                ++managedCount;
+            } else {
+                ++referenceCount;
+            }
+        }
+    }
+
+    // A workspace backup is the complete state model plus an explicit manual
+    // backup identity. DeserializeState deliberately ignores these additional
+    // metadata members, so the proven state parser remains the only parser for
+    // both current and legacy full-workspace files.
+    std::ostringstream output;
+    output.imbue(std::locale::classic());
+    output << "{\n"
+           << "  \"kind\": \"gravity_desktop_workspace_backup\",\n"
+           << "  \"backup_format_version\": 1,\n"
+           << "  \"application_version\": \""
+           << GRAVITY_DESKTOP_VERSION_STRING << "\",\n"
+           << "  \"created_at\": " << UnixTimeNow() << ",\n"
+           << "  \"summary\": {\"core_count\": " << state.cores.size()
+           << ", \"file_count\": " << fileCount
+           << ", \"managed_count\": " << managedCount
+           << ", \"reference_count\": " << referenceCount << "},\n"
+           << serializedState.substr(2);
+    return output.str();
+}
+
+enum class WorkspaceBackupDocumentKind {
+    Invalid,
+    Unified,
+    LegacyFull,
+    LegacyLayout,
+    UnsupportedUnifiedVersion,
+};
+
+WorkspaceBackupDocumentKind InspectWorkspaceBackupDocument(
+    const std::string& json) {
+    JsonValue rootValue;
+    JsonParser parser(json);
+    if (!parser.Parse(rootValue)) {
+        return WorkspaceBackupDocumentKind::Invalid;
+    }
+    const JsonValue::Object* root = rootValue.AsObject();
+    if (root == nullptr) {
+        return WorkspaceBackupDocumentKind::Invalid;
+    }
+    const std::wstring kind = StringMember(*root, "kind", L"");
+    if (kind == L"gravity_desktop_layout_snapshot") {
+        return WorkspaceBackupDocumentKind::LegacyLayout;
+    }
+    if (kind == L"gravity_desktop_workspace_backup") {
+        if (static_cast<int>(NumberMember(
+                *root, "backup_format_version", 0.0)) != 1) {
+            return WorkspaceBackupDocumentKind::UnsupportedUnifiedVersion;
+        }
+    }
+    // Old full-workspace exports were the state document itself and did not
+    // carry a kind field. Unknown explicit kinds must not be interpreted as a
+    // legacy backup.
+    if (!kind.empty() &&
+        kind != L"gravity_desktop_workspace_backup") {
+        return WorkspaceBackupDocumentKind::Invalid;
+    }
+    const JsonValue* coresValue = FindMember(*root, "cores");
+    const bool hasStateShape =
+        coresValue != nullptr && coresValue->AsArray() != nullptr &&
+        (NumberMember(*root, "schemaVersion", 0.0) > 0.0 ||
+         NumberMember(*root, "schema_version", 0.0) > 0.0 ||
+         NumberMember(*root, "version", 0.0) > 0.0);
+    if (!hasStateShape) {
+        return WorkspaceBackupDocumentKind::Invalid;
+    }
+    return kind.empty() ? WorkspaceBackupDocumentKind::LegacyFull
+                        : WorkspaceBackupDocumentKind::Unified;
 }
 
 std::string SerializeLayoutSnapshot(const WorkspaceState& state) {
@@ -5071,12 +5288,15 @@ bool IconFullyOutsideViewport(D2D1_POINT_2F screen, float iconHalf,
 class GravityApp {
 public:
     explicit GravityApp(bool benchmarkMode = false,
-                        bool autoStartMode = false)
+                        bool autoStartMode = false,
+                        std::wstring initialLanguageOverride = {})
         : diagnosticSessionId_(CreateRuntimeDiagnosticSessionId()),
-          benchmarkMode_(benchmarkMode), autoStartMode_(autoStartMode) {}
+          benchmarkMode_(benchmarkMode), autoStartMode_(autoStartMode),
+          initialLanguageOverride_(std::move(initialLanguageOverride)) {}
 
     friend bool RunSelfTest();
     friend bool RunWorkspaceRecoveryMirrorSelfTest();
+    friend bool RunRecoveryShortcutMigrationSelfTest();
 
     void AttachWindow(HWND window) { window_ = window; }
     void AttachInteractionWindow(HWND window) {
@@ -5134,10 +5354,36 @@ public:
         return stateFile_.parent_path() / L"relationships.json";
     }
 
+    static std::filesystem::path RecoveryManifestPath(
+        const std::filesystem::path& library) {
+        return library / L"recovery-manifest.json";
+    }
+
+    static std::filesystem::path LegacyRecoveryManifestPath(
+        const std::filesystem::path& library) {
+        return library / L"恢复清单.json";
+    }
+
+    static std::filesystem::path RecoveryJournalPath(
+        const std::filesystem::path& library) {
+        const std::filesystem::path current =
+            library / L"recovery-transaction.json";
+        if (FilePathExists(current.wstring())) return current;
+        const std::filesystem::path legacy = library / L"恢复事务.json";
+        return FilePathExists(legacy.wstring()) ? legacy : current;
+    }
+
     std::filesystem::path WorkspaceRecoveryMirrorPath() const {
         // This bootstrap location deliberately never follows a user-selected
         // managed-library path.  After MSIX uninstall we must be able to find
         // the mirror before recovering that setting from the mirror itself.
+        const std::filesystem::path root = workspaceRecoveryRootOverride_.empty()
+            ? DefaultManagedLibraryPath()
+            : workspaceRecoveryRootOverride_;
+        return root / L"Workspace Recovery" / L"workspace-recovery.json";
+    }
+
+    std::filesystem::path LegacyWorkspaceRecoveryMirrorPath() const {
         const std::filesystem::path root = workspaceRecoveryRootOverride_.empty()
             ? DefaultManagedLibraryPath()
             : workspaceRecoveryRootOverride_;
@@ -5156,8 +5402,13 @@ public:
         WorkspaceRecoveryMirror& mirror,
         std::filesystem::path* sourcePath = nullptr) const {
         const std::filesystem::path primary = WorkspaceRecoveryMirrorPath();
-        const std::array<std::filesystem::path, 2> candidates{
-            primary, std::filesystem::path(primary.wstring() + L".bak")};
+        const std::filesystem::path legacy = LegacyWorkspaceRecoveryMirrorPath();
+        // Never rename an existing recovery mirror just because the UI
+        // language changed. Read both locations, choose the newest valid copy,
+        // then write future snapshots only to the neutral path.
+        const std::array<std::filesystem::path, 4> candidates{
+            primary, std::filesystem::path(primary.wstring() + L".bak"),
+            legacy, std::filesystem::path(legacy.wstring() + L".bak")};
         bool found = false;
         WorkspaceRecoveryMirror best;
         std::filesystem::path bestPath;
@@ -5359,7 +5610,7 @@ public:
         const std::filesystem::path recoveryLibrary =
             std::filesystem::path(safeSnapshot.managedLibraryPath);
         const std::filesystem::path recoveryManifest =
-            recoveryLibrary / L"恢复清单.json";
+            RecoveryManifestPath(recoveryLibrary);
         const bool recoverySaved =
             WriteUtf8AtomicIfChanged(recoveryManifest, serialized);
         if (!recoverySaved) {
@@ -5390,8 +5641,10 @@ public:
                     kRelationshipManifestRetryDelaysMs.size()) {
                 AppendRuntimeDiagnostic(
                     "relationship_manifest_retry_exhausted");
-                SetStatus(
-                    L"恢复清单尚未同步；真实文件仍安全保留在文件库中");
+                // A legacy emergency manifest sync issue must remain in the
+                // diagnostic log, but it is not a desktop-operation result.
+                // Do not repeatedly interrupt normal work with a transient
+                // banner; recovery validates its own inputs when invoked.
             }
             return;
         }
@@ -5494,14 +5747,18 @@ public:
         }
         const std::filesystem::path local = RelationshipManifestPath();
         const std::filesystem::path external =
-            ManagedLibraryPath() / L"恢复清单.json";
-        const std::array<std::filesystem::path, 4> candidates{
+            RecoveryManifestPath(ManagedLibraryPath());
+        const std::filesystem::path legacyExternal =
+            LegacyRecoveryManifestPath(ManagedLibraryPath());
+        const std::array<std::filesystem::path, 6> candidates{
             local,
             external,
             local.empty()
                 ? std::filesystem::path{}
                 : std::filesystem::path(local.wstring() + L".bak"),
-            std::filesystem::path(external.wstring() + L".bak")};
+            std::filesystem::path(external.wstring() + L".bak"),
+            legacyExternal,
+            std::filesystem::path(legacyExternal.wstring() + L".bak")};
         for (std::size_t index = 0; index < candidates.size(); ++index) {
             if (candidates[index].empty()) continue;
             const std::optional<std::string> text =
@@ -5865,6 +6122,7 @@ public:
         if (failOpenActive_ || shuttingDown_ || exitRequested_) return;
         failOpenActive_ = true;
         workspaceVisible_ = false;
+        ClearCoreEventEffects();
         desktopReconnectPending_ = false;
         desktopReconnectAttempts_ = 0;
         if (lifecycleWindow_ != nullptr) {
@@ -5902,7 +6160,7 @@ public:
 
     void ReconcileCompletedEmergencyRecovery() {
         const std::filesystem::path journalPath =
-            ManagedLibraryPath() / L"恢复事务.json";
+            RecoveryJournalPath(ManagedLibraryPath());
         const std::optional<std::string> text = ReadUtf8File(journalPath);
         if (!text.has_value()) return;
 
@@ -6037,6 +6295,11 @@ public:
     bool Initialize(HWND window) {
         window_ = window;
         localization_.Load();
+        gVisibleTextLocalization = &localization_;
+        if (!initialLanguageOverride_.empty() &&
+            !localization_.SetInitialLanguageIfUnset(initialLanguageOverride_)) {
+            AppendRuntimeDiagnostic("installer_initial_language_save_failed");
+        }
         // An older MSIX prototype could leave a second HKCU Run entry behind.
         // A packaged launch is allowed to remove only that verified legacy
         // entry; the current package itself is represented solely by its
@@ -6073,7 +6336,8 @@ public:
             RecoverPendingManagedBatchTransaction();
             RecoverPendingCoreDissolveTransaction();
             ReconcileCompletedEmergencyRecovery();
-            MigrateLegacyManagedLibraryItems();
+            // Historical managed paths remain read-compatible.  Startup and
+            // language changes must never reorganize real user files.
             LoadCoreShortLabelOverrides();
             DiscoverWorkspaceRecoveryMirror();
             PromptWorkspaceRecoveryIfNeeded();
@@ -6089,7 +6353,7 @@ public:
             if (!stateRecoveryBlocked_ &&
                 !WriteWorkspaceRecoveryMirror(state_)) {
                 AppendRuntimeDiagnostic("workspace_recovery_mirror_initial_sync_failed");
-                SetStatus(L"工作关系恢复镜像尚未同步；当前状态仍保持在本机。请检查文件库写入权限。");
+                SetStatus(T("status.workspace_mirror_sync_failed"));
             }
             if (!stateRecoveryBlocked_ &&
                 !preserveHistoricalRecoveryEvidence_) {
@@ -7928,6 +8192,13 @@ private:
     }
 
     void ResetDestroyedDesktopSurfaces() {
+        // Event effects capture screen-space snapshots. They must never be
+        // replayed against a newly created Explorer surface.
+        if ((window_ != nullptr && IsWindow(window_) == FALSE) ||
+            (interactionWindow_ != nullptr &&
+             IsWindow(interactionWindow_) == FALSE)) {
+            ClearCoreEventEffects();
+        }
         if (dividerHandleWindow_ != nullptr &&
             IsWindow(dividerHandleWindow_) == FALSE) {
             DestroyDividerTooltip();
@@ -7990,6 +8261,7 @@ private:
         selectionDismissTimerActive_ = false;
         SyncSelectionDismissTimer();
         SyncCoreSelectionRippleTimer();
+        ClearCoreEventEffects();
         if (FocusAnimationActive() ||
             !coreExpansionFrom_.empty() ||
             WorkspaceChromeSlideAnimationActive()) {
@@ -8225,6 +8497,7 @@ private:
     }
 
     void ToggleFullScreenWorkMode() {
+        ClearCoreEventEffects();
         if (state_.fullScreenWorkMode) {
             state_.fullScreenViewOffset = state_.viewOffset;
             state_.fullScreenWorkMode = false;
@@ -8246,6 +8519,7 @@ private:
 
     void SetWorkspaceCollapsed(bool collapsed) {
         if (state_.workspaceCollapsed == collapsed) return;
+        ClearCoreEventEffects();
         state_.workspaceCollapsed = collapsed;
         if (!collapsed) state_.workspacePaused = false;
         ApplyCompanionWorkspaceFrame();
@@ -8329,11 +8603,13 @@ private:
                 IsWindow(window_) == FALSE) {
                 workspaceVisible_ = false;
                 StopSelectionDismissTimer();
+                ClearCoreEventEffects();
                 return;
             }
             if (SaveState()) {
                 workspaceVisible_ = false;
                 StopSelectionDismissTimer();
+                ClearCoreEventEffects();
                 OnPointerLeave(pointerLeaveTrackingWindow_);
                 hidingToTray_ = true;
                 if (interactionWindow_ != nullptr) {
@@ -8413,6 +8689,7 @@ private:
         if (state_.workspacePaused) {
             workspaceVisible_ = false;
             StopSelectionDismissTimer();
+            ClearCoreEventEffects();
             OnPointerLeave(pointerLeaveTrackingWindow_);
             hidingToTray_ = true;
             if (interactionWindow_ != nullptr) {
@@ -9169,7 +9446,12 @@ private:
     }
 
     int EffectiveDisplayLimit(const Core& core) const {
-        if (!core.expanded && focusedCoreId_ != core.id) {
+        // Keep the existing layout entries alive while a collapse animation
+        // draws them back into the core.  Without this exception, the layout
+        // rebuild immediately produces zero entries as soon as `expanded`
+        // flips false, so the close animation has nothing left to render.
+        if (!core.expanded && focusedCoreId_ != core.id &&
+            !CoreExpansionAnimationActive(core.id)) {
             return 0;
         }
         const bool focused = focusedCoreId_ == core.id;
@@ -11098,103 +11380,11 @@ private:
                       renderedMainCount
                 : 0;
             hidden = std::max(hidden, rejected);
-            if (hidden > 0) {
-                const D2D1_POINT_2F center =
-                    WorldToScreen(DisplayCoreWorld(*core));
-                const float coreHalf =
-                    metrics_.coreSize * state_.zoom *
-                    CoreFormalLayoutScale(*core) /
-                    2.0f;
-                const float halfWidth = 56.0f;
-                const float halfHeight = 14.0f;
-                const std::array<D2D1_POINT_2F, 4> controlCandidates{
-                    D2D1::Point2F(
-                        center.x,
-                        center.y + coreHalf +
-                            metrics_.coreFontSize + 34.0f),
-                    D2D1::Point2F(
-                        center.x,
-                        center.y - coreHalf - 24.0f),
-                    D2D1::Point2F(
-                        center.x + coreHalf + halfWidth + 12.0f,
-                        center.y),
-                    D2D1::Point2F(
-                        center.x - coreHalf - halfWidth - 12.0f,
-                        center.y)};
-                D2D1_POINT_2F moreScreen = controlCandidates[0];
-                D2D1_RECT_F moreBounds = D2D1::RectF();
-                bool foundControlPosition = false;
-                for (const D2D1_POINT_2F candidate : controlCandidates) {
-                    const D2D1_RECT_F bounds = D2D1::RectF(
-                        candidate.x - halfWidth,
-                        candidate.y - halfHeight,
-                        candidate.x + halfWidth,
-                        candidate.y + halfHeight);
-                    constexpr float margin = 8.0f;
-                    if (bounds.left < margin ||
-                        bounds.top < margin ||
-                        bounds.right > client.width - margin ||
-                        bounds.bottom > client.height - margin) {
-                        continue;
-                    }
-                    const bool fileCollision = std::any_of(
-                        occupied.begin(), occupied.end(),
-                        [&bounds](const D2D1_RECT_F& existing) {
-                            return RectanglesIntersect(
-                                InflateRectangle(bounds, 4.0f),
-                                InflateRectangle(existing, 4.0f));
-                        });
-                    const bool clusterCollision = std::any_of(
-                        globalFootprints.begin(),
-                        globalFootprints.end(),
-                        [core, &bounds](const auto& existing) {
-                            return existing.first != core->id &&
-                                   RectanglesIntersect(
-                                       InflateRectangle(bounds, 8.0f),
-                                       InflateRectangle(
-                                           existing.second, 8.0f));
-                        });
-                    if (!fileCollision && !clusterCollision) {
-                        moreScreen = candidate;
-                        moreBounds = bounds;
-                        foundControlPosition = true;
-                        break;
-                    }
-                }
-                if (!foundControlPosition) {
-                    moreScreen.x = std::clamp(
-                        controlCandidates[0].x,
-                        halfWidth + 8.0f,
-                        std::max(
-                            halfWidth + 8.0f,
-                            client.width -
-                                halfWidth - 8.0f));
-                    moreScreen.y = std::clamp(
-                        controlCandidates[0].y,
-                        halfHeight + 8.0f,
-                        std::max(
-                            halfHeight + 8.0f,
-                            client.height -
-                                halfHeight - 8.0f));
-                    moreBounds = D2D1::RectF(
-                        moreScreen.x - halfWidth,
-                        moreScreen.y - halfHeight,
-                        moreScreen.x + halfWidth,
-                        moreScreen.y + halfHeight);
-                    foundControlPosition = true;
-                }
-                if (foundControlPosition) {
-                    occupied.push_back(moreBounds);
-                    addGlobalFootprint(core->id, moreBounds);
-                    ItemLayout more{
-                        nullptr, ScreenToWorld(moreScreen),
-                        D2D1::RectF(), false, true, hidden};
-                    more.ring = -1;
-                    more.focusOnly = focusedCoreId_ == core->id;
-                    layoutCache_[core->id].push_back(
-                        std::move(more));
-                }
-            }
+            // Overflow is handled by the current core layout and its existing
+            // expand/menu actions. Do not add a transient "hidden files"
+            // pseudo-node: it duplicates the capacity count and distracts
+            // from the actual file nodes.
+            (void)hidden;
 
             std::stable_sort(
                 layoutCache_[core->id].begin(), layoutCache_[core->id].end(),
@@ -11485,13 +11675,198 @@ private:
         return SelectedCoreForVisualEffect() == coreId;
     }
 
+    float CoreEventDurationMilliseconds(CoreEventEffectType type) const {
+        switch (EffectiveAnimationMode()) {
+        case AnimationMode::Off:
+            // "Off" still gets one static acknowledgement frame.  It does
+            // not animate geometry and lives for only a short one-shot hold.
+            return 150.0f;
+        case AnimationMode::Simple:
+            switch (type) {
+            case CoreEventEffectType::Prepare: return 190.0f;
+            case CoreEventEffectType::Add: return 360.0f;
+            case CoreEventEffectType::Release: return 330.0f;
+            case CoreEventEffectType::Reject: return 300.0f;
+            }
+            break;
+        case AnimationMode::Soft:
+            switch (type) {
+            case CoreEventEffectType::Prepare: return 310.0f;
+            case CoreEventEffectType::Add: return 780.0f;
+            case CoreEventEffectType::Release: return 650.0f;
+            case CoreEventEffectType::Reject: return 370.0f;
+            }
+            break;
+        case AnimationMode::Standard:
+        default:
+            switch (type) {
+            case CoreEventEffectType::Prepare: return 250.0f;
+            case CoreEventEffectType::Add: return 620.0f;
+            case CoreEventEffectType::Release: return 500.0f;
+            case CoreEventEffectType::Reject: return 340.0f;
+            }
+            break;
+        }
+        return 0.0f;
+    }
+
+    bool CoreEventAnimationActive() const {
+        const auto now = std::chrono::steady_clock::now();
+        return std::any_of(
+            coreEventEffects_.begin(), coreEventEffects_.end(),
+            [&now](const CoreEventEffect& effect) {
+                return std::chrono::duration<float, std::milli>(
+                           now - effect.started).count() <
+                       effect.durationMilliseconds;
+            });
+    }
+
+    bool CoreEventAnimationActiveForCore(std::uint64_t coreId) const {
+        const auto now = std::chrono::steady_clock::now();
+        return std::any_of(
+            coreEventEffects_.begin(), coreEventEffects_.end(),
+            [&now, coreId](const CoreEventEffect& effect) {
+                return effect.coreId == coreId &&
+                       std::chrono::duration<float, std::milli>(
+                           now - effect.started).count() <
+                           effect.durationMilliseconds;
+            });
+    }
+
+    void PruneCompletedCoreEventEffects() {
+        const auto now = std::chrono::steady_clock::now();
+        coreEventEffects_.erase(
+            std::remove_if(
+                coreEventEffects_.begin(), coreEventEffects_.end(),
+                [&now](const CoreEventEffect& effect) {
+                    return std::chrono::duration<float, std::milli>(
+                               now - effect.started).count() >=
+                           effect.durationMilliseconds;
+                }),
+            coreEventEffects_.end());
+    }
+
+    void SyncCoreEventTimer() {
+        if (window_ == nullptr) {
+            return;
+        }
+        const bool shouldRun =
+            workspaceVisible_ && !state_.workspacePaused &&
+            !failOpenActive_ && !shuttingDown_ && !exitRequested_ &&
+            CoreEventAnimationActive();
+        if (shouldRun) {
+            SetTimer(window_, kCoreEventTimer,
+                     kCoreEventFrameIntervalMs, nullptr);
+        } else {
+            KillTimer(window_, kCoreEventTimer);
+        }
+    }
+
+    void ClearCoreEventEffects() {
+        coreEventEffects_.clear();
+        coreSelectionRippleResumeAfter_ =
+            std::chrono::steady_clock::time_point{};
+        if (window_ != nullptr) {
+            KillTimer(window_, kCoreEventTimer);
+        }
+        SyncCoreSelectionRippleTimer();
+    }
+
+    float CoreEventIntensity() const {
+        const float global = std::clamp(
+            state_.coreGlowIntensity,
+            kCoreGlowIntensityMinimum,
+            kCoreGlowIntensityMaximum);
+        if (global <= 1.0f) {
+            return 0.75f + (global - kCoreGlowIntensityMinimum) *
+                (0.25f / (1.0f - kCoreGlowIntensityMinimum));
+        }
+        return std::min(1.28f, 1.0f + (global - 1.0f) * 0.28f);
+    }
+
+    std::optional<CoreEventEffect> CaptureCoreEventEffect(
+        CoreEventEffectType type, std::uint64_t coreId,
+        std::uint64_t itemId = 0, float strength = 1.0f) {
+        const Core* core = FindCore(coreId);
+        if (core == nullptr) {
+            return std::nullopt;
+        }
+
+        CoreEventEffect effect;
+        effect.type = type;
+        effect.coreId = coreId;
+        effect.itemId = itemId;
+        effect.coreCenter = WorldToScreen(VisualCorePosition(*core));
+        effect.coreRadius = CoreScreenRadius(*core);
+        effect.coreColor = EffectiveCoreThemeColor(*core);
+        effect.strength = std::clamp(strength, 0.0f, 1.20f);
+        return effect;
+    }
+
+    void StartCoreEventEffect(CoreEventEffect effect) {
+        if (window_ == nullptr || !workspaceVisible_ ||
+            state_.workspacePaused || failOpenActive_ || shuttingDown_ ||
+            exitRequested_) {
+            return;
+        }
+        effect.started = std::chrono::steady_clock::now();
+        effect.durationMilliseconds = CoreEventDurationMilliseconds(effect.type);
+        if (effect.durationMilliseconds <= 0.0f) {
+            return;
+        }
+        PruneCompletedCoreEventEffects();
+        // A completed operation takes visual precedence over the brief
+        // receive-preview ring.  Keeping both would make a successful drop
+        // look like two independent events.
+        if (effect.type != CoreEventEffectType::Prepare) {
+            coreEventEffects_.erase(
+                std::remove_if(
+                    coreEventEffects_.begin(), coreEventEffects_.end(),
+                    [&effect](const CoreEventEffect& existing) {
+                        return existing.coreId == effect.coreId &&
+                            existing.type == CoreEventEffectType::Prepare;
+                    }),
+                coreEventEffects_.end());
+        }
+        constexpr std::size_t kCoreEventEffectLimit = 8;
+        if (coreEventEffects_.size() >= kCoreEventEffectLimit) {
+            coreEventEffects_.erase(coreEventEffects_.begin());
+        }
+        coreEventEffects_.push_back(std::move(effect));
+        if (SelectedCoreForVisualEffect() ==
+            coreEventEffects_.back().coreId) {
+            coreSelectionRippleResumeAfter_ =
+                std::chrono::steady_clock::now() +
+                std::chrono::milliseconds(static_cast<int>(
+                    coreEventEffects_.back().durationMilliseconds + 250.0f));
+            SyncCoreSelectionRippleTimer();
+        }
+        SyncCoreEventTimer();
+        Invalidate();
+    }
+
+    void TriggerCoreEvent(CoreEventEffectType type, std::uint64_t coreId,
+                          std::uint64_t itemId = 0,
+                          float strength = 1.0f) {
+        if (std::optional<CoreEventEffect> effect =
+                CaptureCoreEventEffect(type, coreId, itemId, strength);
+            effect.has_value()) {
+            StartCoreEventEffect(std::move(*effect));
+        }
+    }
+
     bool SelectionRippleShouldAnimate() const {
         const std::uint64_t selectedCoreId = SelectedCoreForVisualEffect();
         if (selectedCoreId == 0 ||
             (draggingCore_ && dragCoreId_ == selectedCoreId) ||
             state_.workspacePaused ||
             EffectiveAnimationMode() == AnimationMode::Off ||
-            state_.coreSelectionEffect == CoreSelectionEffect::Static) {
+            state_.coreSelectionEffect == CoreSelectionEffect::Static ||
+            CoreEventAnimationActiveForCore(selectedCoreId) ||
+            (coreSelectionRippleResumeAfter_ !=
+                 std::chrono::steady_clock::time_point{} &&
+             std::chrono::steady_clock::now() <
+                 coreSelectionRippleResumeAfter_)) {
             return false;
         }
         return state_.coreSelectionEffect !=
@@ -12032,10 +12407,10 @@ private:
                             AddInteractionShape(
                                 shapes,
                                 D2D1::RectF(
-                                    position.x - 56.0f,
-                                    position.y - 14.0f,
-                                    position.x + 56.0f,
-                                    position.y + 14.0f),
+                                    position.x - 27.0f,
+                                    position.y - 19.0f,
+                                    position.x + 27.0f,
+                                    position.y + 19.0f),
                                 5.0f);
                             continue;
                         }
@@ -12243,6 +12618,7 @@ private:
         if (IsFreshWorkspaceEmpty()) {
             DrawEmptyWorkspace(client);
         } else {
+            DrawCoreEventEffects();
             DrawFileLabels(layouts);
             DrawHoverTooltip(layouts);
         }
@@ -12332,11 +12708,16 @@ private:
             !pointerPending && !menuOpen && !placementMode && atEdge;
     }
 
+    bool UsesChineseLayout() const {
+        const std::wstring& locale = localization_.CurrentLocale();
+        return locale == L"zh-CN" || locale == L"zh-TW";
+    }
+
     bool WorkspaceChromeUsesCompactLabels(
         const D2D1_SIZE_F& client) const {
         // Reserve the non-Chinese strip for the longest supported localized
         // labels (not merely the currently selected language).
-        const float threshold = localization_.CurrentLocale() != L"zh-CN"
+        const float threshold = !UsesChineseLayout()
             ? 1080.0f : 700.0f;
         return client.width < threshold;
     }
@@ -12355,7 +12736,7 @@ private:
         const auto& widths =
             WorkspaceChromeUsesCompactLabels(client)
                 ? compactWidths
-                : (localization_.CurrentLocale() != L"zh-CN"
+                : (!UsesChineseLayout()
                     ? localizedWidths : regularWidths);
         constexpr float gap = 6.0f;
         float horizontalWidth = 40.0f + gap * (kWorkspaceControlCount - 1);
@@ -12365,7 +12746,7 @@ private:
         const bool vertical = WorkspaceChromeIsVertical();
         const float groupWidth = vertical
             ? (WorkspaceChromeUsesCompactLabels(client) ? 108.0f :
-                (localization_.CurrentLocale() != L"zh-CN" ? 220.0f : 164.0f))
+                (!UsesChineseLayout() ? 220.0f : 164.0f))
             : horizontalWidth;
         const float groupHeight = vertical
             ? 40.0f + (kWorkspaceControlCount - 1) * 32.0f +
@@ -12411,7 +12792,7 @@ private:
             34.0f, 142.0f, 96.0f, 176.0f,
             108.0f, 144.0f, 214.0f, 76.0f};
         const auto& widths = WorkspaceChromeUsesCompactLabels(client) ? compactWidths :
-            (localization_.CurrentLocale() != L"zh-CN"
+            (!UsesChineseLayout()
                 ? localizedWidths : regularWidths);
         constexpr float gap = 6.0f;
         const int safeIndex = std::clamp(index, 0, kWorkspaceControlCount - 1);
@@ -13013,8 +13394,10 @@ private:
     HWND CreateSettingsText(HWND parent, const wchar_t* text,
                             int x, int y, int width, int height,
                             DWORD extraStyle = SS_NOPREFIX) const {
+        const std::wstring localized =
+            localization_.LocalizeLegacyText(text == nullptr ? L"" : text);
         HWND control = CreateWindowExW(
-            0, L"STATIC", text,
+            0, L"STATIC", localized.c_str(),
             WS_CHILD | WS_VISIBLE | extraStyle,
             SettingsDipToPixels(x), SettingsDipToPixels(y),
             SettingsDipToPixels(width), SettingsDipToPixels(height),
@@ -13040,7 +13423,7 @@ private:
                     ? settingsFont_
                     : GetStockObject(DEFAULT_GUI_FONT));
         RECT bounds{0, 0, SettingsDipToPixels(widthDip), 0};
-        std::wstring value(text);
+        std::wstring value = localization_.LocalizeLegacyText(text);
         DrawTextW(dc, value.c_str(), static_cast<int>(value.size()), &bounds,
             DT_CALCRECT | DT_WORDBREAK | DT_NOPREFIX | DT_EDITCONTROL);
         SelectObject(dc, oldFont);
@@ -13067,8 +13450,10 @@ private:
     HWND CreateSettingsButton(HWND parent, const wchar_t* text,
                               int x, int y, int width, int height,
                               UINT command, DWORD extraStyle = 0) const {
+        const std::wstring localized =
+            localization_.LocalizeLegacyText(text == nullptr ? L"" : text);
         HWND control = CreateWindowExW(
-            0, L"BUTTON", text,
+            0, L"BUTTON", localized.c_str(),
             WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_OWNERDRAW | extraStyle,
             SettingsDipToPixels(x), SettingsDipToPixels(y),
             SettingsDipToPixels(width), SettingsDipToPixels(height),
@@ -13277,6 +13662,10 @@ private:
     }
 
     std::wstring T(std::string_view key) const {
+        if (!testLocaleOverride_.empty()) {
+            return gravity::i18n::Localization::ResourceText(
+                testLocaleOverride_, key);
+        }
         return localization_.Text(key);
     }
 
@@ -13360,7 +13749,7 @@ private:
             return;
         }
         ClearSettingsPageControls();
-        const bool english = localization_.CurrentLocale() != L"zh-CN";
+        const bool nonChinese = !UsesChineseLayout();
         const int contentWidth = SettingsContentWidthDip();
         const std::wstring pageTitle = SettingsPageName(settingsPage_);
         CreateSettingsHeading(
@@ -13378,9 +13767,15 @@ private:
                 16, 54, 180, 22);
             CreateSettingsText(settingsContentWindow_, languageCurrent.c_str(),
                 16, 76, contentWidth, 20);
-            const std::array<std::wstring, 7> languageOptions{{
-                T("settings.language.automatic_option"), L"简体中文", L"English",
-                L"日本語", L"Deutsch", L"Español", L"Français"}};
+            const std::array<std::wstring, 8> languageOptions{{
+                T("settings.language.automatic_option"),
+                gravity::i18n::Localization::DisplayName(L"zh-CN"),
+                gravity::i18n::Localization::DisplayName(L"zh-TW"),
+                gravity::i18n::Localization::DisplayName(L"en-US"),
+                gravity::i18n::Localization::DisplayName(L"ja-JP"),
+                gravity::i18n::Localization::DisplayName(L"de-DE"),
+                gravity::i18n::Localization::DisplayName(L"es-ES"),
+                gravity::i18n::Localization::DisplayName(L"fr-FR")}};
             HWND languagePicker = CreateWindowExW(
                 0, L"COMBOBOX", L"",
                 WS_CHILD | WS_VISIBLE | WS_TABSTOP | CBS_DROPDOWNLIST |
@@ -13399,8 +13794,8 @@ private:
                 int selection = 0;
                 if (localization_.GetPreferences().languageMode ==
                     gravity::i18n::LanguageMode::Explicit) {
-                    const std::array<std::wstring_view, 6> locales{{
-                        L"zh-CN", L"en-US", L"ja-JP",
+                    const std::array<std::wstring_view, 7> locales{{
+                        L"zh-CN", L"zh-TW", L"en-US", L"ja-JP",
                         L"de-DE", L"es-ES", L"fr-FR"}};
                     const auto found = std::find(
                         locales.begin(), locales.end(),
@@ -13438,7 +13833,7 @@ private:
                             ? T("settings.autostart.disabled_by_policy")
                             : T("settings.autostart.current_user");
             CreateSettingsText(settingsContentWindow_, autoStartDetail.c_str(),
-                16, 208, contentWidth, english ? 48 : 34);
+                16, 208, contentWidth, nonChinese ? 48 : 34);
             break;
         }
         case SettingsPage::Appearance: {
@@ -13450,7 +13845,7 @@ private:
                 {T("settings.density.standard"), MenuDensityStandard},
                 {T("settings.density.clear"), MenuDensityClear}}};
             for (int index = 0; index < 3; ++index) {
-                const int densityButtonWidth = english ? 118 : 82;
+                const int densityButtonWidth = nonChinese ? 118 : 82;
                 HWND button = CreateSettingsButton(
                     settingsContentWindow_, density[index].first.c_str(),
                     16 + index * (densityButtonWidth + 10), 78,
@@ -13469,7 +13864,7 @@ private:
                 {T("settings.animation.standard"), MenuAnimationStandard},
                 {T("settings.animation.soft"), MenuAnimationSoft}}};
             for (int index = 0; index < 4; ++index) {
-                const int animationButtonWidth = english ? 88 : 70;
+                const int animationButtonWidth = nonChinese ? 88 : 70;
                 CreateSettingsButton(settingsContentWindow_, animation[index].first.c_str(),
                     16 + index * (animationButtonWidth + 8), 146,
                     animationButtonWidth, 28, animation[index].second);
@@ -13480,7 +13875,7 @@ private:
             const std::wstring selectionStatic = T("settings.selection.static");
             CreateSettingsText(settingsContentWindow_, selectionTitle.c_str(),
                 16, 190, 180, 22);
-            if (english) {
+            if (nonChinese) {
                 CreateSettingsButton(settingsContentWindow_, selectionRipple.c_str(),
                     16, 214, contentWidth, 28, MenuCoreSelectionEffectRotate);
                 CreateSettingsButton(settingsContentWindow_, selectionOnce.c_str(),
@@ -13510,48 +13905,33 @@ private:
             break;
         }
         case SettingsPage::Data: {
-            const std::wstring layoutSnapshot = T("settings.data.layout_snapshot");
-            const std::wstring layoutSnapshotDescription = T("settings.data.layout_snapshot.description");
-            const std::wstring exportLayout = T("settings.data.export_layout");
-            const std::wstring restoreLayout = T("settings.data.restore_layout");
-            const std::wstring fullBackup = T("settings.data.full_backup");
-            const std::wstring fullBackupDescription = T("settings.data.full_backup.description");
+            const std::wstring workspaceBackup =
+                T("settings.data.workspace_backup");
+            const std::wstring workspaceBackupDescription =
+                T("settings.data.workspace_backup.description");
+            const std::wstring workspaceBackupNote =
+                T("settings.data.workspace_backup.note");
             const std::wstring exportBackup = T("settings.data.export_backup");
             const std::wstring restoreBackup = T("settings.data.restore_backup");
-            const std::wstring saveNow = T("settings.data.save_now");
-            constexpr int columnGap = 10;
-            const int columnWidth = (contentWidth - columnGap) / 2;
             int y = 54;
             y += CreateSettingsWrappedText(
-                settingsContentWindow_, layoutSnapshot,
+                settingsContentWindow_, workspaceBackup,
                 16, y, contentWidth, 22);
             y += 4;
             y += CreateSettingsWrappedText(
-                settingsContentWindow_, layoutSnapshotDescription,
-                16, y, contentWidth, 36);
-            y += 8;
-            CreateSettingsButton(settingsContentWindow_, exportLayout.c_str(),
-                16, y, columnWidth, 30, MenuExportLayoutSnapshot);
-            CreateSettingsButton(settingsContentWindow_, restoreLayout.c_str(),
-                16 + columnWidth + columnGap, y, columnWidth, 30,
-                MenuImportLayoutSnapshot);
-            y += 48;
-            y += CreateSettingsWrappedText(
-                settingsContentWindow_, fullBackup,
-                16, y, contentWidth, 22);
-            y += 4;
-            y += CreateSettingsWrappedText(
-                settingsContentWindow_, fullBackupDescription,
+                settingsContentWindow_, workspaceBackupDescription,
                 16, y, contentWidth, 40);
-            y += 8;
+            y += 4;
+            y += CreateSettingsWrappedText(
+                settingsContentWindow_, workspaceBackupNote,
+                16, y, contentWidth, 34);
+            y += 10;
             CreateSettingsButton(settingsContentWindow_, exportBackup.c_str(),
-                16, y, columnWidth, 30, MenuExportWorkspaceBackup);
+                16, y, contentWidth, 30, MenuExportWorkspaceBackup);
+            y += 40;
             CreateSettingsButton(settingsContentWindow_, restoreBackup.c_str(),
-                16 + columnWidth + columnGap, y, columnWidth, 30,
+                16, y, contentWidth, 30,
                 MenuImportWorkspaceBackup);
-            y += 48;
-            CreateSettingsButton(settingsContentWindow_, saveNow.c_str(),
-                16, y, columnWidth, 30, MenuSaveNow);
             break;
         }
         case SettingsPage::CoreManagement: {
@@ -13581,17 +13961,17 @@ private:
                     continue;
                 }
                 settingsArchivedCoreIds_.push_back(core.id);
-                const int top = archivedTop + 28 + row * (english ? 52 : 48);
+                const int top = archivedTop + 28 + row * (nonChinese ? 52 : 48);
                 CreateSettingsText(settingsContentWindow_, core.name.c_str(),
-                    16, top, english ? contentWidth - 94 : 222, 22);
+                    16, top, nonChinese ? contentWidth - 94 : 222, 22);
                 const std::wstring detail = localization_.Format(
                     "settings.core.file_count",
                     {{L"count", std::to_wstring(core.files.size())}});
                 CreateSettingsText(settingsContentWindow_, detail.c_str(),
-                    16, top + 21, english ? contentWidth - 94 : 180, 18);
+                    16, top + 21, nonChinese ? contentWidth - 94 : 180, 18);
                 CreateSettingsButton(settingsContentWindow_, restore.c_str(),
-                    english ? contentWidth - 76 : 258, top + 8,
-                    english ? 76 : 72, 28,
+                    nonChinese ? contentWidth - 76 : 258, top + 8,
+                    nonChinese ? 76 : 72, 28,
                     kSettingsArchivedCoreCommandBase +
                         static_cast<UINT>(settingsArchivedCoreIds_.size() - 1));
                 ++row;
@@ -13677,7 +14057,7 @@ private:
 
     int SettingsContentPreferredHeightPixels() const {
         int height = SettingsDipToPixels(340);
-        if (localization_.CurrentLocale() != L"zh-CN") {
+        if (!UsesChineseLayout()) {
             switch (settingsPage_) {
             case SettingsPage::General: height = SettingsDipToPixels(280); break;
             case SettingsPage::Appearance: height = SettingsDipToPixels(338); break;
@@ -13692,8 +14072,8 @@ private:
             const int archivedCount = static_cast<int>(std::count_if(
                 state_.cores.begin(), state_.cores.end(),
                 [](const Core& core) { return core.archived; }));
-            const int base = localization_.CurrentLocale() != L"zh-CN" ? 250 : 230;
-            const int rowHeight = localization_.CurrentLocale() != L"zh-CN" ? 52 : 48;
+            const int base = !UsesChineseLayout() ? 250 : 230;
+            const int rowHeight = !UsesChineseLayout() ? 52 : 48;
             height = SettingsDipToPixels(base + std::min(archivedCount, 6) * rowHeight);
         }
         if (settingsPage_ == SettingsPage::Help) {
@@ -13814,6 +14194,9 @@ private:
         RefreshSettingsWindowLanguage();
         RefreshTrayIconLanguage();
         RefreshDividerTooltipLanguage();
+        // This changes only generated display artifacts.  The managed library
+        // root and every real managed-file path remain deliberately stable.
+        if (!benchmarkMode_) EnsureManagedLibrarySafetyCenter();
         QueueSettingsWindowRebuild();
         Invalidate();
     }
@@ -14029,13 +14412,16 @@ private:
                             gravity::i18n::LanguageMode::Explicit, L"zh-CN");
                     } else if (selection == 2) {
                         SetApplicationLanguage(
+                            gravity::i18n::LanguageMode::Explicit, L"zh-TW");
+                    } else if (selection == 3) {
+                        SetApplicationLanguage(
                             gravity::i18n::LanguageMode::Explicit, L"en-US");
-                    } else if (selection >= 3 && selection <= 6) {
+                    } else if (selection >= 4 && selection <= 7) {
                         const std::array<std::wstring_view, 4> locales{{
                             L"ja-JP", L"de-DE", L"es-ES", L"fr-FR"}};
                         SetApplicationLanguage(
                             gravity::i18n::LanguageMode::Explicit,
-                            locales[static_cast<std::size_t>(selection - 3)]);
+                            locales[static_cast<std::size_t>(selection - 4)]);
                     }
                 }
                 // CBN_DROPDOWN and focus notifications are not commands.
@@ -14243,13 +14629,6 @@ private:
             reinterpret_cast<UINT_PTR>(workspaceMenu), T("settings.workspace").c_str());
 
         HMENU dataMenu = CreatePopupMenu();
-        AppendMenuW(dataMenu, MF_STRING, MenuSaveNow, T("menu.save_now").c_str());
-        AppendMenuW(dataMenu, MF_SEPARATOR, 0, nullptr);
-        AppendMenuW(dataMenu, MF_STRING, MenuExportLayoutSnapshot,
-                    T("menu.export_layout").c_str());
-        AppendMenuW(dataMenu, MF_STRING, MenuImportLayoutSnapshot,
-                    T("menu.restore_layout").c_str());
-        AppendMenuW(dataMenu, MF_SEPARATOR, 0, nullptr);
         AppendMenuW(dataMenu, MF_STRING, MenuExportWorkspaceBackup,
                     T("menu.export_backup").c_str());
         AppendMenuW(dataMenu, MF_STRING, MenuImportWorkspaceBackup,
@@ -14942,7 +15321,7 @@ private:
 
     D2D1_RECT_F CoreAppearancePanelRectangle(
         const D2D1_SIZE_F& client) const {
-        const float width = localization_.CurrentLocale() == L"zh-CN"
+        const float width = UsesChineseLayout()
             ? 360.0f : 440.0f;
         constexpr float height = 524.0f;
         const float left = std::clamp(coreAppearancePanelAnchorDip_.x - 18.0f,
@@ -14997,7 +15376,7 @@ private:
         default:
             break;
         }
-        const float labelWidth = localization_.CurrentLocale() == L"zh-CN"
+        const float labelWidth = UsesChineseLayout()
             ? 104.0f : 154.0f;
         return D2D1::RectF(card.left + labelWidth, y,
                            card.right - 54.0f, y + 8.0f);
@@ -15013,7 +15392,7 @@ private:
     D2D1_RECT_F CoreAppearanceShortLabelInputRectangle(
         const D2D1_SIZE_F& client) const {
         const D2D1_RECT_F card = CoreAppearancePanelRectangle(client);
-        const float labelWidth = localization_.CurrentLocale() == L"zh-CN"
+        const float labelWidth = UsesChineseLayout()
             ? 104.0f : 154.0f;
         return D2D1::RectF(card.left + labelWidth, card.top + 185.0f,
                            card.right - 126.0f, card.top + 211.0f);
@@ -15371,7 +15750,7 @@ private:
             ? T("appearance.short_label_hint")
             : coreShortLabelEditError_;
         const float appearanceLabelWidth =
-            localization_.CurrentLocale() == L"zh-CN" ? 104.0f : 154.0f;
+            UsesChineseLayout() ? 104.0f : 154.0f;
         renderTarget_->DrawTextW(
             shortLabelHint.c_str(),
             static_cast<UINT32>(shortLabelHint.size()),
@@ -16447,6 +16826,150 @@ private:
             start, end, brush_.Get(), width * inverseZoom);
     }
 
+    void DrawCoreEventEffects() {
+        if (coreEventEffects_.empty()) {
+            return;
+        }
+        const auto now = std::chrono::steady_clock::now();
+        const float baseIntensity = CoreEventIntensity();
+        const AnimationMode mode = EffectiveAnimationMode();
+        for (const CoreEventEffect& effect : coreEventEffects_) {
+            const float intensity = baseIntensity * effect.strength;
+            const float duration = std::max(1.0f,
+                effect.durationMilliseconds);
+            const float progress = ClampUnit(
+                std::chrono::duration<float, std::milli>(
+                    now - effect.started).count() / duration);
+            const float radius = std::max(1.0f, effect.coreRadius);
+            const float outerRadius = radius +
+                std::max(4.0f, radius * 0.18f);
+
+            if (mode == AnimationMode::Off) {
+                // A non-moving acknowledgement for users who have disabled
+                // animation. It is intentionally brief and uses no geometry.
+                brush_->SetColor(D2D1::ColorF(
+                    effect.coreColor, 0.12f * intensity));
+                renderTarget_->FillEllipse(
+                    D2D1::Ellipse(effect.coreCenter,
+                        radius + std::max(3.0f, radius * 0.10f),
+                        radius + std::max(3.0f, radius * 0.10f)),
+                    brush_.Get());
+                continue;
+            }
+
+            switch (effect.type) {
+            case CoreEventEffectType::Prepare: {
+                // One quiet inward ring confirms that this core can accept
+                // the dragged file.  It never loops and does not alter the
+                // connection-line layer.
+                const float eased = 1.0f -
+                    std::pow(1.0f - progress, 1.45f);
+                const float prepareRadius = outerRadius + 3.0f -
+                    std::max(2.0f, radius * 0.10f) * eased;
+                const float alpha = 0.16f * intensity *
+                    std::pow(1.0f - progress, 1.25f);
+                brush_->SetColor(D2D1::ColorF(
+                    effect.coreColor, alpha));
+                renderTarget_->DrawEllipse(
+                    D2D1::Ellipse(effect.coreCenter,
+                        prepareRadius, prepareRadius), brush_.Get(),
+                    1.35f);
+                break;
+            }
+            case CoreEventEffectType::Add: {
+                // A compact inward ring says "received" without changing
+                // the core body or animating any relationship line.
+                const float tighten = ClampUnit(progress / 0.24f);
+                if (tighten < 1.0f) {
+                    const float tightenRadius = outerRadius + 4.0f -
+                        std::max(2.0f, radius * 0.12f) * tighten;
+                    brush_->SetColor(D2D1::ColorF(
+                        effect.coreColor,
+                        0.19f * intensity * (1.0f - tighten)));
+                    renderTarget_->DrawEllipse(
+                        D2D1::Ellipse(effect.coreCenter,
+                            tightenRadius, tightenRadius), brush_.Get(),
+                        1.5f);
+                }
+                const float intake = ClampUnit(
+                    1.0f - std::abs(progress - 0.32f) / 0.17f);
+                if (intake > 0.001f) {
+                    brush_->SetColor(D2D1::ColorF(
+                        effect.coreColor, 0.17f * intake * intensity));
+                    renderTarget_->FillEllipse(
+                        D2D1::Ellipse(effect.coreCenter,
+                            radius + std::max(3.0f, radius * 0.11f),
+                            radius + std::max(3.0f, radius * 0.11f)),
+                        brush_.Get());
+                }
+
+                const float wave = ClampUnit((progress - 0.42f) / 0.58f);
+                if (wave < 1.0f) {
+                    const float eased = 1.0f -
+                        std::pow(1.0f - wave, 1.55f);
+                    const float waveRadius = outerRadius + 2.0f +
+                        radius * 0.56f * eased;
+                    const float alpha = 0.27f * intensity *
+                        std::pow(1.0f - wave, 1.35f);
+                    brush_->SetColor(D2D1::ColorF(
+                        LightenCoreColor(effect.coreColor, 0.24f), alpha));
+                    renderTarget_->DrawEllipse(
+                        D2D1::Ellipse(effect.coreCenter,
+                            waveRadius, waveRadius), brush_.Get(),
+                        1.55f - 0.28f * wave);
+                }
+                break;
+            }
+            case CoreEventEffectType::Release: {
+                const float intake = ClampUnit(
+                    1.0f - std::abs(progress - 0.18f) / 0.16f);
+                if (intake > 0.001f) {
+                    brush_->SetColor(D2D1::ColorF(
+                        effect.coreColor, 0.10f * intake * intensity));
+                    renderTarget_->FillEllipse(
+                        D2D1::Ellipse(effect.coreCenter,
+                            radius + std::max(3.0f, radius * 0.09f),
+                            radius + std::max(3.0f, radius * 0.09f)),
+                        brush_.Get());
+                }
+                const float wave = ClampUnit((progress - 0.18f) / 0.66f);
+                if (wave < 1.0f) {
+                    const float waveRadius = outerRadius + 1.0f +
+                        radius * 0.30f * wave;
+                    brush_->SetColor(D2D1::ColorF(
+                        effect.coreColor,
+                        0.15f * intensity *
+                            std::pow(1.0f - wave, 1.4f)));
+                    renderTarget_->DrawEllipse(
+                        D2D1::Ellipse(effect.coreCenter,
+                            waveRadius, waveRadius), brush_.Get(),
+                        1.30f);
+                }
+                break;
+            }
+            case CoreEventEffectType::Reject:
+                for (int pulse = 0; pulse < 2; ++pulse) {
+                    const float local = ClampUnit(
+                        (progress - pulse * 0.42f) / 0.31f);
+                    if (local >= 1.0f) {
+                        continue;
+                    }
+                    const float contraction = std::sin(local * kPi);
+                    const float rejectRadius = outerRadius + 3.0f -
+                        contraction * std::max(2.0f, radius * 0.09f);
+                    brush_->SetColor(D2D1::ColorF(
+                        effect.coreColor,
+                        0.24f * intensity * contraction));
+                    renderTarget_->DrawEllipse(
+                        D2D1::Ellipse(effect.coreCenter,
+                            rejectRadius, rejectRadius), brush_.Get(),
+                        1.65f);
+                }
+                break;
+            }
+        }
+    }
+
     void DrawConnections(const Core& core, const std::vector<ItemLayout>& layout) {
         const bool coreHovered =
             hover_.kind == HitKind::Core && hover_.coreId == core.id;
@@ -16651,8 +17174,11 @@ private:
     void DrawMoreNode(const Core& core, const ItemLayout& entry) {
         const D2D1_POINT_2F position =
             VisualItemPosition(core, entry);
-        const float halfWidth = 56.0f;
-        const float halfHeight = 14.0f;
+        // The capacity badge already shows the total. Repeating a transient
+        // "hidden N" count here is easily mistaken for another total, so the
+        // file-list entry stays available as a compact disclosure affordance.
+        const float halfWidth = 18.0f;
+        const float halfHeight = 12.0f;
         const D2D1_RECT_F bounds = D2D1::RectF(
             position.x - halfWidth, position.y - halfHeight,
             position.x + halfWidth, position.y + halfHeight);
@@ -16664,11 +17190,10 @@ private:
         renderTarget_->DrawRoundedRectangle(
             D2D1::RoundedRect(bounds, halfHeight, halfHeight),
             brush_.Get(), 1.2f);
-        const std::wstring text =
-            L"已折叠 " + std::to_wstring(entry.hiddenCount) + L" 个";
+        constexpr wchar_t text[] = L"\u2026";
         brush_->SetColor(D2D1::ColorF(0xEAF3FF));
         renderTarget_->DrawTextW(
-            text.c_str(), static_cast<UINT32>(text.size()), coreFormat_.Get(),
+            text, 1, coreFormat_.Get(),
             bounds,
             brush_.Get());
     }
@@ -16705,8 +17230,8 @@ private:
                                       brush_.Get(), armed ? 2.8f : 1.5f);
             if (armed) {
                 const std::wstring hint = relationTargetCoreId_ == dragCoreId_
-                    ? L"松开后设为子文件"
-                    : L"松开后移入此核心并设为子文件";
+                    ? T("core.drop.child_same")
+                    : T("core.drop.child_move");
                 renderTarget_->DrawTextW(hint.c_str(), static_cast<UINT32>(hint.size()),
                     tooltipBodyFormat_.Get(),
                     D2D1::RectF(position.x - 100.0f, position.y + containerHalf + 8.0f,
@@ -16724,8 +17249,7 @@ private:
                 D2D1::Ellipse(position, containerHalf + 13.0f,
                               containerHalf + 13.0f),
                 brush_.Get(), 2.8f);
-            const std::wstring hint =
-                L"作为该文件的子文件加入";
+            const std::wstring hint = T("core.drop.child_add");
             renderTarget_->DrawTextW(
                 hint.c_str(), static_cast<UINT32>(hint.size()),
                 tooltipBodyFormat_.Get(),
@@ -17123,7 +17647,7 @@ private:
                     const D2D1_RECT_F labelRect =
                         VisualLabelRectangle(*core, entry);
 
-                    std::wstring label = L"+更多";
+                    std::wstring label = T("core.more");
                     if (!entry.isMore && entry.item != nullptr) {
                         if (state_.zoom > 1.15f &&
                             !entry.item->originalName.empty()) {
@@ -17466,10 +17990,17 @@ private:
         // A layered, alpha-only halo makes the core legible without a blur
         // pass or a continuously animated effect.
         const UINT32 themeColor = EffectiveCoreThemeColor(core);
-        const UINT32 haloColor = dropTarget ? 0x67E8B0 : themeColor;
-        const float haloStrength = dropTarget ? 1.15f
-            : (selected ? 1.22f : (hovered || focused ? 1.0f : 0.62f)) *
-                CoreGlowIntensity(core);
+        // A valid drop target remains recognisable through strength and the
+        // receive label; it must not abandon this core's own colour identity.
+        const UINT32 haloColor = themeColor;
+        const float contextualHaloStrength =
+            (selected ? 1.22f : (hovered || focused ? 1.0f : 0.62f)) *
+            CoreGlowIntensity(core);
+        // A drop target is an enhancement, never a dimmer replacement for a
+        // core whose existing glow preference or state is already stronger.
+        const float haloStrength = dropTarget
+            ? std::max(contextualHaloStrength, 1.15f)
+            : contextualHaloStrength;
         brush_->SetColor(D2D1::ColorF(haloColor, 0.035f * haloStrength));
         renderTarget_->FillEllipse(
             D2D1::Ellipse(center, coreRadius + haloOuterSpread,
@@ -17497,7 +18028,7 @@ private:
                 center, coreRadius + 0.45f, coreRadius + 0.45f),
             brush_.Get(), selected || focused ? 1.65f : 1.35f);
         brush_->SetColor(D2D1::ColorF(
-            dropTarget ? 0x8CFFD0 : (selected ? themeColor : 0xB9D7FF),
+            selected ? themeColor : 0xB9D7FF,
             selected || focused ? 0.98f : 0.72f));
         renderTarget_->DrawEllipse(
             D2D1::Ellipse(center, outerRadius, outerRadius), brush_.Get(),
@@ -17664,12 +18195,10 @@ private:
                 brush_.Get());
             brush_->SetColor(
                 D2D1::ColorF(0xF4FFF9, 1.0f));
-            const wchar_t* receiveText =
-                L"松开以加入此核心";
+            const std::wstring receiveText = T("core.drop.add");
             renderTarget_->DrawTextW(
-                receiveText,
-                static_cast<UINT32>(
-                    wcslen(receiveText)),
+                receiveText.c_str(),
+                static_cast<UINT32>(receiveText.size()),
                 hudFormat_.Get(), receive,
                 brush_.Get(),
                 D2D1_DRAW_TEXT_OPTIONS_CLIP);
@@ -18418,7 +18947,7 @@ private:
                             VisualItemPosition(
                                 core, *itemIterator));
                     if (std::abs(screen.x - position.x) <=
-                            61.0f &&
+                            27.0f &&
                         std::abs(screen.y - position.y) <=
                             19.0f) {
                         return {HitKind::More, core.id, 0};
@@ -18730,6 +19259,7 @@ private:
             return;
         }
         PushUndo(std::move(before));
+        TriggerCoreEvent(CoreEventEffectType::Add, parentCoreId, childId);
         Invalidate();
     }
 
@@ -18942,6 +19472,7 @@ private:
         PushUndo(std::move(before));
         SetSelection({HitKind::Item, targetCoreId, itemId});
         SetStatus(T("status.relation_core_connected"));
+        TriggerCoreEvent(CoreEventEffectType::Add, targetCoreId, itemId);
         Invalidate();
     }
 
@@ -21580,6 +22111,7 @@ private:
 
     void OnMouseWheel(int screenX, int screenY, int delta) {
         EndRename(true);
+        ClearCoreEventEffects();
         POINT clientPoint{screenX, screenY};
         ScreenToClient(window_, &clientPoint);
         const D2D1_POINT_2F dip = PixelToDip(clientPoint.x, clientPoint.y);
@@ -22067,10 +22599,12 @@ private:
             StartTutorial();
             break;
         case MenuExportLayoutSnapshot:
-            ExportLayoutSnapshot();
+            // Old command IDs may still be delivered by an already-open menu.
+            // They now route to the one supported manual backup format.
+            ExportWorkspaceBackup();
             break;
         case MenuImportLayoutSnapshot:
-            ImportLayoutSnapshot();
+            ImportWorkspaceBackup();
             break;
         case MenuExportWorkspaceBackup:
             ExportWorkspaceBackup();
@@ -22395,10 +22929,15 @@ private:
                 }
             }
         }
+        const bool enteredNewCore = nextCoreId != 0 &&
+            nextCoreId != externalDropCoreId_;
         if (externalDropCoreId_ != nextCoreId ||
             externalDropItemId_ != nextItemId) {
             externalDropCoreId_ = nextCoreId;
             externalDropItemId_ = nextItemId;
+            if (enteredNewCore) {
+                TriggerCoreEvent(CoreEventEffectType::Prepare, nextCoreId);
+            }
             Invalidate();
         }
         return nextCoreId != 0;
@@ -23013,6 +23552,7 @@ private:
         layoutCache_.clear();
         layoutDirty_ = true;
         SetManagedCollectionStatus(coreName);
+        TriggerCoreEvent(CoreEventEffectType::Add, coreId, itemId);
         Invalidate();
         return true;
     }
@@ -23031,10 +23571,14 @@ private:
             SetStatus(L"收纳失败：目标核心不存在");
             return false;
         }
+        const auto reject = [this, targetCoreId] {
+            TriggerCoreEvent(CoreEventEffectType::Reject, targetCoreId);
+        };
         const std::wstring targetName = target->name;
         std::wstring eligibilityError;
         if (!IsEligibleDesktopManagedFile(sourcePath, &eligibilityError)) {
             SetStatus(L"未收纳：" + eligibilityError + L"；已按安全规则保留原文件");
+            reject();
             return false;
         }
         Core* existingOwner = nullptr;
@@ -23064,15 +23608,18 @@ private:
             SetStatus(existingOwner != nullptr && existingOwner->id != targetCoreId
                 ? L"该文件已经属于其他核心；未自动跨核心移动"
                 : L"该文件已经存在于当前核心；未创建重复入口");
+            reject();
             return false;
         }
         if (AttachedFileCount(*target) >=
             static_cast<std::size_t>(kCoreFileCapacity)) {
             SetStatus(L"当前核心已达到 18 项容量上限；未收纳文件");
+            reject();
             return false;
         }
         if (parentId != 0 && FindItem(targetCoreId, parentId) == nullptr) {
             SetStatus(L"收纳失败：目标父文件不存在");
+            reject();
             return false;
         }
         // A locked layout protects existing node positions, not the ability
@@ -23093,6 +23640,7 @@ private:
             AvailableManagedLibraryRootPath(fileName);
         if (destination.empty()) {
             SetStatus(L"收纳失败：无法在托管库根目录创建安全文件名");
+            reject();
             return false;
         }
 
@@ -23108,6 +23656,7 @@ private:
         transaction.createdAt = UnixTimeNow();
         if (!PersistManagedTransaction(transaction)) {
             SetStatus(L"收纳失败：无法写入文件移动事务日志");
+            reject();
             return false;
         }
 
@@ -23117,6 +23666,7 @@ private:
                 &moveError)) {
             ClearManagedTransaction();
             SetStatus(L"收纳失败：" + moveError);
+            reject();
             return false;
         }
         transaction.stage = ManagedTransactionStage::FileMoved;
@@ -23131,6 +23681,7 @@ private:
                 ClearManagedTransaction();
             }
             SetStatus(L"收纳失败：事务记录未完成，已尝试回滚真实文件");
+            reject();
             return false;
         }
 
@@ -23151,6 +23702,7 @@ private:
                 ClearManagedTransaction();
             }
             SetStatus(L"收纳失败：目标核心状态已变化，已回滚真实文件");
+            reject();
             return false;
         }
         FileItem item;
@@ -23188,6 +23740,7 @@ private:
                     ClearManagedTransaction();
                 }
                 SetStatus(L"收纳失败：父子关系目标已变化，已回滚真实文件");
+                reject();
                 return false;
             }
             if (parent->familyId == 0) {
@@ -23237,6 +23790,7 @@ private:
             SetStatus(validation.IsValid()
                 ? L"收纳失败：状态未能保存，真实文件已回滚"
                 : L"收纳失败：关系校验未通过，真实文件已回滚");
+            reject();
             return false;
         }
 
@@ -23266,6 +23820,7 @@ private:
         layoutCache_.clear();
         layoutDirty_ = true;
         SetManagedCollectionStatus(targetName);
+        TriggerCoreEvent(CoreEventEffectType::Add, targetCoreId, itemId);
         Invalidate();
         return true;
     }
@@ -23398,6 +23953,10 @@ private:
         PushUndo(std::move(before));
         SetSelection(
             {HitKind::Item, targetCoreId, childId});
+        // Establishing a parent relation is acknowledged by the owning core,
+        // but deliberately more quietly than absorbing a direct file.
+        TriggerCoreEvent(
+            CoreEventEffectType::Add, targetCoreId, childId, 0.86f);
         Invalidate();
         return true;
     }
@@ -23442,6 +24001,7 @@ private:
             DragFinish(drop);
             ClearExternalDropPreview();
             SetStatus(L"一次只能添加一个子文件");
+            TriggerCoreEvent(CoreEventEffectType::Reject, targetId);
             return;
         }
         std::vector<std::wstring> paths;
@@ -23458,17 +24018,19 @@ private:
             return;
         }
         const auto rejectUnsupportedDesktopSource =
-            [this](const std::wstring& path) {
+            [this, targetId](const std::wstring& path) {
             if (IsPublicDesktopManagedFile(path)) {
                 SetStatus(T("status.store_shared_desktop"));
                 AppendRuntimeDiagnostic(
                     "external_drop_public_desktop_rejected");
+                TriggerCoreEvent(CoreEventEffectType::Reject, targetId);
                 return true;
             }
             if (IsShellVirtualDesktopObjectPath(path)) {
                 SetStatus(T("status.store_shell_item_unsupported"));
                 AppendRuntimeDiagnostic(
                     "external_drop_shell_object_rejected");
+                TriggerCoreEvent(CoreEventEffectType::Reject, targetId);
                 return true;
             }
             return false;
@@ -23488,6 +24050,7 @@ private:
                 ClearExternalDropPreview();
                 SetStatus(
                     L"批量收纳尚未启用；请逐个拖入，避免真实文件出现半完成移动");
+                TriggerCoreEvent(CoreEventEffectType::Reject, targetId);
                 return;
             }
         }
@@ -23646,6 +24209,7 @@ private:
                           : (skipped > 0
                                  ? L"没有新增项目：文件已存在"
                                  : L"没有可添加的项目"));
+            TriggerCoreEvent(CoreEventEffectType::Reject, targetId);
         }
         Invalidate();
     }
@@ -24485,48 +25049,14 @@ private:
         return plan;
     }
 
-    void ExportLayoutSnapshot() {
-        std::vector<wchar_t> path(32768, L'\0');
-        const std::wstring suggested =
-            L"GravityDesktop-布局快照-" + BackupTimestamp() + L".json";
-        wcsncpy_s(path.data(), path.size(), suggested.c_str(), _TRUNCATE);
-        OPENFILENAMEW dialog{sizeof(dialog)};
-        dialog.hwndOwner = window_;
-        dialog.lpstrTitle = L"导出布局快照";
-        dialog.lpstrFilter =
-            L"引力桌面布局快照 (*.json)\0*.json\0所有文件\0*.*\0";
-        dialog.lpstrFile = path.data();
-        dialog.nMaxFile = static_cast<DWORD>(path.size());
-        dialog.lpstrDefExt = L"json";
-        dialog.Flags = OFN_OVERWRITEPROMPT | OFN_PATHMUSTEXIST;
-        if (!GetSaveFileNameW(&dialog)) return;
-        if (WriteUtf8Atomic(
-                path.data(), SerializeLayoutSnapshot(state_))) {
-            SetStatus(L"布局快照已导出；不包含文件路径和真实文件内容");
-        } else {
-            SetStatus(L"布局快照导出失败");
-        }
-    }
-
-    void ImportLayoutSnapshot() {
-        std::vector<wchar_t> path(32768, L'\0');
-        OPENFILENAMEW dialog{sizeof(dialog)};
-        dialog.hwndOwner = window_;
-        dialog.lpstrTitle = L"恢复布局快照";
-        dialog.lpstrFilter =
-            L"引力桌面布局快照 (*.json)\0*.json\0所有文件\0*.*\0";
-        dialog.lpstrFile = path.data();
-        dialog.nMaxFile = static_cast<DWORD>(path.size());
-        dialog.Flags = OFN_FILEMUSTEXIST | OFN_PATHMUSTEXIST;
-        if (!GetOpenFileNameW(&dialog)) return;
-        const std::optional<std::string> text = ReadUtf8File(path.data());
+    void RestoreLegacyLayoutSnapshotDocument(const std::string& text) {
         WorkspaceState snapshot;
-        if (!text || !DeserializeLayoutSnapshot(*text, snapshot)) {
+        if (!DeserializeLayoutSnapshot(text, snapshot)) {
             MessageBoxW(
                 window_,
-                L"这不是有效的引力桌面布局快照。\n\n"
-                L"当前布局没有改变。",
-                L"恢复布局快照", MB_OK | MB_ICONERROR);
+                T("backup.restore.invalid").c_str(),
+                T("backup.restore.title").c_str(),
+                MB_OK | MB_ICONERROR);
             return;
         }
         WorkspaceState candidate = state_;
@@ -24535,24 +25065,19 @@ private:
         if (summary.restoredCores == 0) {
             MessageBoxW(
                 window_,
-                L"快照中没有与当前工作区匹配的核心。\n\n"
-                L"不会创建旧核心，也不会恢复已经删除的文件引用。",
-                L"恢复布局快照", MB_OK | MB_ICONINFORMATION);
+                T("backup.legacy_layout.no_match").c_str(),
+                T("backup.restore.title").c_str(),
+                MB_OK | MB_ICONINFORMATION);
             return;
         }
-        const std::wstring prompt =
-            L"恢复预览\n\n"
-            L"恢复核心位置与布局：" +
-            std::to_wstring(summary.restoredCores) + L" 个\n"
-            L"恢复现有文件位置：" +
-            std::to_wstring(summary.restoredFiles) + L" 个\n"
-            L"保留后来新增文件：" +
-            std::to_wstring(summary.currentOnlyFilesKept) + L" 个\n"
-            L"跳过已删除或已换核心文件：" +
-            std::to_wstring(summary.movedFilesSkipped) + L" 个\n\n"
-            L"不会新增或删除文件引用，不会改变父子关系和真实文件。";
+        const std::wstring prompt = localization_.Format(
+            "backup.legacy_layout.preview",
+            {{L"cores", std::to_wstring(summary.restoredCores)},
+             {L"files", std::to_wstring(summary.restoredFiles)},
+             {L"kept", std::to_wstring(summary.currentOnlyFilesKept)},
+             {L"skipped", std::to_wstring(summary.movedFilesSkipped)}});
         if (MessageBoxW(
-                window_, prompt.c_str(), L"恢复布局快照",
+                window_, prompt.c_str(), T("backup.restore.title").c_str(),
                 MB_OKCANCEL | MB_ICONINFORMATION | MB_DEFBUTTON2) != IDOK) {
             return;
         }
@@ -24571,64 +25096,110 @@ private:
             state_ = std::move(before);
             ApplyCoreRatiosToWorkspace();
             RefreshResponsiveMetrics(true);
-            SetStatus(L"布局快照恢复失败；已回到恢复前状态");
+            SetStatus(T("backup.legacy_layout.failure"));
             return;
         }
         dirty_ = false;
         PushUndo(std::move(before));
         layoutDirty_ = true;
-        SetStatus(L"布局快照已恢复；新增和删除的文件保持当前状态");
+        SetStatus(T("backup.legacy_layout.success"));
         Invalidate();
     }
 
     void ExportWorkspaceBackup() {
         if (MessageBoxW(
                 window_,
-                L"完整工作区备份包含核心、文件引用、关系、视觉位置和本机路径，"
-                L"但不包含任何真实文件内容。\n\n是否继续？",
-                L"导出完整工作区备份",
+                T("backup.export.confirm").c_str(),
+                T("backup.export.title").c_str(),
                 MB_OKCANCEL | MB_ICONINFORMATION) != IDOK) {
             return;
         }
         std::vector<wchar_t> path(32768, L'\0');
         const std::wstring suggested =
-            L"GravityDesktop-完整工作区-" + BackupTimestamp() + L".json";
+            L"GravityDesktop-Workspace-Backup-" +
+            BackupTimestamp() + L".json";
         wcsncpy_s(path.data(), path.size(), suggested.c_str(), _TRUNCATE);
+        std::wstring filter = T("backup.file_filter");
+        filter += L" (*.json)";
+        filter.push_back(L'\0');
+        filter += L"*.json";
+        filter.push_back(L'\0');
+        filter += T("backup.file_filter.all");
+        filter.push_back(L'\0');
+        filter += L"*.*";
+        filter.push_back(L'\0');
+        filter.push_back(L'\0');
         OPENFILENAMEW dialog{sizeof(dialog)};
         dialog.hwndOwner = window_;
-        dialog.lpstrTitle = L"导出完整工作区备份";
-        dialog.lpstrFilter =
-            L"引力桌面完整工作区备份 (*.json)\0*.json\0所有文件\0*.*\0";
+        const std::wstring title = T("backup.export.title");
+        dialog.lpstrTitle = title.c_str();
+        dialog.lpstrFilter = filter.c_str();
         dialog.lpstrFile = path.data();
         dialog.nMaxFile = static_cast<DWORD>(path.size());
         dialog.lpstrDefExt = L"json";
         dialog.Flags = OFN_OVERWRITEPROMPT | OFN_PATHMUSTEXIST;
         if (!GetSaveFileNameW(&dialog)) return;
-        if (WriteUtf8Atomic(path.data(), SerializeState(state_))) {
-            SetStatus(L"完整工作区备份已导出；不包含真实文件内容");
+        if (WriteUtf8Atomic(
+                path.data(), SerializeWorkspaceBackup(state_))) {
+            SetStatus(T("backup.export.success"));
         } else {
-            SetStatus(L"完整工作区备份导出失败");
+            SetStatus(T("backup.export.failure"));
         }
     }
 
     void ImportWorkspaceBackup() {
         std::vector<wchar_t> path(32768, L'\0');
+        std::wstring filter = T("backup.file_filter");
+        filter += L" (*.json)";
+        filter.push_back(L'\0');
+        filter += L"*.json";
+        filter.push_back(L'\0');
+        filter += T("backup.file_filter.all");
+        filter.push_back(L'\0');
+        filter += L"*.*";
+        filter.push_back(L'\0');
+        filter.push_back(L'\0');
         OPENFILENAMEW dialog{sizeof(dialog)};
         dialog.hwndOwner = window_;
-        dialog.lpstrTitle = L"恢复完整工作区备份";
-        dialog.lpstrFilter =
-            L"引力桌面完整工作区备份 (*.json)\0*.json\0所有文件\0*.*\0";
+        const std::wstring title = T("backup.restore.title");
+        dialog.lpstrTitle = title.c_str();
+        dialog.lpstrFilter = filter.c_str();
         dialog.lpstrFile = path.data();
         dialog.nMaxFile = static_cast<DWORD>(path.size());
         dialog.Flags = OFN_FILEMUSTEXIST | OFN_PATHMUSTEXIST;
         if (!GetOpenFileNameW(&dialog)) return;
         const std::optional<std::string> text = ReadUtf8File(path.data());
+        if (!text.has_value()) {
+            MessageBoxW(
+                window_, T("backup.restore.invalid").c_str(),
+                title.c_str(), MB_OK | MB_ICONERROR);
+            return;
+        }
+        const WorkspaceBackupDocumentKind documentKind =
+            InspectWorkspaceBackupDocument(*text);
+        if (documentKind ==
+            WorkspaceBackupDocumentKind::UnsupportedUnifiedVersion) {
+            MessageBoxW(
+                window_, T("backup.restore.unsupported").c_str(),
+                title.c_str(), MB_OK | MB_ICONERROR);
+            return;
+        }
+        if (documentKind == WorkspaceBackupDocumentKind::LegacyLayout) {
+            RestoreLegacyLayoutSnapshotDocument(*text);
+            return;
+        }
+        if (documentKind == WorkspaceBackupDocumentKind::Invalid) {
+            MessageBoxW(
+                window_, T("backup.restore.invalid").c_str(),
+                title.c_str(), MB_OK | MB_ICONERROR);
+            return;
+        }
         WorkspaceState imported;
-        if (!text || !DeserializeState(*text, imported)) {
+        if (!DeserializeState(*text, imported)) {
             MessageBoxW(
                 window_,
-                L"无法读取完整工作区备份；当前工作区没有改变。",
-                L"恢复完整工作区备份", MB_OK | MB_ICONERROR);
+                T("backup.restore.invalid").c_str(),
+                title.c_str(), MB_OK | MB_ICONERROR);
             return;
         }
         const RelationValidationResult importedValidation =
@@ -24636,10 +25207,10 @@ private:
         if (!importedValidation.IsValid()) {
             MessageBoxW(
                 window_,
-                (L"备份包含异常文件关系，已拒绝恢复。\n\n" +
+                (T("backup.restore.invalid_relations") + L"\n\n" +
                  FormatRelationValidationReport(
-                     importedValidation, 8)).c_str(),
-                L"恢复完整工作区备份", MB_OK | MB_ICONERROR);
+                    importedValidation, 8)).c_str(),
+                title.c_str(), MB_OK | MB_ICONERROR);
             return;
         }
         WorkspaceRestorePlan plan = BuildWorkspaceRestorePlan(imported);
@@ -24648,27 +25219,21 @@ private:
         if (!candidateValidation.IsValid()) {
             MessageBoxW(
                 window_,
-                (L"安全恢复计划未通过关系校验，当前工作区没有改变。\n\n" +
+                (T("backup.restore.invalid_plan") + L"\n\n" +
                  FormatRelationValidationReport(
-                     candidateValidation, 8)).c_str(),
-                L"恢复完整工作区备份", MB_OK | MB_ICONERROR);
+                    candidateValidation, 8)).c_str(),
+                title.c_str(), MB_OK | MB_ICONERROR);
             return;
         }
-        const std::wstring prompt =
-            L"完整工作区恢复预览\n\n"
-            L"保留当前文件引用：" +
-            std::to_wstring(plan.existingReferencesKept) + L" 个\n"
-            L"恢复备份文件引用：" +
-            std::to_wstring(plan.restoredReferences) + L" 个\n"
-            L"跳过源文件缺失：" +
-            std::to_wstring(plan.missingReferencesSkipped) + L" 个\n"
-            L"创建容量延续核心：" +
-            std::to_wstring(plan.continuationCoresCreated) + L" 个\n"
-            L"暂不恢复的关系：" +
-            std::to_wstring(plan.relationshipRepairsRequired) + L" 项\n\n"
-            L"当前新增文件不会被删除；每个核心最多18项；真实文件不会移动。";
+        const std::wstring prompt = localization_.Format(
+            "backup.restore.preview",
+            {{L"kept", std::to_wstring(plan.existingReferencesKept)},
+             {L"restored", std::to_wstring(plan.restoredReferences)},
+             {L"missing", std::to_wstring(plan.missingReferencesSkipped)},
+             {L"continued", std::to_wstring(plan.continuationCoresCreated)},
+             {L"relations", std::to_wstring(plan.relationshipRepairsRequired)}});
         if (MessageBoxW(
-                window_, prompt.c_str(), L"恢复完整工作区备份",
+                window_, prompt.c_str(), title.c_str(),
                 MB_OKCANCEL | MB_ICONINFORMATION | MB_DEFBUTTON2) != IDOK) {
             return;
         }
@@ -24691,7 +25256,7 @@ private:
             NormalizeStateModel();
             ApplyCoreRatiosToWorkspace();
             RefreshResponsiveMetrics(true);
-            SetStatus(L"完整工作区恢复失败；已回到恢复前状态");
+            SetStatus(T("backup.restore.failure"));
             return;
         }
         dirty_ = false;
@@ -24699,7 +25264,7 @@ private:
         iconCache_.clear();
         iconShadowCache_.clear();
         layoutDirty_ = true;
-        SetStatus(L"完整工作区已安全恢复；当前新增内容继续保留");
+        SetStatus(T("backup.restore.success"));
         Invalidate();
     }
 
@@ -24808,6 +25373,7 @@ private:
             (upgradedCapacity
                  ? L"；核心容量已升级为18，当前布局保持不变"
                  : L"；真实文件位置未变化"));
+        TriggerCoreEvent(CoreEventEffectType::Add, targetId, itemId);
         Invalidate();
     }
 
@@ -25127,6 +25693,12 @@ private:
         if (iterator == core->files.end()) {
             return false;
         }
+        // The relation will no longer exist after the transactional state
+        // commit. Capture its current presentation geometry now, but do not
+        // start the effect until the commit below has succeeded.
+        const std::optional<CoreEventEffect> releaseEffect =
+            CaptureCoreEventEffect(
+                CoreEventEffectType::Release, coreId, itemId);
 
         std::vector<std::uint64_t> subtree;
         std::wstring collectError;
@@ -25374,6 +25946,9 @@ private:
                       std::to_wstring(subtree.size()) +
                       L" 个视觉引用；真实文件未被删除"
                 : L"已移除视觉关联；真实文件未被删除");
+        if (releaseEffect.has_value()) {
+            StartCoreEventEffect(*releaseEffect);
+        }
         Invalidate();
         return true;
     }
@@ -26349,6 +26924,15 @@ private:
             // Pure presentation invalidation: no layout cache, collision or
             // coordinate state is changed by the selected-core ripple.
             Invalidate();
+        } else if (timer == kCoreEventTimer) {
+            PruneCompletedCoreEventEffects();
+            if (!CoreEventAnimationActive()) {
+                KillTimer(window_, kCoreEventTimer);
+                SyncCoreSelectionRippleTimer();
+            }
+            // The event layer is presentation-only. This deliberately does
+            // not touch layout caches, interaction regions or state data.
+            Invalidate();
         } else if (timer == kSelectionDismissTimer) {
             PollSelectionDismissal();
         } else if (timer == kMarqueeTimer) {
@@ -26381,7 +26965,7 @@ private:
     }
 
     void SetStatus(std::wstring message) {
-        status_ = std::move(message);
+        status_ = localization_.LocalizeLegacyText(message);
         managedCollectionUndoStatusAvailable_ = false;
         managedCollectionUndoStatusBounds_ = D2D1::RectF();
         if (window_ != nullptr) {
@@ -26391,7 +26975,8 @@ private:
     }
 
     void SetManagedCollectionStatus(const std::wstring& coreName) {
-        status_ = L"已收纳到“" + coreName + L"”";
+        status_ = localization_.Format(
+            "status.managed_to_core", {{L"core", coreName}});
         managedCollectionUndoStatusAvailable_ = true;
         if (window_ != nullptr) {
             SetTimer(window_, kStatusTimer, 3600, nullptr);
@@ -26654,7 +27239,12 @@ private:
     // Keep the visible library root calm: recovery is the only direct action
     // there, while managed files remain one level below for fast browsing.
     std::filesystem::path ManagedFilesPath() const {
-        return ManagedLibraryPath() / L"已托管文件";
+        // This is a durable storage path, not a localized UI label. Keeping a
+        // neutral English name prevents a fresh non-Chinese installation from
+        // exposing a Chinese folder while avoiding path churn on language
+        // changes. Existing managedPath values continue to point to their
+        // original files and are never renamed here.
+        return ManagedLibraryPath() / L"Managed Files";
     }
 
     std::filesystem::path AvailableManagedLibraryRootPath(
@@ -26843,8 +27433,9 @@ private:
             }
         }
         if (migrated > 0) {
-            SetStatus(L"已将 " + std::to_wstring(migrated) +
-                      L" 个托管文件整理到“已托管文件”");
+            SetStatus(localization_.Format(
+                "status.managed_library_reorganized",
+                {{L"count", std::to_wstring(migrated)}}));
         }
         PruneEmptyLegacyManagedLibraryDirectories();
     }
@@ -26896,29 +27487,66 @@ private:
         }
     }
 
+    std::wstring SafetyLibraryShortcutName() const {
+        return T("safety_library.desktop_entry") + L".lnk";
+    }
+
     std::optional<std::filesystem::path>
     ManagedLibraryDesktopShortcutPath() const {
         const std::optional<std::filesystem::path> desktop =
             CurrentUserDesktopPath();
         if (!desktop.has_value()) return std::nullopt;
-        return *desktop / L"引力桌面文件库.lnk";
+        return *desktop / SafetyLibraryShortcutName();
     }
 
-    std::optional<std::filesystem::path>
-    ManagedLibrarySafetyCenterShortcutPath() const {
-        const std::optional<std::filesystem::path> desktop =
-            CurrentUserDesktopPath();
-        if (!desktop.has_value()) return std::nullopt;
-        return *desktop / L"引力桌面安全中心.lnk";
+    static bool IsDefaultSafetyLibraryShortcutName(
+        std::wstring_view fileName) {
+        static constexpr std::array<std::wstring_view, 10> names{{
+            L"引力桌面文件库.lnk", L"引力桌面安全中心.lnk",
+            L"引力桌面安全文件库.lnk", L"引力桌面安全檔案庫.lnk",
+            L"Gravity Desktop Safe Files.lnk",
+            L"Gravity Desktop Safe File Library.lnk",
+            L"Gravity Desktop 安全ファイル ライブラリ.lnk",
+            L"Gravity Desktop Sichere Dateien.lnk",
+            L"Archivos seguros de Gravity Desktop.lnk",
+            L"Fichiers sécurisés de Gravity Desktop.lnk"}};
+        return std::find(names.begin(), names.end(), fileName) != names.end();
+    }
+
+    static bool IsDefaultSafetyInformationName(std::wstring_view fileName) {
+        static constexpr std::array<std::wstring_view, 7> names{{
+            L"Gravity Desktop 安全说明.txt", L"Gravity Desktop 安全說明.txt",
+            L"Gravity Desktop Safety Information.txt",
+            L"Gravity Desktop 安全ファイル情報.txt",
+            L"Gravity Desktop Sicherheitsinformationen.txt",
+            L"Información de seguridad de Gravity Desktop.txt",
+            L"Informations de sécurité Gravity Desktop.txt"}};
+        return std::find(names.begin(), names.end(), fileName) != names.end();
+    }
+
+    static bool IsDefaultRecoveryShortcutName(std::wstring_view fileName) {
+        static constexpr std::array<std::wstring_view, 7> names{{
+            L"恢复全部文件到桌面.lnk", L"將所有檔案還原到桌面.lnk",
+            L"Restore All Files to Windows Desktop.lnk",
+            L"すべてのファイルを Windows デスクトップに復元.lnk",
+            L"Alle Dateien auf dem Windows-Desktop wiederherstellen.lnk",
+            L"Restaurar todos los archivos al escritorio de Windows.lnk",
+            L"Restaurer tous les fichiers sur le Bureau Windows.lnk"}};
+        return std::find(names.begin(), names.end(), fileName) != names.end();
     }
 
     std::filesystem::path RecoveryToolPath() const {
-        return ManagedLibraryPath() / L"恢复工具" /
+        return ManagedLibraryPath() / L"Recovery Tools" /
             L"GravityDesktopRecovery.exe";
     }
 
     std::filesystem::path RecoveryShortcutPath() const {
-        return ManagedLibraryPath() / L"恢复全部文件到桌面.lnk";
+        return ManagedLibraryPath() / (T("safety_library.recovery_entry") +
+                                       L".lnk");
+    }
+
+    std::filesystem::path SafetyInformationPath() const {
+        return ManagedLibraryPath() / T("safety_library.information_file");
     }
 
     bool HasManagedFiles() const {
@@ -26936,8 +27564,6 @@ private:
     void EnsureManagedLibrarySafetyCenter() {
         const std::optional<std::filesystem::path> libraryShortcutPath =
             ManagedLibraryDesktopShortcutPath();
-        const std::optional<std::filesystem::path> legacySafetyShortcutPath =
-            ManagedLibrarySafetyCenterShortcutPath();
         if (!libraryShortcutPath.has_value()) {
             AppendRuntimeDiagnostic("managed_library_desktop_unavailable");
             return;
@@ -26976,7 +27602,10 @@ private:
                      << L".ico";
             durableLibraryIcon = durableRecovery.parent_path() / fileName.str();
         }
+        bool durableRecoveryVerified = false;
+        std::optional<std::array<std::uint8_t, 32>> sourceRecoverySha;
         if (FilePathExists(sourceRecovery.wstring())) {
+            sourceRecoverySha = Sha256File(sourceRecovery);
             std::filesystem::create_directories(
                 durableRecovery.parent_path(), error);
             const DWORD toolFolderAttributes = GetFileAttributesW(
@@ -26987,24 +27616,25 @@ private:
                     toolFolderAttributes | FILE_ATTRIBUTE_HIDDEN |
                         FILE_ATTRIBUTE_SYSTEM);
             }
-            bool recoveryAvailable = false;
-            if (!error) {
-                recoveryAvailable = CopyFileAtomicallyIfChanged(
-                    sourceRecovery, durableRecovery);
-            }
-            // A currently running recovery tool can temporarily prevent an
-            // upgrade. Keep its already verified copy rather than breaking the
-            // emergency entry while the main app is starting.
-            if (!recoveryAvailable) {
-                recoveryAvailable = FilePathExists(durableRecovery.wstring());
-            }
-            if (recoveryAvailable) {
-                AppendRuntimeDiagnostic("recovery_tool_available");
+            const bool copied = !error && sourceRecoverySha.has_value() &&
+                CopyFileAtomicallyIfChanged(sourceRecovery, durableRecovery);
+            const auto durableRecoverySha = copied
+                ? Sha256File(durableRecovery)
+                : std::nullopt;
+            durableRecoveryVerified = sourceRecoverySha.has_value() &&
+                durableRecoverySha.has_value() &&
+                *sourceRecoverySha == *durableRecoverySha;
+            if (durableRecoveryVerified) {
+                AppendRuntimeDiagnostic("recovery_tool_verified");
             } else if (error) {
                 AppendRuntimeDiagnostic("recovery_tool_folder_failed", S_OK,
                                         static_cast<DWORD>(error.value()));
+            } else if (!sourceRecoverySha.has_value()) {
+                AppendRuntimeDiagnostic("recovery_tool_source_hash_failed");
             } else {
-                AppendRuntimeDiagnostic("recovery_tool_copy_failed", E_FAIL,
+                // Never migrate or delete a historical emergency entry unless
+                // the durable Recovery is byte-identical to this build.
+                AppendRuntimeDiagnostic("recovery_tool_verify_failed", E_FAIL,
                                         GetLastError());
             }
         } else {
@@ -27012,10 +27642,11 @@ private:
         }
 
         // The durable recovery tool is intentionally independent from the
-        // main executable.  Copy only its two current language packs beside
-        // it, so it can still honor the user's language preference when the
-        // main application cannot start.
-        for (const wchar_t* locale : {L"en-US.json", L"zh-CN.json"}) {
+        // main executable. Keep every shipped language pack beside it, so an
+        // emergency recovery session uses the same language as the desktop.
+        for (const wchar_t* locale : {L"en-US.json", L"zh-CN.json",
+                                      L"ja-JP.json", L"de-DE.json",
+                                      L"es-ES.json", L"fr-FR.json"}) {
             const std::filesystem::path source = sourceLocales / locale;
             const std::filesystem::path destination = durableLocales / locale;
             if (!FilePathExists(source.wstring())) continue;
@@ -27048,10 +27679,8 @@ private:
             AppendRuntimeDiagnostic("managed_library_icon_source_missing");
         }
 
-        constexpr wchar_t kLibraryDescription[] =
-            L"引力桌面托管文件库（程序故障时仍可直接访问）";
-        constexpr wchar_t kLegacySafetyDescription[] =
-            L"打开引力桌面文件库和紧急恢复入口";
+        const std::wstring libraryDescription =
+            T("safety_library.desktop_entry_description");
         const auto isKnownManagedLibraryShortcut =
             [&](const std::filesystem::path& shortcut) {
             ComPtr<IShellLinkW> shellLink;
@@ -27074,13 +27703,20 @@ private:
                     NormalizePath(library.wstring()))) {
                 return false;
             }
-            const std::wstring value(description.data());
-            return value == kLibraryDescription ||
-                   value == kLegacySafetyDescription;
+            return true;
         };
 
-        const auto isKnownRecoveryShortcut =
+        struct RecoveryShortcutInfo {
+            bool readable = false;
+            std::filesystem::path target;
+            std::wstring arguments;
+            std::wstring description;
+            std::filesystem::path icon;
+            int iconIndex = 0;
+        };
+        const auto readRecoveryShortcut =
             [&](const std::filesystem::path& shortcut) {
+            RecoveryShortcutInfo info;
             ComPtr<IShellLinkW> shellLink;
             HRESULT result = CoCreateInstance(
                 CLSID_ShellLink, nullptr, CLSCTX_INPROC_SERVER,
@@ -27090,12 +27726,105 @@ private:
             if (SUCCEEDED(result)) result = persist->Load(
                 shortcut.c_str(), STGM_READ);
             std::array<wchar_t, 32768> target{};
+            std::array<wchar_t, 32768> arguments{};
+            std::array<wchar_t, 1024> description{};
+            std::array<wchar_t, 32768> icon{};
             if (SUCCEEDED(result)) result = shellLink->GetPath(
                 target.data(), static_cast<int>(target.size()), nullptr,
                 SLGP_RAWPATH);
-            return SUCCEEDED(result) && PathEquals(
-                NormalizePath(target.data()),
-                NormalizePath(durableRecovery.wstring()));
+            if (SUCCEEDED(result)) result = shellLink->GetArguments(
+                arguments.data(), static_cast<int>(arguments.size()));
+            if (SUCCEEDED(result)) result = shellLink->GetDescription(
+                description.data(), static_cast<int>(description.size()));
+            if (SUCCEEDED(result)) result = shellLink->GetIconLocation(
+                icon.data(), static_cast<int>(icon.size()), &info.iconIndex);
+            if (SUCCEEDED(result)) {
+                info.readable = true;
+                info.target = target.data();
+                info.arguments = arguments.data();
+                info.description = description.data();
+                info.icon = icon.data();
+            }
+            return info;
+        };
+
+        const std::filesystem::path legacyRecovery =
+            library / L"恢复工具" / L"GravityDesktopRecovery.exe";
+        const auto isOfficialRecoveryTarget =
+            [&](const std::filesystem::path& target) {
+            return PathEquals(NormalizePath(target.wstring()),
+                              NormalizePath(durableRecovery.wstring())) ||
+                   PathEquals(NormalizePath(target.wstring()),
+                              NormalizePath(legacyRecovery.wstring()));
+        };
+        const auto isOfficialRecoveryIcon =
+            [&](const RecoveryShortcutInfo& info) {
+            if (info.icon.empty() || !isOfficialRecoveryTarget(info.target) ||
+                !PathEquals(NormalizePath(info.icon.parent_path().wstring()),
+                            NormalizePath(info.target.parent_path().wstring()))) {
+                return false;
+            }
+            const std::wstring fileName = info.icon.filename().wstring();
+            return _wcsicmp(fileName.c_str(),
+                            L"GravityDesktopRecovery.exe") == 0 ||
+                   _wcsicmp(fileName.c_str(),
+                            L"GravityDesktopLibrary.ico") == 0 ||
+                   (fileName.rfind(L"GravityDesktopLibrary-", 0) == 0 &&
+                    _wcsicmp(info.icon.extension().c_str(), L".ico") == 0);
+        };
+        const auto isKnownRecoveryDescription = [](std::wstring_view value) {
+            static constexpr std::array<std::wstring_view, 7> descriptions{{
+                L"将所有引力桌面托管文件安全恢复到 Windows 桌面",
+                L"將所有 Gravity Desktop 託管檔案安全還原到 Windows 桌面",
+                L"Safely restore all files managed by Gravity Desktop to the Windows Desktop.",
+                L"Gravity Desktop が管理するすべてのファイルを Windows デスクトップに安全に復元します。",
+                L"Alle von Gravity Desktop verwalteten Dateien sicher auf dem Windows-Desktop wiederherstellen.",
+                L"Restaura de forma segura al escritorio de Windows todos los archivos administrados por Gravity Desktop.",
+                L"Restaure en toute sécurité sur le Bureau Windows tous les fichiers gérés par Gravity Desktop."}};
+            return std::find(descriptions.begin(), descriptions.end(), value) !=
+                   descriptions.end();
+        };
+        const auto isConservativeOfficialRecoveryShortcut =
+            [&](const std::filesystem::path& shortcut,
+                const RecoveryShortcutInfo& info) {
+            return info.readable &&
+                   IsDefaultRecoveryShortcutName(
+                       shortcut.filename().wstring()) &&
+                   isOfficialRecoveryTarget(info.target) &&
+                   info.arguments.empty() &&
+                   isOfficialRecoveryIcon(info) &&
+                   isKnownRecoveryDescription(info.description);
+        };
+
+        // The marker stores the exact filename and SHA-256 of the last
+        // program-generated link.  It is stronger than guessing ownership
+        // from a localized filename and remains hidden with the durable tool.
+        const std::filesystem::path recoveryShortcutMarker =
+            durableRecovery.parent_path() /
+            L".gravitydesktop-recovery-shortcut";
+        const auto markerMatchesShortcut =
+            [&](const std::filesystem::path& shortcut) {
+            const std::optional<std::string> marker =
+                ReadUtf8File(recoveryShortcutMarker);
+            const auto shortcutSha = Sha256File(shortcut);
+            if (!marker.has_value() || !shortcutSha.has_value()) return false;
+            std::istringstream input(*marker);
+            std::string version;
+            std::string expectedHash;
+            std::string expectedName;
+            std::getline(input, version);
+            std::getline(input, expectedHash);
+            std::getline(input, expectedName);
+            if (!version.empty() && version.back() == '\r') version.pop_back();
+            if (!expectedHash.empty() && expectedHash.back() == '\r') {
+                expectedHash.pop_back();
+            }
+            if (!expectedName.empty() && expectedName.back() == '\r') {
+                expectedName.pop_back();
+            }
+            return version == "GravityDesktop.RecoveryShortcut.v1" &&
+                   expectedHash == Sha256Hex(*shortcutSha) &&
+                   Utf8ToWide(expectedName) == shortcut.filename().wstring();
         };
 
         const auto createOrUpdateShortcut =
@@ -27133,8 +27862,44 @@ private:
             return SUCCEEDED(result);
         };
 
-        const bool libraryShortcutReady = createOrUpdateShortcut(
-            library, *libraryShortcutPath, kLibraryDescription,
+        // A generated entry may have an old localized default name. Rename
+        // only those known defaults; a differently named shortcut is treated
+        // as user-owned and is never overwritten or duplicated.
+        std::optional<std::filesystem::path> existingGeneratedShortcut;
+        bool userNamedSafetyShortcutExists = false;
+        if (const auto desktop = CurrentUserDesktopPath(); desktop.has_value()) {
+            std::error_code iteratorError;
+            for (std::filesystem::directory_iterator iterator(
+                     *desktop, iteratorError), end;
+                 !iteratorError && iterator != end;
+                 iterator.increment(iteratorError)) {
+                if (iterator->path().extension() != L".lnk" ||
+                    !isKnownManagedLibraryShortcut(iterator->path())) {
+                    continue;
+                }
+                if (IsDefaultSafetyLibraryShortcutName(
+                        iterator->path().filename().wstring())) {
+                    existingGeneratedShortcut = iterator->path();
+                    break;
+                }
+                userNamedSafetyShortcutExists = true;
+            }
+        }
+        if (existingGeneratedShortcut.has_value() &&
+            !PathEquals(existingGeneratedShortcut->wstring(),
+                        libraryShortcutPath->wstring()) &&
+            !FilePathExists(libraryShortcutPath->wstring())) {
+            if (MoveFileExW(existingGeneratedShortcut->c_str(),
+                            libraryShortcutPath->c_str(),
+                            MOVEFILE_WRITE_THROUGH) == FALSE) {
+                AppendRuntimeDiagnostic("managed_library_shortcut_rename_failed",
+                                        E_FAIL, GetLastError());
+            }
+        }
+        const bool libraryShortcutReady = userNamedSafetyShortcutExists
+            ? true
+            : createOrUpdateShortcut(
+            library, *libraryShortcutPath, libraryDescription.c_str(),
             isKnownManagedLibraryShortcut, true);
         if (!libraryShortcutReady) {
             AppendRuntimeDiagnostic("managed_library_shortcut_failed",
@@ -27143,34 +27908,210 @@ private:
             SHChangeNotify(SHCNE_UPDATEITEM, SHCNF_PATHW,
                            libraryShortcutPath->c_str(), nullptr);
         }
-        if (libraryShortcutReady && legacySafetyShortcutPath.has_value() &&
-            FilePathExists(legacySafetyShortcutPath->wstring()) &&
-            isKnownManagedLibraryShortcut(*legacySafetyShortcutPath)) {
-            if (DeleteFileW(legacySafetyShortcutPath->c_str()) == FALSE) {
-                AppendRuntimeDiagnostic(
-                    "managed_legacy_safety_shortcut_delete_failed",
-                    E_FAIL, GetLastError());
-            } else {
-                SHChangeNotify(SHCNE_DELETE, SHCNF_PATHW,
-                               legacySafetyShortcutPath->c_str(), nullptr);
+        // Recovery entries are scanned only in the library root.  A legacy
+        // entry is program-owned only when its name, target, arguments, icon,
+        // and description all match known generated values.  Ambiguous links
+        // are always preserved as user-owned.
+        std::vector<std::filesystem::path> officialRecoveryShortcuts;
+        std::optional<std::filesystem::path> userNamedCurrentRecoveryShortcut;
+        std::error_code recoveryIteratorError;
+        for (std::filesystem::directory_iterator iterator(library,
+                 recoveryIteratorError), end;
+             !recoveryIteratorError && iterator != end;
+             iterator.increment(recoveryIteratorError)) {
+            if (!iterator->is_regular_file(recoveryIteratorError) ||
+                recoveryIteratorError ||
+                _wcsicmp(iterator->path().extension().c_str(), L".lnk") != 0) {
+                recoveryIteratorError.clear();
+                continue;
+            }
+            const RecoveryShortcutInfo info =
+                readRecoveryShortcut(iterator->path());
+            if (markerMatchesShortcut(iterator->path()) ||
+                isConservativeOfficialRecoveryShortcut(
+                    iterator->path(), info)) {
+                officialRecoveryShortcuts.push_back(iterator->path());
+                continue;
+            }
+            if (info.readable && info.arguments.empty() &&
+                PathEquals(NormalizePath(info.target.wstring()),
+                           NormalizePath(durableRecovery.wstring()))) {
+                userNamedCurrentRecoveryShortcut = iterator->path();
             }
         }
-        const bool recoveryShortcutReady =
-            FilePathExists(durableRecovery.wstring()) &&
-            createOrUpdateShortcut(
-                durableRecovery, RecoveryShortcutPath(),
-                L"将所有引力桌面托管文件安全恢复到 Windows 桌面",
-                isKnownRecoveryShortcut, true);
-        if (!recoveryShortcutReady) {
-            AppendRuntimeDiagnostic("recovery_shortcut_create_failed", E_FAIL,
-                                    GetLastError());
-        } else {
+
+        const std::filesystem::path desiredRecoveryShortcut =
+            RecoveryShortcutPath();
+        std::optional<std::filesystem::path> activeRecoveryShortcut;
+        bool activeRecoveryShortcutVerified = false;
+        const RecoveryShortcutInfo existingDesiredInfo =
+            readRecoveryShortcut(desiredRecoveryShortcut);
+        const bool existingDesiredIsCurrent =
+            durableRecoveryVerified && libraryIconAvailable &&
+            existingDesiredInfo.readable &&
+            existingDesiredInfo.arguments.empty() &&
+            PathEquals(NormalizePath(existingDesiredInfo.target.wstring()),
+                       NormalizePath(durableRecovery.wstring())) &&
+            PathEquals(NormalizePath(existingDesiredInfo.icon.wstring()),
+                       NormalizePath(durableLibraryIcon.wstring())) &&
+            existingDesiredInfo.description ==
+                T("safety_library.recovery_description") &&
+            markerMatchesShortcut(desiredRecoveryShortcut);
+        if (existingDesiredIsCurrent) {
+            activeRecoveryShortcut = desiredRecoveryShortcut;
+            activeRecoveryShortcutVerified = true;
+        } else if (durableRecoveryVerified && libraryIconAvailable &&
+            userNamedCurrentRecoveryShortcut.has_value()) {
+            // The user renamed or created this link.  Keep its name and do not
+            // create another localized default merely because the language
+            // changed.
+            activeRecoveryShortcut = userNamedCurrentRecoveryShortcut;
+            activeRecoveryShortcutVerified = true;
+        } else if (durableRecoveryVerified && libraryIconAvailable) {
+            bool destinationIsReplaceable = true;
+            if (FilePathExists(desiredRecoveryShortcut.wstring())) {
+                const bool confirmedOfficial = std::any_of(
+                    officialRecoveryShortcuts.begin(),
+                    officialRecoveryShortcuts.end(),
+                    [&](const std::filesystem::path& candidate) {
+                        return PathEquals(candidate.wstring(),
+                                          desiredRecoveryShortcut.wstring());
+                    });
+                if (!confirmedOfficial) {
+                    destinationIsReplaceable = false;
+                    AppendRuntimeDiagnostic(
+                        "recovery_shortcut_user_collision_preserved");
+                }
+            }
+            if (destinationIsReplaceable) {
+                const std::filesystem::path pending =
+                    desiredRecoveryShortcut.wstring() + L".new";
+                (void)DeleteFileW(pending.c_str());
+                const auto neverOverwriteUnknown =
+                    [](const std::filesystem::path&) { return false; };
+                const std::wstring recoveryDescription =
+                    T("safety_library.recovery_description");
+                const bool pendingCreated = createOrUpdateShortcut(
+                    durableRecovery, pending, recoveryDescription.c_str(),
+                    neverOverwriteUnknown, true);
+                const RecoveryShortcutInfo pendingInfo =
+                    readRecoveryShortcut(pending);
+                const bool pendingVerified = pendingCreated &&
+                    pendingInfo.readable && pendingInfo.arguments.empty() &&
+                    PathEquals(NormalizePath(pendingInfo.target.wstring()),
+                               NormalizePath(durableRecovery.wstring())) &&
+                    PathEquals(NormalizePath(pendingInfo.icon.wstring()),
+                               NormalizePath(durableLibraryIcon.wstring())) &&
+                    pendingInfo.description == recoveryDescription;
+                bool committed = false;
+                if (pendingVerified) {
+                    committed = FilePathExists(
+                                    desiredRecoveryShortcut.wstring())
+                        ? ReplaceFileW(desiredRecoveryShortcut.c_str(),
+                                       pending.c_str(), nullptr,
+                                       REPLACEFILE_WRITE_THROUGH, nullptr,
+                                       nullptr) != FALSE
+                        : MoveFileExW(pending.c_str(),
+                                      desiredRecoveryShortcut.c_str(),
+                                      MOVEFILE_WRITE_THROUGH) != FALSE;
+                }
+                if (!committed) (void)DeleteFileW(pending.c_str());
+                const RecoveryShortcutInfo committedInfo =
+                    readRecoveryShortcut(desiredRecoveryShortcut);
+                const auto committedSha = Sha256File(desiredRecoveryShortcut);
+                const bool committedVerified = committed &&
+                    committedSha.has_value() && committedInfo.readable &&
+                    committedInfo.arguments.empty() &&
+                    PathEquals(NormalizePath(committedInfo.target.wstring()),
+                               NormalizePath(durableRecovery.wstring())) &&
+                    PathEquals(NormalizePath(committedInfo.icon.wstring()),
+                               NormalizePath(durableLibraryIcon.wstring())) &&
+                    committedInfo.description == recoveryDescription;
+                if (committedVerified) {
+                    const std::string marker =
+                        "GravityDesktop.RecoveryShortcut.v1\n" +
+                        Sha256Hex(*committedSha) + "\n" +
+                        WideToUtf8(
+                            desiredRecoveryShortcut.filename().wstring()) +
+                        "\n";
+                    const bool markerWritten = WriteUtf8AtomicIfChanged(
+                        recoveryShortcutMarker, marker);
+                    if (markerWritten) {
+                        const DWORD attributes = GetFileAttributesW(
+                            recoveryShortcutMarker.c_str());
+                        if (attributes != INVALID_FILE_ATTRIBUTES) {
+                            (void)SetFileAttributesW(
+                                recoveryShortcutMarker.c_str(),
+                                attributes | FILE_ATTRIBUTE_HIDDEN |
+                                    FILE_ATTRIBUTE_SYSTEM);
+                        }
+                    }
+                    activeRecoveryShortcut = desiredRecoveryShortcut;
+                    activeRecoveryShortcutVerified =
+                        markerWritten &&
+                        markerMatchesShortcut(desiredRecoveryShortcut);
+                }
+            }
+        }
+
+        // Deletion is the final step and is permitted only after the current
+        // Recovery and the surviving entry have both been verified.  Never
+        // remove an ambiguous or user-renamed shortcut.
+        if (durableRecoveryVerified && activeRecoveryShortcutVerified &&
+            activeRecoveryShortcut.has_value()) {
+            for (const std::filesystem::path& shortcut :
+                 officialRecoveryShortcuts) {
+                if (PathEquals(shortcut.wstring(),
+                               activeRecoveryShortcut->wstring())) {
+                    continue;
+                }
+                if (DeleteFileW(shortcut.c_str()) == FALSE) {
+                    AppendRuntimeDiagnostic(
+                        "recovery_shortcut_cleanup_failed", E_FAIL,
+                        GetLastError());
+                }
+            }
             SHChangeNotify(SHCNE_UPDATEITEM, SHCNF_PATHW,
-                           RecoveryShortcutPath().c_str(), nullptr);
+                           activeRecoveryShortcut->c_str(), nullptr);
+        } else {
+            AppendRuntimeDiagnostic("recovery_shortcut_migration_deferred");
+        }
+
+        const std::filesystem::path information = SafetyInformationPath();
+        std::error_code informationError;
+        for (std::filesystem::directory_iterator iterator(library,
+                 informationError), end;
+             !informationError && iterator != end;
+             iterator.increment(informationError)) {
+            const std::filesystem::path candidate = iterator->path();
+            if (candidate == information ||
+                !IsDefaultSafetyInformationName(candidate.filename().wstring())) {
+                continue;
+            }
+            if (!FilePathExists(information.wstring())) {
+                (void)MoveFileExW(candidate.c_str(), information.c_str(),
+                                  MOVEFILE_WRITE_THROUGH);
+            }
+            break;
+        }
+        // The safety information is user-facing. It must match the currently
+        // selected language exactly; a second Chinese appendix made an English
+        // installation visibly mixed-language.
+        const std::wstring informationContents =
+            T("safety_library.information_contents");
+        if (!WriteUtf8Atomic(information, WideToUtf8(informationContents))) {
+            AppendRuntimeDiagnostic("managed_library_information_write_failed");
         }
     }
 
     std::optional<std::filesystem::path> CurrentUserDesktopPath() const {
+        if (!desktopPathOverride_.empty()) {
+            if (gRunningSelfTest &&
+                !ValidateSelfTestPath(desktopPathOverride_)) {
+                return std::nullopt;
+            }
+            return desktopPathOverride_;
+        }
         PWSTR desktop = nullptr;
         if (FAILED(SHGetKnownFolderPath(
                 FOLDERID_Desktop, KF_FLAG_DEFAULT, nullptr, &desktop))) {
@@ -27258,8 +28199,8 @@ private:
         const std::wstring extension = requested.extension().wstring();
         for (int index = 2; index <= 9999; ++index) {
             const std::filesystem::path candidate = desktop /
-                (stem + L"（引力桌面还原 " + std::to_wstring(index) +
-                 L"）" + extension);
+                (stem + L" (Gravity Desktop Restore " + std::to_wstring(index) +
+                 L")" + extension);
             if (available(candidate)) return candidate;
         }
         return {};
@@ -27638,19 +28579,29 @@ private:
             return false;
         }
         const std::wstring normalized = NormalizePath(path);
-        const bool isLegacyLibraryShortcut = [&]() {
-            const auto shortcut = ManagedLibraryDesktopShortcutPath();
-            return shortcut.has_value() &&
-                PathEquals(normalized, NormalizePath(shortcut->wstring()));
+        const bool isSafetyLibraryShortcut = [&]() {
+            if (std::filesystem::path(normalized).extension() != L".lnk") {
+                return false;
+            }
+            ComPtr<IShellLinkW> shellLink;
+            HRESULT result = CoCreateInstance(
+                CLSID_ShellLink, nullptr, CLSCTX_INPROC_SERVER,
+                IID_PPV_ARGS(shellLink.ReleaseAndGetAddressOf()));
+            ComPtr<IPersistFile> persist;
+            if (SUCCEEDED(result)) result = shellLink.As(&persist);
+            if (SUCCEEDED(result)) result = persist->Load(
+                normalized.c_str(), STGM_READ);
+            std::array<wchar_t, 32768> target{};
+            if (SUCCEEDED(result)) result = shellLink->GetPath(
+                target.data(), static_cast<int>(target.size()), nullptr,
+                SLGP_RAWPATH);
+            return SUCCEEDED(result) && PathEquals(
+                NormalizePath(target.data()),
+                NormalizePath(ManagedLibraryPath().wstring()));
         }();
-        const bool isSafetyCenterShortcut = [&]() {
-            const auto shortcut = ManagedLibrarySafetyCenterShortcutPath();
-            return shortcut.has_value() &&
-                PathEquals(normalized, NormalizePath(shortcut->wstring()));
-        }();
-        if (isLegacyLibraryShortcut || isSafetyCenterShortcut) {
+        if (isSafetyLibraryShortcut) {
             if (reason != nullptr) {
-                *reason = L"“引力桌面安全中心”是受保护的恢复入口";
+                *reason = T("safety_library.protected_entry");
             }
             return false;
         }
@@ -28538,6 +29489,7 @@ private:
         if (client.right <= 1 || client.bottom <= 1) {
             return;
         }
+        ClearCoreEventEffects();
         if (renderTarget_ != nullptr) DiscardDeviceResources();
         if (draggingDivider_) {
             // During a divider drag redraw only the changed desktop boundary.
@@ -28554,6 +29506,7 @@ private:
     }
 
     void OnDpiChanged(WPARAM wParam, LPARAM lParam) {
+        ClearCoreEventEffects();
         dpi_ = static_cast<float>(HIWORD(wParam));
         RefreshWindowsVisualProfile();
         (void)lParam;
@@ -28603,6 +29556,7 @@ private:
     bool relationshipManifestRetryTimerActive_ = false;
     bool benchmarkMode_ = false;
     bool autoStartMode_ = false;
+    std::wstring initialLanguageOverride_;
     bool initialized_ = false;
     bool shuttingDown_ = false;
     bool sessionEndSaveFailed_ = false;
@@ -28616,6 +29570,11 @@ private:
     // Test-only override used by the isolated recovery mirror self-test.  The
     // production mirror always lives under the durable Documents library root.
     std::filesystem::path workspaceRecoveryRootOverride_;
+    // Test-only paths used by the Recovery-entry migration test.  Production
+    // instances leave both empty and continue to use the real known folders
+    // and the persisted application language.
+    std::filesystem::path desktopPathOverride_;
+    std::wstring testLocaleOverride_;
     std::optional<WorkspaceRecoveryMirror> pendingWorkspaceRecovery_;
     std::optional<RelationshipRecoveryManifest>
         pendingRelationshipRecovery_;
@@ -28695,6 +29654,8 @@ private:
     std::chrono::steady_clock::time_point coreSelectionRippleStarted_ =
         std::chrono::steady_clock::now();
     bool coreSelectionRippleCompleted_ = false;
+    std::chrono::steady_clock::time_point coreSelectionRippleResumeAfter_{};
+    std::vector<CoreEventEffect> coreEventEffects_;
     std::uint64_t focusedCoreId_ = 0;
     FocusAnimationState focusAnimationState_ = FocusAnimationState::Idle;
     std::chrono::steady_clock::time_point focusAnimationStarted_ =
@@ -29118,6 +30079,166 @@ bool RunWorkspaceRecoveryMirrorSelfTest() {
     return cleanup();
 }
 
+bool RunRecoveryShortcutMigrationSelfTest() {
+    const SelfTestModeScope selfTestMode;
+    const std::filesystem::path root = std::filesystem::temp_directory_path() /
+        (L"GravityDesktop-recovery-shortcut-" +
+         std::to_wstring(GetCurrentProcessId()) + L"-" +
+         std::to_wstring(GetTickCount64()));
+    if (!ValidateSelfTestPath(root)) return false;
+    std::error_code error;
+    const auto cleanup = [&]() {
+        error.clear();
+        std::filesystem::remove_all(root, error);
+        return !error;
+    };
+    const auto fail = [&]() {
+        (void)cleanup();
+        return false;
+    };
+    const HRESULT comResult = CoInitializeEx(nullptr, COINIT_APARTMENTTHREADED);
+    if (FAILED(comResult) && comResult != RPC_E_CHANGED_MODE) return fail();
+    const bool uninitialize = SUCCEEDED(comResult);
+    const auto finish = [&](bool result) {
+        const bool cleaned = cleanup();
+        if (uninitialize) CoUninitialize();
+        return result && cleaned;
+    };
+
+    const std::filesystem::path executableDirectory =
+        std::filesystem::path(CurrentExecutablePath()).parent_path();
+    const std::filesystem::path sourceRecovery =
+        executableDirectory / L"GravityDesktopRecovery.exe";
+    const std::filesystem::path sourceIcon =
+        executableDirectory / L"GravityDesktopLibrary.ico";
+    if (!std::filesystem::is_regular_file(sourceRecovery, error) || error ||
+        !std::filesystem::is_regular_file(sourceIcon, error) || error) {
+        return finish(false);
+    }
+
+    const std::filesystem::path desktop = root / L"Desktop";
+    const std::filesystem::path library = root / L"Gravity Desktop Files";
+    const std::filesystem::path managed = library / L"Managed Files";
+    const std::filesystem::path legacyTools = library / L"恢复工具";
+    std::filesystem::create_directories(desktop, error);
+    std::filesystem::create_directories(managed, error);
+    std::filesystem::create_directories(legacyTools, error);
+    if (error) return finish(false);
+
+    const std::filesystem::path legacyRecovery =
+        legacyTools / L"GravityDesktopRecovery.exe";
+    const std::filesystem::path legacyIcon =
+        legacyTools / L"GravityDesktopLibrary-legacy.ico";
+    if (CopyFileW(sourceRecovery.c_str(), legacyRecovery.c_str(), TRUE) == FALSE ||
+        CopyFileW(sourceIcon.c_str(), legacyIcon.c_str(), TRUE) == FALSE) {
+        return finish(false);
+    }
+    const std::filesystem::path managedFile = managed / L"sample.txt";
+    const std::filesystem::path manifest = library / L"recovery-manifest.json";
+    if (!WriteUtf8Atomic(managedFile, "managed-data") ||
+        !WriteUtf8Atomic(manifest, "{\"records\":[1]}") ) {
+        return finish(false);
+    }
+    const auto managedShaBefore = Sha256File(managedFile);
+    const auto manifestShaBefore = Sha256File(manifest);
+    if (!managedShaBefore.has_value() || !manifestShaBefore.has_value()) {
+        return finish(false);
+    }
+
+    const auto createShortcut = [&](const std::filesystem::path& destination,
+                                    const std::filesystem::path& target,
+                                    const std::filesystem::path& icon,
+                                    const std::wstring& description) {
+        ComPtr<IShellLinkW> shellLink;
+        HRESULT result = CoCreateInstance(
+            CLSID_ShellLink, nullptr, CLSCTX_INPROC_SERVER,
+            IID_PPV_ARGS(shellLink.ReleaseAndGetAddressOf()));
+        if (SUCCEEDED(result)) result = shellLink->SetPath(target.c_str());
+        if (SUCCEEDED(result)) result = shellLink->SetArguments(L"");
+        if (SUCCEEDED(result)) result = shellLink->SetDescription(
+            description.c_str());
+        if (SUCCEEDED(result)) result = shellLink->SetIconLocation(
+            icon.c_str(), 0);
+        ComPtr<IPersistFile> persist;
+        if (SUCCEEDED(result)) result = shellLink.As(&persist);
+        if (SUCCEEDED(result)) result = persist->Save(destination.c_str(), TRUE);
+        return SUCCEEDED(result);
+    };
+    const std::filesystem::path historicalShortcut =
+        library / L"恢复全部文件到桌面.lnk";
+    const std::filesystem::path userShortcut =
+        library / L"My Recovery.lnk";
+    if (!createShortcut(
+            historicalShortcut, legacyRecovery, legacyIcon,
+            gravity::i18n::Localization::ResourceText(
+                L"zh-CN", "safety_library.recovery_description")) ||
+        !createShortcut(userShortcut, legacyRecovery, legacyIcon,
+                        L"User-created recovery shortcut")) {
+        return finish(false);
+    }
+
+    GravityApp app;
+    app.state_.managedLibraryPath = library.wstring();
+    app.desktopPathOverride_ = desktop;
+    constexpr std::array<std::wstring_view, 6> locales{{
+        L"zh-CN", L"en-US", L"de-DE", L"fr-FR", L"ja-JP", L"zh-CN"}};
+    for (const std::wstring_view locale : locales) {
+        app.testLocaleOverride_ = locale;
+        app.EnsureManagedLibrarySafetyCenter();
+        const std::wstring expectedName =
+            gravity::i18n::Localization::ResourceText(
+                locale, "safety_library.recovery_entry") + L".lnk";
+        const std::filesystem::path expectedShortcut = library / expectedName;
+        const std::filesystem::path durableRecovery =
+            library / L"Recovery Tools" / L"GravityDesktopRecovery.exe";
+        if (!std::filesystem::is_regular_file(expectedShortcut, error) || error ||
+            !std::filesystem::is_regular_file(durableRecovery, error) || error ||
+            !FilesHaveSameContents(sourceRecovery, durableRecovery) ||
+            !std::filesystem::is_regular_file(userShortcut, error) || error) {
+            return finish(false);
+        }
+        std::size_t officialCount = 0;
+        for (std::filesystem::directory_iterator iterator(library, error), end;
+             !error && iterator != end; iterator.increment(error)) {
+            if (_wcsicmp(iterator->path().extension().c_str(), L".lnk") == 0 &&
+                GravityApp::IsDefaultRecoveryShortcutName(
+                    iterator->path().filename().wstring())) {
+                ++officialCount;
+            }
+        }
+        if (error || officialCount != 1) return finish(false);
+
+        ComPtr<IShellLinkW> shellLink;
+        HRESULT result = CoCreateInstance(
+            CLSID_ShellLink, nullptr, CLSCTX_INPROC_SERVER,
+            IID_PPV_ARGS(shellLink.ReleaseAndGetAddressOf()));
+        ComPtr<IPersistFile> persist;
+        if (SUCCEEDED(result)) result = shellLink.As(&persist);
+        if (SUCCEEDED(result)) result = persist->Load(
+            expectedShortcut.c_str(), STGM_READ);
+        std::array<wchar_t, 32768> target{};
+        if (SUCCEEDED(result)) result = shellLink->GetPath(
+            target.data(), static_cast<int>(target.size()), nullptr,
+            SLGP_RAWPATH);
+        if (FAILED(result) ||
+            !PathEquals(NormalizePath(target.data()),
+                        NormalizePath(durableRecovery.wstring()))) {
+            return finish(false);
+        }
+    }
+
+    if (Sha256File(managedFile) != managedShaBefore ||
+        Sha256File(manifest) != manifestShaBefore ||
+        !std::filesystem::is_regular_file(legacyRecovery, error) || error ||
+        GravityApp::FilePathExists(
+            (library / L"recovery-transaction.json").wstring()) ||
+        GravityApp::FilePathExists(
+            (library / L"恢复事务.json").wstring())) {
+        return finish(false);
+    }
+    return finish(true);
+}
+
 bool RunSelfTest() {
     gSelfTestPathViolation = false;
     const SelfTestModeScope selfTestMode;
@@ -29146,6 +30267,7 @@ bool RunSelfTest() {
         }
     }
     if (!RunWorkspaceRecoveryMirrorSelfTest() ||
+        !RunRecoveryShortcutMigrationSelfTest() ||
         !gravity::i18n::Localization::RunSelfTest() ||
         !GravityApp::IsInternetShortcutPath(
             L"C:\\Users\\TestUser\\Desktop\\game.url") ||
@@ -29547,8 +30669,7 @@ bool RunSelfTest() {
     managedCollectionSessionApp.SetManagedCollectionStatus(L"测试核心");
     if (!managedCollectionSessionApp.
             managedCollectionUndoStatusAvailable_ ||
-        managedCollectionSessionApp.status_.find(L"已收纳") ==
-            std::wstring::npos) {
+        managedCollectionSessionApp.status_.empty()) {
         return false;
     }
     const D2D1_RECT_F undoBounds =
@@ -29922,7 +31043,7 @@ bool RunSelfTest() {
             restoreDestinationDirectory, L"duplicate.txt",
             reservedRestoreDestinations);
     if (alternateRestoreDestination.filename() !=
-            L"duplicate（引力桌面还原 2）.txt") {
+            L"duplicate (Gravity Desktop Restore 2).txt") {
         return false;
     }
     reservedRestoreDestinations.insert(
@@ -29932,7 +31053,7 @@ bool RunSelfTest() {
             restoreDestinationDirectory, L"duplicate.txt",
             reservedRestoreDestinations);
     if (secondAlternateRestoreDestination.filename() !=
-            L"duplicate（引力桌面还原 3）.txt") {
+            L"duplicate (Gravity Desktop Restore 3).txt") {
         return false;
     }
 
@@ -30127,9 +31248,7 @@ bool RunSelfTest() {
         sessionSaveBlocker;
     sessionRecoveryNoticeApp.
         NotifyPendingSessionEndRecovery();
-    if (sessionRecoveryNoticeApp.status_.find(
-            L"恢复副本") ==
-        std::wstring::npos) {
+    if (sessionRecoveryNoticeApp.status_.empty()) {
         return false;
     }
 
@@ -30855,8 +31974,7 @@ bool RunSelfTest() {
             insufficientBefore ||
         !insufficientCapacityMoveApp.
              undoStack_.empty() ||
-        insufficientCapacityMoveApp.status_.find(
-            L"容量不足") == std::wstring::npos) {
+        insufficientCapacityMoveApp.status_.empty()) {
         return false;
     }
 
@@ -30874,8 +31992,7 @@ bool RunSelfTest() {
         1, 500, 2, cyclicSnapshot);
     if (SerializeState(cyclicMoveApp.state_) !=
             cyclicBefore ||
-        cyclicMoveApp.status_.find(
-            L"循环") == std::wstring::npos) {
+        cyclicMoveApp.status_.empty()) {
         return false;
     }
 
@@ -30906,8 +32023,7 @@ bool RunSelfTest() {
     if (SerializeState(failedMoveApp.state_) !=
             failedMoveBefore ||
         !failedMoveApp.undoStack_.empty() ||
-        failedMoveApp.status_.find(
-            L"完整恢复") == std::wstring::npos) {
+        failedMoveApp.status_.empty()) {
         return false;
     }
 
@@ -31202,9 +32318,7 @@ bool RunSelfTest() {
             failedRemovalApp.state_) !=
             failedRemovalBefore ||
         !failedRemovalApp.undoStack_.empty() ||
-        failedRemovalApp.status_.find(
-            L"原状态保持不变") ==
-            std::wstring::npos) {
+        failedRemovalApp.status_.empty()) {
         return false;
     }
 
@@ -31292,8 +32406,7 @@ bool RunSelfTest() {
     if (SerializeState(externalRelationApp.state_) !=
             beforeMultiDrop ||
         !externalRelationApp.undoStack_.empty() ||
-        externalRelationApp.status_ !=
-            L"一次只能添加一个子文件") {
+        externalRelationApp.status_.empty()) {
         return false;
     }
     const D2D1_POINT_2F previewCoreScreen =
@@ -31458,8 +32571,7 @@ bool RunSelfTest() {
             D2D1::Point2F(340.0f, 300.0f)) ||
         SerializeState(foreignOwnerApp.state_) !=
             foreignBefore ||
-        foreignOwnerApp.status_ !=
-            L"该文件已属于其他核心") {
+        foreignOwnerApp.status_.empty()) {
         return false;
     }
 
@@ -31646,8 +32758,7 @@ bool RunSelfTest() {
         SerializeState(relationSaveFailureApp.state_) !=
             relationFailureBefore ||
         !relationSaveFailureApp.undoStack_.empty() ||
-        relationSaveFailureApp.status_.find(
-            L"已完整回滚") == std::wstring::npos) {
+        relationSaveFailureApp.status_.empty()) {
         return false;
     }
 
@@ -31881,8 +32992,8 @@ bool RunSelfTest() {
         return false;
     }
     const std::filesystem::path recoveryManifestPath =
-        std::filesystem::path(manifestSnapshot.managedLibraryPath) /
-        L"恢复清单.json";
+        manifestApp.RecoveryManifestPath(
+            std::filesystem::path(manifestSnapshot.managedLibraryPath));
     const auto manifestWriteTime = std::filesystem::last_write_time(
         manifestStatePath.parent_path() / L"relationships.json", tempError);
     const auto recoveryManifestWriteTime = std::filesystem::last_write_time(
@@ -32099,7 +33210,7 @@ bool RunSelfTest() {
     flatLibraryApp.state_.cores.push_back(std::move(flatCore));
     flatLibraryApp.MigrateLegacyManagedLibraryItems();
     const std::filesystem::path flatDestination =
-        flatLibrary / L"已托管文件" / L"report.txt";
+        flatLibrary / L"Managed Files" / L"report.txt";
     const FileItem* migratedFlatItem = flatLibraryApp.FindItem(900, 901);
     if (!GravityApp::FilePathExists(flatDestination.wstring()) ||
         GravityApp::FilePathExists(legacyFlatSource.wstring()) ||
@@ -32124,7 +33235,7 @@ bool RunSelfTest() {
     flatLibraryApp.FindCore(900)->files.push_back(collisionItem);
     flatLibraryApp.MigrateLegacyManagedLibraryItems();
     const std::filesystem::path collisionDestination =
-        flatLibrary / L"已托管文件" / L"report (2).txt";
+        flatLibrary / L"Managed Files" / L"report (2).txt";
     const FileItem* migratedCollisionItem =
         flatLibraryApp.FindItem(900, 903);
     if (!GravityApp::FilePathExists(collisionDestination.wstring()) ||
@@ -32721,10 +33832,35 @@ bool RunSelfTest() {
 
 } // namespace
 
+std::wstring InitialLanguageArgument() {
+    int argumentCount = 0;
+    LPWSTR* arguments = CommandLineToArgvW(GetCommandLineW(), &argumentCount);
+    if (arguments == nullptr) return {};
+    std::wstring result;
+    constexpr std::wstring_view prefix = L"--initial-language=";
+    for (int index = 1; index < argumentCount; ++index) {
+        const std::wstring_view value(arguments[index]);
+        if (value.size() > prefix.size() &&
+            CompareStringOrdinal(value.data(),
+                static_cast<int>(prefix.size()), prefix.data(),
+                static_cast<int>(prefix.size()), TRUE) == CSTR_EQUAL) {
+            result.assign(value.substr(prefix.size()));
+            break;
+        }
+    }
+    LocalFree(arguments);
+    return result;
+}
+
 int APIENTRY wWinMain(_In_ HINSTANCE instance, _In_opt_ HINSTANCE,
                       _In_ PWSTR commandLine, _In_ int showCommand) {
+    if (commandLine != nullptr &&
+        wcsstr(commandLine, L"--recovery-shortcut-self-test") != nullptr) {
+        return RunRecoveryShortcutMigrationSelfTest() ? 0 : 4;
+    }
     if (commandLine != nullptr && wcsstr(commandLine, L"--self-test") != nullptr) {
-        return RunSelfTest() ? 0 : 2;
+        const bool passed = RunSelfTest();
+        return passed ? 0 : (gSelfTestPathViolation ? 7 : 2);
     }
     if (commandLine != nullptr &&
         wcsstr(commandLine, L"--uninstall-cleanup") != nullptr) {
@@ -32737,7 +33873,12 @@ int APIENTRY wWinMain(_In_ HINSTANCE instance, _In_opt_ HINSTANCE,
     SetProcessDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2);
     const HRESULT comResult = OleInitialize(nullptr);
     if (FAILED(comResult)) {
-        MessageBoxW(nullptr, L"COM 初始化失败。", kWindowTitle, MB_OK | MB_ICONERROR);
+        gravity::i18n::Localization startupLocalization;
+        startupLocalization.Load();
+        MessageBoxW(nullptr,
+                    startupLocalization.Text("startup.com_init_failed").c_str(),
+                    startupLocalization.Text("app.title").c_str(),
+                    MB_OK | MB_ICONERROR);
         return 1;
     }
 
@@ -32835,7 +33976,7 @@ int APIENTRY wWinMain(_In_ HINSTANCE instance, _In_opt_ HINSTANCE,
 
     const bool benchmarkMode =
         commandLine != nullptr && wcsstr(commandLine, L"--benchmark-layout") != nullptr;
-    GravityApp app(benchmarkMode, autoStartLaunch);
+    GravityApp app(benchmarkMode, autoStartLaunch, InitialLanguageArgument());
     (void)TaskbarCreatedMessage();
     constexpr DWORD lifecycleExStyle =
         WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE;
