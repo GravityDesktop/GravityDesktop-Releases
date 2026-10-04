@@ -6,13 +6,24 @@ It helps users organize desktop files visually through cores and relationships w
 
 ## Status
 
-Gravity Desktop is currently in early Alpha development.
+Current public version: **1.0.20.0**
 
-## Downloads
+## Official installation
 
-Official Windows releases will be published on the GitHub Releases page.
+Install Gravity Desktop from the Microsoft Store:
 
-No public release is available yet.
+[Microsoft Store](https://apps.microsoft.com/store/detail/9P4Q9JK2DV8R?cid=DevShareMCLPCS)
+
+The Microsoft Store is the official installation and update channel. It provides the signed package and Microsoft distribution.
+
+## Release information
+
+- Version: 1.0.20.0
+- Platform: Windows x64
+- Installation: Microsoft Store only
+- This repository does not distribute unsigned MSIX or development binaries.
+
+Release notes and demonstration media may be published here; installation must always use the Microsoft Store link above.
 
 ## Platform
 
