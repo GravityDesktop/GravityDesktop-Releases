@@ -25,6 +25,18 @@ The Microsoft Store is the official installation and update channel. It provides
 
 Release notes and demonstration media may be published here; installation must always use the Microsoft Store link above.
 
+## Demonstration media
+
+The following screenshots and processed screen recording are demonstration materials only. They are not installation packages.
+
+- [Screenshot 1](media/screenshot-114533.png)
+- [Screenshot 2](media/screenshot-114624.png)
+- [Screenshot 3](media/screenshot-114703.png)
+- [Screenshot 4](media/screenshot-114818.png)
+- [Screenshot 5](media/screenshot-114838.png)
+- [Screenshot 6](media/screenshot-114852.png)
+- [Processed screen recording](media/gravity-desktop-demo-20261005.mp4)
+
 ## Platform
 
 - Windows 11
