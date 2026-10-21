@@ -1,0 +1,38 @@
+#pragma code_page(65001)
+
+#include <winver.h>
+#include "GravityDesktopResource.h"
+
+IDI_GRAVITYDESKTOP ICON "GravityDesktop.ico"
+
+VS_VERSION_INFO VERSIONINFO
+ FILEVERSION 0,1,0,0
+ PRODUCTVERSION 0,1,0,0
+ FILEFLAGSMASK 0x3fL
+#ifdef _DEBUG
+ FILEFLAGS VS_FF_DEBUG
+#else
+ FILEFLAGS 0x0L
+#endif
+ FILEOS VOS__WINDOWS32
+ FILETYPE VFT_APP
+ FILESUBTYPE VFT2_UNKNOWN
+BEGIN
+    BLOCK "StringFileInfo"
+    BEGIN
+        BLOCK "080404B0"
+        BEGIN
+            VALUE "FileDescription", "桌面文件工作关系整理工具"
+            VALUE "FileVersion", "0.1.0-alpha"
+            VALUE "InternalName", "GravityDesktop"
+            VALUE "OriginalFilename", "GravityDesktop.exe"
+            VALUE "ProductName", "引力桌面"
+            VALUE "ProductVersion", "0.1.0-alpha"
+            VALUE "Comments", "English Name: Gravity Desktop; Author: wangboyun"
+        END
+    END
+    BLOCK "VarFileInfo"
+    BEGIN
+        VALUE "Translation", 0x0804, 1200
+    END
+END

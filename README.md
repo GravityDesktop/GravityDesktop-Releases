@@ -66,9 +66,25 @@ The Microsoft Store is the only official installation and update channel for Gra
 - 平台 / Platform: **Windows x64**
 - 安装 / Installation: **Microsoft Store only**
 
-本项目为闭源软件。此公开仓库用于产品介绍和演示素材；不分发产品源码、EXE 或 MSIX 安装包。
+## 创作时间线与早期源码 / Development timeline and historical source
 
-Gravity Desktop is closed source. This public repository contains product information and demonstration media; it does not distribute source code, EXE files, or MSIX packages.
+[**查看创作时间线 / View the development timeline**](HISTORY.md)
+
+这个仓库现公开部分早期源码快照，用于记录 Gravity Desktop 的演进。第一批来自本地保留的 2026-07-30、2026-08-01 和 2026-08-08 Git 记录。原始记录日期与本次公开日期分别标明；没有补造缺失版本或回填公开日期。
+
+Selected early source snapshots are published here to document Gravity Desktop's development. The first batch comes from retained Git records dated July 30, August 1, and August 8, 2026. Original record dates and public publication dates are shown separately; missing versions are not invented.
+
+**这些是历史研究源码，不是当前产品源码或推荐安装版本。当前版本的完整源码仍保留在私有仓库；1.0.20.35 及之后的版本不在本批公开范围内。本仓库不分发 EXE 或 MSIX 安装包。**
+
+**These are historical research snapshots, not current production source or recommended installers. The complete current source remains private; versions 1.0.20.35 and later are not included in this batch. This repository does not distribute EXE or MSIX installers.**
+
+历史源码本轮未进行构建或运行验收，可能存在已知或未知缺陷。不要加载真实数据或真实安全文件库；如需研究，请仅在隔离虚拟机中使用合成文件。正常安装与更新仍通过 Microsoft Store。
+
+These snapshots were not built or runtime-tested for this archival publication and may contain defects. Do not use real user data or an active Safety Library. Use an isolated VM and synthetic files for research. Normal installation and updates remain available through Microsoft Store.
+
+原有版权声明保持不变；本次公开不新增 MIT、GPL 等软件许可。源码可见不等同于采用开源许可证。参见 [GitHub 的许可说明 / GitHub licensing guidance](https://docs.github.com/en/repositories/managing-your-repositorys-settings-and-features/customizing-your-repository/licensing-a-repository)。
+
+Original copyright notices remain unchanged. This publication does not add an MIT, GPL, or other software license. Public visibility is not the same as adopting an open-source license; see the GitHub guidance above.
 
 ---
 

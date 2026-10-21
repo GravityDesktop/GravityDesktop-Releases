@@ -1,0 +1,93 @@
+{
+  "Slug": "2026-08-08-independent-recovery",
+  "Title": "独立恢复工具初版 / Initial independent Recovery tool",
+  "Stage": "加入独立紧急文件恢复程序 / Independent emergency file recovery added",
+  "OriginalCommit": "5a006bd7ae1ab4dcc7685c65b2813fe6acd8cff3",
+  "OriginalTree": "65057bd5445405e1c7dc1e10a58b456c89da7460",
+  "OriginalAuthorDate": "2026-08-08T22:00:09+08:00",
+  "OriginalCommitterDate": "2026-08-08T22:00:09+08:00",
+  "OriginalSubject": "Add independent emergency file recovery",
+  "OriginalVersion": "0.1.0-alpha (see original RC/installer)",
+  "PublicExportDate": "2026-10-22",
+  "ProvenanceNote": "Original dates are Git metadata, not an independently certified start-of-creation date. Public commits/releases use their actual publication dates.",
+  "FileCount": 12,
+  "Archive": "GravityDesktop-source-2026-08-08-independent-recovery-5a006bd7.zip",
+  "ArchiveSHA256": "23B81718B54EE7CC989B7684187BC265981C227352709B8B0BDD2A75E1ACB71D",
+  "Files": [
+    {
+      "Path": ".gitignore",
+      "GitBlobSHA1": "055c025e6c6df9ee2fb93834d972e52c0a6d944e",
+      "SHA256": "E542711CC914AA4EDCC4710E083A4B11CDA8C1A600A74BEA26D535DC29DF582B",
+      "Bytes": 47
+    },
+    {
+      "Path": "GravityDesktop.sln",
+      "GitBlobSHA1": "c74536565da2e1eb1b093978839e8876cfa3f0bc",
+      "SHA256": "05AF2476278C242A4559921F8F88E575A899430EAA11D09EE026250263268388",
+      "Bytes": 1390
+    },
+    {
+      "Path": "GravityDesktop.vcxproj",
+      "GitBlobSHA1": "4331eed9597593f20f8c90965dcc23ddce127959",
+      "SHA256": "C2DA43A99442E9EF5266F475CC527BEABF003266CDDD6EE4B5904A393E06868F",
+      "Bytes": 3851
+    },
+    {
+      "Path": "GravityDesktopRecovery.vcxproj",
+      "GitBlobSHA1": "83fe4e3612e61f9980721d474f4d249941189c0f",
+      "SHA256": "2D0112F77CCE03DE29A8115D8D402C3877CCD045A7F47BBDB334F7361AA047FA",
+      "Bytes": 3479
+    },
+    {
+      "Path": "README.md",
+      "GitBlobSHA1": "fb44a2ae3da662fda44fe916b99336747668a521",
+      "SHA256": "7E4C618F550FDD76A1FA8985B147A81F3D9557F45691A7D80B3557C9F1D61F02",
+      "Bytes": 6945
+    },
+    {
+      "Path": "docs/GROWTH_RULES.md",
+      "GitBlobSHA1": "07063e628130d9c2e621e374ed15d94a33c37fd6",
+      "SHA256": "4C9B5D378367502A799668B331CD0EE8420240F53C1A3B9CD29FC5F7900BC462",
+      "Bytes": 7003
+    },
+    {
+      "Path": "installer/GravityDesktop-Setup.iss",
+      "GitBlobSHA1": "448ef476ee1a33b120669053ee99c4ef5ac90928",
+      "SHA256": "6D02ED30B88C479719F20925A936662CA4527CD31D6180898B3A2886E825E16C",
+      "Bytes": 3295
+    },
+    {
+      "Path": "src/GravityDesktop.cpp",
+      "GitBlobSHA1": "d73d9ad05fcb775e598b345ba9cb4eecc03e6c23",
+      "SHA256": "C7065C70D4BCA86026C5F68E75CC4CE68713FAAC24A347333DD118391D326C91",
+      "Bytes": 1083981
+    },
+    {
+      "Path": "src/GravityDesktop.ico",
+      "GitBlobSHA1": "5486c5fac69e73fb6f418f8cfdaa294a7ee4deef",
+      "SHA256": "719F7A697E85BD598F604CBC8B3BE29C8A75B86FBC8083DC837BDDA9492E64F2",
+      "Bytes": 79185
+    },
+    {
+      "Path": "src/GravityDesktop.rc",
+      "GitBlobSHA1": "47223e73b7bde71bdde333a8612f204e8e94cf26",
+      "SHA256": "C2D9CECCB5DDC32CD60DF481E8AAE471B6F8FB6B2967DC237DD8CCCF426CD17F",
+      "Bytes": 958
+    },
+    {
+      "Path": "src/GravityDesktopRecovery.cpp",
+      "GitBlobSHA1": "d9eacd83dd16268e1002792c3be5ef88906e394a",
+      "SHA256": "0B8B534130A07EE5411710AA15121B5B2855AF73FC3027CF214D414AA0444112",
+      "Bytes": 21876
+    },
+    {
+      "Path": "src/GravityDesktopResource.h",
+      "GitBlobSHA1": "33b905b73a55a289da713ca2794f75bae9a633b2",
+      "SHA256": "CF4A805C1B441D9A36BA2C3CD311BC704780FCE4E994B651E8AE6E6591B8D2A0",
+      "Bytes": 45
+    }
+  ],
+  "BuildTest": "NOT RUN",
+  "RuntimeTest": "NOT RUN",
+  "CurrentProductionCodeIncluded": false
+}

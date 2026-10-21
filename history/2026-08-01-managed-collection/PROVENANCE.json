@@ -1,0 +1,57 @@
+{
+  "Slug": "2026-08-01-managed-collection",
+  "Title": "托管文件收集初版 / Initial managed-file collection",
+  "Stage": "加入真实文件托管收集 / Managed file collection added",
+  "OriginalCommit": "c40e55f692565212ba4b94441a71e9a0e76e32cb",
+  "OriginalTree": "3b4d979ddec2e50ad256dba2cd39c7377a00cb82",
+  "OriginalAuthorDate": "2026-08-01T23:41:58+08:00",
+  "OriginalCommitterDate": "2026-08-01T23:41:58+08:00",
+  "OriginalSubject": "Add managed desktop file collection",
+  "OriginalVersion": "No explicit version header in this snapshot",
+  "PublicExportDate": "2026-10-22",
+  "ProvenanceNote": "Original dates are Git metadata, not an independently certified start-of-creation date. Public commits/releases use their actual publication dates.",
+  "FileCount": 6,
+  "Archive": "GravityDesktop-source-2026-08-01-managed-collection-c40e55f6.zip",
+  "ArchiveSHA256": "EC3F497E004494F82A1FB18AC874F0B1130F8D9B1BB97081023B51628B2FC2BB",
+  "Files": [
+    {
+      "Path": ".gitignore",
+      "GitBlobSHA1": "055c025e6c6df9ee2fb93834d972e52c0a6d944e",
+      "SHA256": "E542711CC914AA4EDCC4710E083A4B11CDA8C1A600A74BEA26D535DC29DF582B",
+      "Bytes": 47
+    },
+    {
+      "Path": "GravityDesktop.sln",
+      "GitBlobSHA1": "38549cc15a8f363b896fb7b50a937f2a9fae6099",
+      "SHA256": "437338E6F3157A7346436D6AA1FE3B5673B08D66733CA91ABE1E8142F0161BD9",
+      "Bytes": 931
+    },
+    {
+      "Path": "GravityDesktop.vcxproj",
+      "GitBlobSHA1": "7e2843575e66837a49c01f8af87334c7ec9af765",
+      "SHA256": "C875C2FFF21EA438D2BF94E79756D72A8EF0CE8E68DCD085ED7E5E13D00C85F5",
+      "Bytes": 3766
+    },
+    {
+      "Path": "README.md",
+      "GitBlobSHA1": "fb44a2ae3da662fda44fe916b99336747668a521",
+      "SHA256": "7E4C618F550FDD76A1FA8985B147A81F3D9557F45691A7D80B3557C9F1D61F02",
+      "Bytes": 6945
+    },
+    {
+      "Path": "docs/GROWTH_RULES.md",
+      "GitBlobSHA1": "07063e628130d9c2e621e374ed15d94a33c37fd6",
+      "SHA256": "4C9B5D378367502A799668B331CD0EE8420240F53C1A3B9CD29FC5F7900BC462",
+      "Bytes": 7003
+    },
+    {
+      "Path": "src/GravityDesktop.cpp",
+      "GitBlobSHA1": "be55f938cacbbf1cd896b1ec879839a45d603235",
+      "SHA256": "89811CFC524914EE507C73A1A2FB2930449E834F81F27B063ABD7433DB0B9F5B",
+      "Bytes": 898870
+    }
+  ],
+  "BuildTest": "NOT RUN",
+  "RuntimeTest": "NOT RUN",
+  "CurrentProductionCodeIncluded": false
+}

@@ -1,0 +1,2 @@
+# Preserve historical source bytes; do not normalize line endings on add/checkout.
+** -text
