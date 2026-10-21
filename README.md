@@ -1,91 +1,46 @@
 # Gravity Desktop
 
-## 图标总乱跑难找？
+用视觉 Core 组织文件、文件夹和快捷方式，让常用项目留在熟悉的位置。
 
-## Desktop icons keep moving around?
+Organize files, folders, and shortcuts around visual Cores. Keep everyday items in familiar places.
 
-**Gravity Desktop 帮你把常用图标固定在熟悉的位置。**
+[Microsoft Store · 官方安装](https://apps.microsoft.com/store/detail/9P4Q9JK2DV8R?cid=DevShareMCLPCS) · [创作时间线 / Timeline](HISTORY.md) · [原始 Git 提交 / Original commits](https://github.com/GravityDesktop/GravityDesktop-Releases/commits/codex/history-through-2026-08-20/)
 
-**Gravity Desktop keeps your everyday shortcuts where you expect them.**
+![Gravity Desktop organizes everyday items around visual Cores](media/screenshot-114533.png)
 
-把图标固定在你记得住的地方。
+## 产品 / Product
 
-Keep your icons where you remember them.
+- 以 Core 分组，保存组内项目的视觉位置与关系。
+- 面向 Windows x64；管理放入 Core 的项目，不锁定所有 Windows 原生桌面图标。
+- 正式安装与更新统一通过 Microsoft Store；当前可安装版本以商店页面为准。
 
-[**从 Microsoft Store 下载 / Get it on Microsoft Store**](https://apps.microsoft.com/store/detail/9P4Q9JK2DV8R?cid=DevShareMCLPCS)
+Group related items around Cores and preserve their visual layout. For Windows x64. Gravity manages items placed in Cores, not every native Windows desktop icon. Install and update through Microsoft Store; consult the Store for the currently available version.
 
-![Gravity Desktop visual Cores keep frequently used desktop items in familiar places](media/screenshot-114533.png)
+[观看演示 / Watch the demo](media/gravity-desktop-demo-20261005.mp4)
 
-## 桌面越满，熟悉的位置越难找 / A familiar desktop can be hard to scan
+## 真实开发历史 / Real development history
 
-文件、文件夹和快捷方式不断增加，桌面内容或布局一变化，熟悉的图标就可能换了位置。找一个常用项目，常常又得从头扫一遍桌面——像在玩“找不同”。
+这里保留早期源码快照，也提供经过审查的原始 Git 历史分支：可查看真实提交、父关系和逐次 Diff，而不只是本次集中上传的快照。
 
-As files, folders, and shortcuts add up, a refresh, sort, or layout change can leave familiar icons somewhere else. Finding one item means scanning the desktop again—like playing “spot the difference.”
+This repository preserves early source snapshots and audited original Git branches, including the original commits, parent relationships, and incremental diffs.
 
-问题不只是桌面看起来乱，而是你不得不反复重新记住东西放在哪里。Gravity Desktop 希望通过熟悉的视觉位置，减少寻找桌面图标和快捷方式的重复搜索。
+| 历史范围 / History | 提交 / Commits | 入口 / Browse |
+| --- | ---: | --- |
+| 2026-07-30 → 2026-08-08 · Core、托管收集、独立 Recovery | 78 | [历史分支 / Branch](https://github.com/GravityDesktop/GravityDesktop-Releases/tree/codex/history-2026-07-30-to-2026-08-08) |
+| 2026-07-30 → 2026-08-20 · English-first 本地化基线 | 182 | [历史分支 / Branch](https://github.com/GravityDesktop/GravityDesktop-Releases/tree/codex/history-through-2026-08-20) |
 
-The problem is more than a messy desktop: it is having to relearn where things are. Gravity Desktop is designed to make desktop icons and shortcuts easier to find by keeping their visual layout familiar.
+这两个范围重叠，不能相加。原始 Git 日期与首次公开日期分别记录在[时间线](HISTORY.md)。本次没有伪造或回填历史提交；Git 时间是原始元数据，不是第三方时间认证。
 
-## 把常用项目放在熟悉的 Core 周围 / Keep everyday items around familiar Cores
+The ranges overlap and must not be added together. Original Git dates and first public publication dates are distinguished in the timeline. No historical commits or dates were fabricated; Git timestamps are retained metadata, not independent timestamp certification.
 
-把经常一起使用的文件、文件夹、程序和快捷方式围绕 Gravity Core 组织。Gravity Desktop 保存你在 Core 中安排的视觉位置和关系，让空间记忆帮你找到目标：**“要找它，就去那个 Core 附近。”**
+## 公开边界 / Publication boundaries
 
-Arrange frequently used files, folders, apps, and shortcuts around a Gravity Core. Gravity Desktop preserves the visual positions and relationships you set up, so spatial memory can help: **“If I need it, I know which Core to look near.”**
+当前商业源码保持私有，1.0.20.35、.36、.37 不在公开范围内。这里的历史代码不是推荐使用的旧产品，不提供 EXE/MSIX 安装包。本次历史发布未做构建或运行验收（**NOT RUN**）；研究时使用隔离环境和合成数据，勿加载真实文件或 Safety Library。
 
-这不是锁定 Windows Explorer 的所有原生桌面图标；它管理的是你放入 Gravity Core 的项目及其视觉布局。
+Current commercial source remains private, including 1.0.20.35, .36, and .37. Historical code is not a supported installation or downgrade route. No EXE/MSIX installers are distributed here. Build/runtime acceptance for this archival publication is **NOT RUN**; use isolated environments and synthetic data only.
 
-Gravity Desktop does not lock every native Windows desktop icon. It organizes the items you place in Gravity Cores and their visual layout.
+公开源码不等于授予开源许可。本次未新增 MIT、GPL 等许可；原有版权及许可声明保持有效，第三方内容按各自许可处理。
 
-![Gravity Desktop organizes desktop shortcuts around visual Cores](media/screenshot-114703.png)
+Source visibility does not establish an open-source license. No new MIT, GPL, or other license is granted by this publication. Existing copyright and license notices remain applicable; third-party material retains its respective terms.
 
-![Gravity Desktop shows visual relationships between familiar desktop items](media/screenshot-114838.png)
-
-## 为熟悉的位置而设计 / Designed for familiar places
-
-- **熟悉的位置 / Familiar locations** — 让常用桌面图标待在你记得住的地方。
-- **视觉 Core / Visual Cores** — 把相关项目围绕同一个 Core 组织起来。
-- **视觉关系 / Visual relationships** — 一眼看出哪些项目属于同一组。
-- **更快找到 / Find things faster** — 少一些全桌面扫描，多一些凭熟悉位置直接找到目标。
-- **保持 Windows 使用习惯 / Keep your Windows workflow** — 用熟悉的文件、文件夹和快捷方式，不必重新学习一套文件系统。
-
-## 查看演示 / Watch the demo
-
-[**观看 Gravity Desktop 演示视频 / Watch the Gravity Desktop demo**](media/gravity-desktop-demo-20261005.mp4)
-
-## 下载 / Download
-
-Gravity Desktop 的唯一官方安装和更新渠道是 Microsoft Store。请从商店安装，避免使用来源不明的安装文件。
-
-The Microsoft Store is the only official installation and update channel for Gravity Desktop. Install from the Store rather than using unofficial packages.
-
-[**Microsoft Store — 下载 Gravity Desktop / Get Gravity Desktop**](https://apps.microsoft.com/store/detail/9P4Q9JK2DV8R?cid=DevShareMCLPCS)
-
-## 版本信息 / Release information
-
-- 当前版本 / Current version: **1.0.20.0**
-- 平台 / Platform: **Windows x64**
-- 安装 / Installation: **Microsoft Store only**
-
-## 创作时间线与早期源码 / Development timeline and historical source
-
-[**查看创作时间线 / View the development timeline**](HISTORY.md)
-
-这个仓库现公开部分早期源码快照，用于记录 Gravity Desktop 的演进。第一批来自本地保留的 2026-07-30、2026-08-01 和 2026-08-08 Git 记录。原始记录日期与本次公开日期分别标明；没有补造缺失版本或回填公开日期。
-
-Selected early source snapshots are published here to document Gravity Desktop's development. The first batch comes from retained Git records dated July 30, August 1, and August 8, 2026. Original record dates and public publication dates are shown separately; missing versions are not invented.
-
-**这些是历史研究源码，不是当前产品源码或推荐安装版本。当前版本的完整源码仍保留在私有仓库；1.0.20.35 及之后的版本不在本批公开范围内。本仓库不分发 EXE 或 MSIX 安装包。**
-
-**These are historical research snapshots, not current production source or recommended installers. The complete current source remains private; versions 1.0.20.35 and later are not included in this batch. This repository does not distribute EXE or MSIX installers.**
-
-历史源码本轮未进行构建或运行验收，可能存在已知或未知缺陷。不要加载真实数据或真实安全文件库；如需研究，请仅在隔离虚拟机中使用合成文件。正常安装与更新仍通过 Microsoft Store。
-
-These snapshots were not built or runtime-tested for this archival publication and may contain defects. Do not use real user data or an active Safety Library. Use an isolated VM and synthetic files for research. Normal installation and updates remain available through Microsoft Store.
-
-原有版权声明保持不变；本次公开不新增 MIT、GPL 等软件许可。源码可见不等同于采用开源许可证。参见 [GitHub 的许可说明 / GitHub licensing guidance](https://docs.github.com/en/repositories/managing-your-repositorys-settings-and-features/customizing-your-repository/licensing-a-repository)。
-
-Original copyright notices remain unchanged. This publication does not add an MIT, GPL, or other software license. Public visibility is not the same as adopting an open-source license; see the GitHub guidance above.
-
----
-
-Copyright © 2026 Gravity Desktop. All rights reserved.
+Copyright © 2026 Gravity Desktop.
