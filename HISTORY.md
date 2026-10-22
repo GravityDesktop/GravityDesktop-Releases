@@ -32,6 +32,16 @@ Both branches belong to the same continuous ancestry: the 78 commits are include
 
 The first three snapshots were first published on October 22, 2026. Their provenance files record the original commit/tree, dates, and per-file hashes. Existing historical releases and manually uploaded stage ZIPs remain unchanged. GitHub's automatically generated tag archives represent the tagged public repository tree, not the individual stage ZIPs.
 
+## 后续产品源码节点 / Later product-source milestone
+
+| 原始构建日期 / Original build | 阶段 / Stage | 形式 / Form | 首次公开 / First public |
+| --- | --- | --- | --- |
+| 2026-10-18 | 1.0.20.35 · DefView产品与Win+D闪烁优化 | [精选源码快照、逐文件SHA256及出处](history/1.0.20.35-defview/) | 2026-10-23 |
+
+.35来自保留的冻结工作树：523个原始清单条目已核对，公开210个字节不变的源码、资源及依赖文件。它没有独立干净的原始Git提交，本次公开提交使用实际公开日期。省略私人资料、签名/安装脚本及第三方测试压缩语料，不把精选快照冒充完整私有历史。后续.36/.37继续私有。
+
+The .35 snapshot reconstructs a retained frozen worktree: all 523 manifest entries were verified, and 210 unchanged source/resource/dependency files are published. There is no independent clean original .35 Git commit; the publication commit uses its actual date. Private material, signing/installer scripts, and third-party test archives are omitted. This is not the complete private history. Later .36/.37 source remains private.
+
 ## 更早的资料与日期边界 / Earlier evidence and date boundaries
 
 本地保留的2026-07-25开发会话及构建回执，记录了当日项目开发与一次 Release x64 构建完成。另有早期资料文件与首个 Git 节点内容可对应。但尚未找到7月30日之前的原始 Git 提交或完整源码快照，因此没有补造7月25日提交，也不公开原始私人会话或运行日志。
@@ -39,11 +49,11 @@ The first three snapshots were first published on October 22, 2026. Their proven
 Retained local development-session and build receipts record project work and a completed Release x64 build on July 25, 2026. Earlier document material also corresponds to the first Git snapshot. No pre-July-30 Git commit or complete source snapshot has been found, so no July 25 commit has been invented. Raw private sessions and logs are not published.
 
 - Git日期是保留的元数据，不是外部认证的创作起始证明；本次公开提交及分支的公开日期使用实际日期。
-- 历史分支只公开截至所列节点的祖先，不公开其后代。后续商业源码继续私有，1.0.20.35、.36、.37均不在范围内。
+- 历史分支只公开截至所列节点的祖先，不公开其后代；独立增加的.35精选快照不转移私有Git祖先。1.0.20.36、.37源码仍未公开。
 - 更晚节点需单独审查，不以补齐时间线为由跳过安全及权利核验。
 - 本次历史源码构建与运行验收：**NOT RUN**。旧代码可能包含缺陷或真实文件操作，只能用隔离环境和合成数据研究。
 
-Git dates are retained metadata, not externally certified creation dates. Publication dates are actual dates. Only the listed ancestor histories are published; later commercial source stays private. Later milestones require separate safety and rights review. Archival build/runtime acceptance is **NOT RUN**; use isolated environments and synthetic files.
+Git dates are retained metadata, not externally certified creation dates. Publication dates are actual dates. Only the listed ancestor histories and the separate curated .35 snapshot are published; .36/.37 source stays private. Later milestones require separate safety and rights review. Archival build/runtime acceptance is **NOT RUN**; use isolated environments and synthetic files.
 
 ## 安装与权利 / Installation and rights
 

@@ -28,16 +28,17 @@ This repository preserves early source snapshots and audited original Git branch
 | --- | ---: | --- |
 | 2026-07-30 → 2026-08-08 · Core、托管收集、独立 Recovery | 78 | [历史分支 / Branch](https://github.com/GravityDesktop/GravityDesktop-Releases/tree/codex/history-2026-07-30-to-2026-08-08) |
 | 2026-07-30 → 2026-08-20 · English-first 本地化基线 | 182 | [历史分支 / Branch](https://github.com/GravityDesktop/GravityDesktop-Releases/tree/codex/history-through-2026-08-20) |
+| 2026-10-18 · 1.0.20.35 DefView 产品阶段 | 精选快照 / Curated snapshot | [源码与核验清单 / Source and provenance](history/1.0.20.35-defview/) |
 
-这两个范围重叠，不能相加。原始 Git 日期与首次公开日期分别记录在[时间线](HISTORY.md)。本次没有伪造或回填历史提交；Git 时间是原始元数据，不是第三方时间认证。
+前两个范围重叠，不能相加；.35是冻结工作树还原的精选源码，不是原始Git提交链。原始记录日期与首次公开日期分别记录在[时间线](HISTORY.md)。没有伪造或回填历史提交；Git 时间是原始元数据，不是第三方时间认证。
 
-The ranges overlap and must not be added together. Original Git dates and first public publication dates are distinguished in the timeline. No historical commits or dates were fabricated; Git timestamps are retained metadata, not independent timestamp certification.
+The first two ranges overlap and must not be added together. The .35 entry is a curated frozen-worktree reconstruction, not an original Git chain. Original record dates and first public publication dates are distinguished in the timeline. No historical commits or dates were fabricated; Git timestamps are retained metadata, not independent timestamp certification.
 
 ## 公开边界 / Publication boundaries
 
-当前商业源码保持私有，1.0.20.35、.36、.37 不在公开范围内。这里的历史代码不是推荐使用的旧产品，不提供 EXE/MSIX 安装包。本次历史发布未做构建或运行验收（**NOT RUN**）；研究时使用隔离环境和合成数据，勿加载真实文件或 Safety Library。
+最新商业源码保持私有，1.0.20.36、.37 不在公开范围内；.35仅公开审查后的精选源码。这里的历史代码不是推荐使用的旧产品，不提供 EXE/MSIX 安装包。本次历史发布未做构建或运行验收（**NOT RUN**）；研究时使用隔离环境和合成数据，勿加载真实文件或 Safety Library。
 
-Current commercial source remains private, including 1.0.20.35, .36, and .37. Historical code is not a supported installation or downgrade route. No EXE/MSIX installers are distributed here. Build/runtime acceptance for this archival publication is **NOT RUN**; use isolated environments and synthetic data only.
+Latest commercial source remains private, including 1.0.20.36 and .37; only the reviewed curated .35 source is published. Historical code is not a supported installation or downgrade route. No EXE/MSIX installers are distributed here. Build/runtime acceptance for this archival publication is **NOT RUN**; use isolated environments and synthetic data only.
 
 公开源码不等于授予开源许可。本次未新增 MIT、GPL 等许可；原有版权及许可声明保持有效，第三方内容按各自许可处理。
 

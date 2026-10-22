@@ -1,0 +1,134 @@
+<?xml version="1.0" encoding="utf-8"?>
+<Project DefaultTargets="Build" xmlns="http://schemas.microsoft.com/developer/msbuild/2003">
+  <ItemGroup Label="ProjectConfigurations">
+    <ProjectConfiguration Include="Debug|x64">
+      <Configuration>Debug</Configuration>
+      <Platform>x64</Platform>
+    </ProjectConfiguration>
+    <ProjectConfiguration Include="Release|x64">
+      <Configuration>Release</Configuration>
+      <Platform>x64</Platform>
+    </ProjectConfiguration>
+  </ItemGroup>
+  <PropertyGroup Label="Globals">
+    <VCProjectVersion>17.0</VCProjectVersion>
+    <Keyword>Win32Proj</Keyword>
+    <ProjectGuid>{7EC2BFF8-B359-4B2E-9787-2B9919A95A72}</ProjectGuid>
+    <RootNamespace>GravityDesktop</RootNamespace>
+    <WindowsTargetPlatformVersion>10.0.26100.0</WindowsTargetPlatformVersion>
+  </PropertyGroup>
+  <Import Project="$(VCTargetsPath)\Microsoft.Cpp.Default.props" />
+  <PropertyGroup Condition="'$(Configuration)|$(Platform)'=='Debug|x64'" Label="Configuration">
+    <ConfigurationType>Application</ConfigurationType>
+    <UseDebugLibraries>true</UseDebugLibraries>
+    <PlatformToolset>v143</PlatformToolset>
+    <CharacterSet>Unicode</CharacterSet>
+  </PropertyGroup>
+  <PropertyGroup Condition="'$(Configuration)|$(Platform)'=='Release|x64'" Label="Configuration">
+    <ConfigurationType>Application</ConfigurationType>
+    <UseDebugLibraries>false</UseDebugLibraries>
+    <PlatformToolset>v143</PlatformToolset>
+    <WholeProgramOptimization>true</WholeProgramOptimization>
+    <CharacterSet>Unicode</CharacterSet>
+  </PropertyGroup>
+  <Import Project="$(VCTargetsPath)\Microsoft.Cpp.props" />
+  <PropertyGroup>
+    <GravityDesktopOutputSuffix Condition="'$(GravityDesktopPackaged)'=='true'">$(Configuration)MSIX</GravityDesktopOutputSuffix>
+    <GravityDesktopOutputSuffix Condition="'$(GravityDesktopOutputSuffix)'==''">$(Configuration)</GravityDesktopOutputSuffix>
+    <OutDir>$(SolutionDir)out\$(GravityDesktopOutputSuffix)\</OutDir>
+    <IntDir>$(SolutionDir)out\obj\$(GravityDesktopOutputSuffix)\</IntDir>
+    <TargetName>GravityDesktop</TargetName>
+    <ZipThirdPartyBuildDirectory>$(SolutionDir)out\zip-third-party\$(GravityDesktopOutputSuffix)</ZipThirdPartyBuildDirectory>
+    <ZipCMake>$(VSInstallDir)Common7\IDE\CommonExtensions\Microsoft\CMake\CMake\bin\cmake.exe</ZipCMake>
+  </PropertyGroup>
+  <ItemDefinitionGroup Condition="'$(Configuration)|$(Platform)'=='Debug|x64'">
+    <ClCompile>
+      <WarningLevel>Level4</WarningLevel>
+      <SDLCheck>true</SDLCheck>
+      <PreprocessorDefinitions>_DEBUG;UNICODE;_UNICODE;NOMINMAX;WIN32_LEAN_AND_MEAN;%(PreprocessorDefinitions)</PreprocessorDefinitions>
+      <ConformanceMode>true</ConformanceMode>
+      <LanguageStandard>stdcpp20</LanguageStandard>
+      <MultiProcessorCompilation>true</MultiProcessorCompilation>
+      <RuntimeLibrary>MultiThreadedDebug</RuntimeLibrary>
+      <AdditionalOptions>/utf-8 %(AdditionalOptions)</AdditionalOptions>
+    </ClCompile>
+    <Link>
+      <SubSystem>Windows</SubSystem>
+      <GenerateDebugInformation>true</GenerateDebugInformation>
+    </Link>
+  </ItemDefinitionGroup>
+  <ItemDefinitionGroup Condition="'$(Configuration)|$(Platform)'=='Release|x64'">
+    <ClCompile>
+      <WarningLevel>Level4</WarningLevel>
+      <SDLCheck>true</SDLCheck>
+      <PreprocessorDefinitions>NDEBUG;UNICODE;_UNICODE;NOMINMAX;WIN32_LEAN_AND_MEAN;%(PreprocessorDefinitions)</PreprocessorDefinitions>
+      <ConformanceMode>true</ConformanceMode>
+      <LanguageStandard>stdcpp20</LanguageStandard>
+      <MultiProcessorCompilation>true</MultiProcessorCompilation>
+      <RuntimeLibrary>MultiThreaded</RuntimeLibrary>
+      <Optimization>MaxSpeed</Optimization>
+      <FunctionLevelLinking>true</FunctionLevelLinking>
+      <IntrinsicFunctions>true</IntrinsicFunctions>
+      <AdditionalOptions>/utf-8 %(AdditionalOptions)</AdditionalOptions>
+    </ClCompile>
+    <Link>
+      <SubSystem>Windows</SubSystem>
+      <EnableCOMDATFolding>true</EnableCOMDATFolding>
+      <OptimizeReferences>true</OptimizeReferences>
+      <GenerateDebugInformation>false</GenerateDebugInformation>
+    </Link>
+  </ItemDefinitionGroup>
+  <ItemDefinitionGroup Condition="'$(GravityDesktopPackaged)'=='true'">
+    <ClCompile>
+      <PreprocessorDefinitions>GRAVITYDESKTOP_PACKAGED;%(PreprocessorDefinitions)</PreprocessorDefinitions>
+    </ClCompile>
+  </ItemDefinitionGroup>
+  <ItemDefinitionGroup Condition="'$(GravityDesktopDefViewLocalTest)'=='true'">
+    <ClCompile>
+      <PreprocessorDefinitions>GRAVITY_DEFVIEW_LOCALTEST;%(PreprocessorDefinitions)</PreprocessorDefinitions>
+    </ClCompile>
+  </ItemDefinitionGroup>
+  <ItemDefinitionGroup>
+    <Manifest>
+      <AdditionalManifestFiles>$(ProjectDir)src\GravityDesktop.manifest</AdditionalManifestFiles>
+    </Manifest>
+    <ClCompile>
+      <PreprocessorDefinitions>GRAVITY_DEFVIEW_PRESENTATION;%(PreprocessorDefinitions)</PreprocessorDefinitions>
+      <AdditionalIncludeDirectories>$(ProjectDir)out\build-identity;$(ProjectDir)third_party\minizip-ng;$(ZipThirdPartyBuildDirectory)\minizip-ng;%(AdditionalIncludeDirectories)</AdditionalIncludeDirectories>
+    </ClCompile>
+    <Link>
+      <AdditionalLibraryDirectories>$(ZipThirdPartyBuildDirectory)\minizip-ng\$(Configuration);$(ZipThirdPartyBuildDirectory)\zlib\$(Configuration);%(AdditionalLibraryDirectories)</AdditionalLibraryDirectories>
+      <AdditionalDependencies>minizip-ng.lib;zs.lib;ole32.lib;%(AdditionalDependencies)</AdditionalDependencies>
+    </Link>
+  </ItemDefinitionGroup>
+  <ItemGroup>
+    <ClCompile Include="src\GravityDesktop.cpp" />
+    <ClCompile Include="src\DragOutService.cpp" />
+    <ClCompile Include="src\Localization.cpp" />
+    <ClCompile Include="src\ZipService.cpp" />
+  </ItemGroup>
+  <ItemGroup>
+    <ResourceCompile Include="src\GravityDesktop.rc" />
+  </ItemGroup>
+  <ItemGroup>
+    <None Include="src\GravityDesktop.manifest" />
+  </ItemGroup>
+  <Target Name="CopyGravityDesktopRuntimeAssets" AfterTargets="Build">
+    <Copy SourceFiles="$(ProjectDir)src\GravityDesktopLibrary.ico"
+          DestinationFolder="$(OutDir)"
+          SkipUnchangedFiles="true" />
+    <ItemGroup>
+      <GravityDesktopLocalizationAssets Include="$(ProjectDir)src\locales\*.json" />
+    </ItemGroup>
+    <Copy SourceFiles="@(GravityDesktopLocalizationAssets)"
+          DestinationFolder="$(OutDir)locales\"
+          SkipUnchangedFiles="true" />
+  </Target>
+  <Target Name="BuildZipThirdParty" BeforeTargets="ClCompile">
+    <Error Condition="'$(GravityDesktopDefViewLocalTest)'=='true' and '$(GravityDesktopPackaged)'=='true'"
+           Text="DefView integration is ordinary LOCALTEST EXE only; packaged build is forbidden." />
+    <Exec Command="&quot;$(ZipCMake)&quot; -S &quot;$(ProjectDir)third_party&quot; -B &quot;$(ZipThirdPartyBuildDirectory)&quot; -G &quot;Visual Studio 17 2022&quot; -A x64" />
+    <Exec Command="&quot;$(ZipCMake)&quot; --build &quot;$(ZipThirdPartyBuildDirectory)&quot; --config $(Configuration) --target minizip-ng" />
+  </Target>
+  <Import Project="$(VCTargetsPath)\Microsoft.Cpp.targets" />
+</Project>

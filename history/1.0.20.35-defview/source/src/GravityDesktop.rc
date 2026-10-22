@@ -1,0 +1,41 @@
+#pragma code_page(65001)
+
+#include <winver.h>
+#include "GravityDesktopResource.h"
+#include "GravityDesktopVersion.h"
+
+IDI_GRAVITYDESKTOP ICON "GravityDesktop.ico"
+
+VS_VERSION_INFO VERSIONINFO
+ FILEVERSION GRAVITY_DESKTOP_VERSION_TUPLE
+ PRODUCTVERSION GRAVITY_DESKTOP_VERSION_TUPLE
+ FILEFLAGSMASK 0x3fL
+#ifdef _DEBUG
+ FILEFLAGS VS_FF_DEBUG
+#else
+ FILEFLAGS 0x0L
+#endif
+ FILEOS VOS__WINDOWS32
+ FILETYPE VFT_APP
+ FILESUBTYPE VFT2_UNKNOWN
+BEGIN
+    BLOCK "StringFileInfo"
+    BEGIN
+        BLOCK "080404B0"
+        BEGIN
+            VALUE "FileDescription", "Gravity Desktop"
+            VALUE "FileVersion", GRAVITY_DESKTOP_VERSION_STRING
+            VALUE "InternalName", "GravityDesktop"
+            VALUE "OriginalFilename", "GravityDesktop.exe"
+            VALUE "ProductName", "Gravity Desktop"
+            VALUE "ProductVersion", GRAVITY_DESKTOP_VERSION_STRING
+            VALUE "CompanyName", ""
+            VALUE "LegalCopyright", "© 2026 wangboyun. All rights reserved."
+            VALUE "Comments", "Gravity Desktop; Developer: wangboyun; Website: https://gravitydesktop.com"
+        END
+    END
+    BLOCK "VarFileInfo"
+    BEGIN
+        VALUE "Translation", 0x0804, 1200
+    END
+END

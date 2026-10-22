@@ -1,0 +1,864 @@
+{
+  "version": "1.0.20.35",
+  "build": "120-035-DEFVIEW-PRODUCT-CANDIDATE-R4",
+  "channelAtOriginalBuild": "LOCALTEST",
+  "originalBuildUTC": "2026-10-18T10:34:32.1568425Z",
+  "firstPublicDate": "2026-10-23",
+  "sourceType": "curated reconstruction of frozen dirty-worktree source; not an original standalone Git commit",
+  "baseCommit": "060f44a398b34777687163c0f3c8125f595d8ea9",
+  "frozenSourceManifestSHA256": "D1BD8BC45720D0F5D146AA5AB785940CB8530B112516F1B975F2970B7ED3E373",
+  "frozenManifestFilesVerified": 523,
+  "publishedSourceFiles": 210,
+  "publishedSourceBytes": 6353352,
+  "fileBytesModified": false,
+  "excludedCategories": [
+    "Private investigation reports, raw logs and user/VM data",
+    "Installer/signing and historical automation scripts",
+    "Third-party optional platforms, documentation, tests, fuzz corpora and binary fixtures"
+  ],
+  "unchangedThirdPartyLicenseNotices": true,
+  "newOpenSourceLicenseGranted": false,
+  "buildAndRuntimeAcceptanceForThisPublication": "NOT RUN",
+  "files": [
+    {
+      "path": "GravityDesktop.sln",
+      "sha256": "0454C067F9661D7E92B59E6278618EF012B23B410EC69C6B06A7F0AB4F81B27C"
+    },
+    {
+      "path": "GravityDesktop.vcxproj",
+      "sha256": "2459CC5A91865DDCA7FBD1113BC95C158B45517F13525594AC813BAAEB1B94EC"
+    },
+    {
+      "path": "GravityDesktopRecovery.vcxproj",
+      "sha256": "F23DB24507AE48A7CD5539C0F4780B1A72AC576F325F5F1BCA39A2F56EDA3B1B"
+    },
+    {
+      "path": "msix/Assets/Square150x150Logo.png",
+      "sha256": "E515C36EE2C8E026F640001E71162D0FC6C4F73BC97FE707AE55E7E7646E768D"
+    },
+    {
+      "path": "msix/Assets/Square150x150Logo.scale-100.png",
+      "sha256": "E515C36EE2C8E026F640001E71162D0FC6C4F73BC97FE707AE55E7E7646E768D"
+    },
+    {
+      "path": "msix/Assets/Square150x150Logo.scale-125.png",
+      "sha256": "A98581A40BAB43991A6724D4873A12980934ECF0C4ED99B30A67E2893C47F3D0"
+    },
+    {
+      "path": "msix/Assets/Square150x150Logo.scale-150.png",
+      "sha256": "99067CCE474B7A7A9FFBAAB3E7B0EF9A89C286F54800D9D872AE01D006A1B3A6"
+    },
+    {
+      "path": "msix/Assets/Square150x150Logo.scale-200.png",
+      "sha256": "92E6240CAB6838A123383DED53A6DD3FEE5D9C367ECC3ABE3C3608DEC5304AF7"
+    },
+    {
+      "path": "msix/Assets/Square150x150Logo.scale-400.png",
+      "sha256": "6F78D7159F4155188D1D219E59DAF31C9B3489308DAC072B5D09FB847A7C890C"
+    },
+    {
+      "path": "msix/Assets/Square44x44Logo.png",
+      "sha256": "801EAF7F621228794F6BD4E36FE976CB2F93343B5C5BAB7D6249542422086449"
+    },
+    {
+      "path": "msix/Assets/Square44x44Logo.scale-100.png",
+      "sha256": "801EAF7F621228794F6BD4E36FE976CB2F93343B5C5BAB7D6249542422086449"
+    },
+    {
+      "path": "msix/Assets/Square44x44Logo.scale-125.png",
+      "sha256": "63F460A98BA09DEC3C75D3F981F2674877AA4256127F5B7344AEC20ADB9E3E27"
+    },
+    {
+      "path": "msix/Assets/Square44x44Logo.scale-150.png",
+      "sha256": "73A8EE582FD9D4DB143CDF8B0088A95D0349238EA4FA2F69DE9F9A571ECCF07B"
+    },
+    {
+      "path": "msix/Assets/Square44x44Logo.scale-200.png",
+      "sha256": "6155051F55AA19C866B0F4FF78800D026110BE71760114C4C662A9CA1B569005"
+    },
+    {
+      "path": "msix/Assets/Square44x44Logo.scale-400.png",
+      "sha256": "4C915A5219C93C701F144855753923EC15C078D34849542058FF2BF5D989446E"
+    },
+    {
+      "path": "msix/Assets/Square44x44Logo.targetsize-16_altform-lightunplated.png",
+      "sha256": "B7106A4BF59B9779CDAC40C57B15C00FF36A38CE8C8255EB4FF569019FD5BE2B"
+    },
+    {
+      "path": "msix/Assets/Square44x44Logo.targetsize-16_altform-unplated.png",
+      "sha256": "B7106A4BF59B9779CDAC40C57B15C00FF36A38CE8C8255EB4FF569019FD5BE2B"
+    },
+    {
+      "path": "msix/Assets/Square44x44Logo.targetsize-16.png",
+      "sha256": "73FA906604EC2B7617253D66EC3905F60B5C140299C915C802073301EF33D710"
+    },
+    {
+      "path": "msix/Assets/Square44x44Logo.targetsize-24_altform-lightunplated.png",
+      "sha256": "925027838ACC525B36B7BC2187C073DE23F66F170AA7CCF9C11D11B72064D6F8"
+    },
+    {
+      "path": "msix/Assets/Square44x44Logo.targetsize-24_altform-unplated.png",
+      "sha256": "925027838ACC525B36B7BC2187C073DE23F66F170AA7CCF9C11D11B72064D6F8"
+    },
+    {
+      "path": "msix/Assets/Square44x44Logo.targetsize-24.png",
+      "sha256": "7C03737AE8F1578470CE9F3AA59297D3491951D72004F5C688FE4B22FA5CD664"
+    },
+    {
+      "path": "msix/Assets/Square44x44Logo.targetsize-256_altform-lightunplated.png",
+      "sha256": "F6631CFB6F38AD0E409389D3E1AC0D5ED33F23938E26249865002709FB0A5BE5"
+    },
+    {
+      "path": "msix/Assets/Square44x44Logo.targetsize-256_altform-unplated.png",
+      "sha256": "F6631CFB6F38AD0E409389D3E1AC0D5ED33F23938E26249865002709FB0A5BE5"
+    },
+    {
+      "path": "msix/Assets/Square44x44Logo.targetsize-256.png",
+      "sha256": "BBFAA287BB3A2E1E5669029909C9E0A34FA6CEAB320C2326032007FCC0F6DA18"
+    },
+    {
+      "path": "msix/Assets/Square44x44Logo.targetsize-32_altform-lightunplated.png",
+      "sha256": "1C2F04B25BCCC631A82438232FCC52A4E890FBF3A6F72F589AB74CEA4875B43C"
+    },
+    {
+      "path": "msix/Assets/Square44x44Logo.targetsize-32_altform-unplated.png",
+      "sha256": "1C2F04B25BCCC631A82438232FCC52A4E890FBF3A6F72F589AB74CEA4875B43C"
+    },
+    {
+      "path": "msix/Assets/Square44x44Logo.targetsize-32.png",
+      "sha256": "59BC93FB03B945DC443A9BBB343829352B6F6C87626420FCB46F3A64F4B41000"
+    },
+    {
+      "path": "msix/Assets/Square44x44Logo.targetsize-44_altform-lightunplated.png",
+      "sha256": "AE14064A63916A789B536009226343EDEC168E403CFBB3E031D936FED2C2E5AC"
+    },
+    {
+      "path": "msix/Assets/Square44x44Logo.targetsize-44_altform-unplated.png",
+      "sha256": "AE14064A63916A789B536009226343EDEC168E403CFBB3E031D936FED2C2E5AC"
+    },
+    {
+      "path": "msix/Assets/Square44x44Logo.targetsize-44.png",
+      "sha256": "801EAF7F621228794F6BD4E36FE976CB2F93343B5C5BAB7D6249542422086449"
+    },
+    {
+      "path": "msix/Assets/Square44x44Logo.targetsize-48_altform-lightunplated.png",
+      "sha256": "6014530F53A2A229552CE7F4C0FB9782C40D708DF8626F4862E4FE65959EAC7C"
+    },
+    {
+      "path": "msix/Assets/Square44x44Logo.targetsize-48_altform-unplated.png",
+      "sha256": "6014530F53A2A229552CE7F4C0FB9782C40D708DF8626F4862E4FE65959EAC7C"
+    },
+    {
+      "path": "msix/Assets/Square44x44Logo.targetsize-48.png",
+      "sha256": "E11F991ED03BEA6080CA6D3B64476CB598FEF85FEB9F1D0CF9EDE054E23A6465"
+    },
+    {
+      "path": "msix/Assets/Square44x44Logo.targetsize-64_altform-lightunplated.png",
+      "sha256": "0552236C55D9C3DF39DC4D670DC5358ED5EBE8A63D4E2335A75960A98F1748D1"
+    },
+    {
+      "path": "msix/Assets/Square44x44Logo.targetsize-64_altform-unplated.png",
+      "sha256": "0552236C55D9C3DF39DC4D670DC5358ED5EBE8A63D4E2335A75960A98F1748D1"
+    },
+    {
+      "path": "msix/Assets/Square44x44Logo.targetsize-64.png",
+      "sha256": "A5EAA3820C194F97CAE5E7E208CBCBA2634AA05318C5A50CE9F361D2E9746FA9"
+    },
+    {
+      "path": "msix/Assets/Square44x44Logo.targetsize-96_altform-lightunplated.png",
+      "sha256": "3DE3B46ED47292323D9B993A5731733F2339991746E85840DA90A40F015C3DB0"
+    },
+    {
+      "path": "msix/Assets/Square44x44Logo.targetsize-96_altform-unplated.png",
+      "sha256": "3DE3B46ED47292323D9B993A5731733F2339991746E85840DA90A40F015C3DB0"
+    },
+    {
+      "path": "msix/Assets/Square44x44Logo.targetsize-96.png",
+      "sha256": "A713E05FD9193C6933BBA8B1368649F8B0DA9D64A47A6583C7D84B4C998535E1"
+    },
+    {
+      "path": "msix/Assets/StoreLogo.png",
+      "sha256": "42ED74C812E040A74F1A9ADBE7AC4C20BA550CBA9E5B0DAB9D30B4FA51C8395B"
+    },
+    {
+      "path": "msix/Assets/Wide310x150Logo.png",
+      "sha256": "BAE90E6D402DF1A2BC3EB8D5615173154005CCA12F3B1031AC9A53A396A7ABBF"
+    },
+    {
+      "path": "msix/Assets/Wide310x150Logo.scale-100.png",
+      "sha256": "BAE90E6D402DF1A2BC3EB8D5615173154005CCA12F3B1031AC9A53A396A7ABBF"
+    },
+    {
+      "path": "msix/Assets/Wide310x150Logo.scale-125.png",
+      "sha256": "B55DA4F37C2A7C99A856D9244542E9D5DF1B1DAE2886E7A391FE43A162DADBBB"
+    },
+    {
+      "path": "msix/Assets/Wide310x150Logo.scale-150.png",
+      "sha256": "0E551AD6E84E1AB330BA330FF023B14D94C178BDA20AFE002DC63D276A9F3B8B"
+    },
+    {
+      "path": "msix/Assets/Wide310x150Logo.scale-200.png",
+      "sha256": "9E99BFEF8481A3F4712A36898B9812B7A94F062EFC81D5365F95888687876E41"
+    },
+    {
+      "path": "msix/Assets/Wide310x150Logo.scale-400.png",
+      "sha256": "D8CC49EAEDDB95F273458E6A8071E7437CF2F31DB4ACBAFB9F38CB6E0E430B0D"
+    },
+    {
+      "path": "src/BuildIdentity.h",
+      "sha256": "2E573B6A55ACA5D550C85BE805091E5C7AC9CB032987873DE642F927EBF21C94"
+    },
+    {
+      "path": "src/ConfigCompatibilityAudit.h",
+      "sha256": "615D0E39E352E2AC6C08E9E9CDFAEC8B8658BBF9E2C6153FCC2568E226195F1D"
+    },
+    {
+      "path": "src/DefViewDesktopHost.h",
+      "sha256": "C7D8D6E936EE38B6889AA05FB3F95912A4C54C98FE6C9CB48869BF7759DE611E"
+    },
+    {
+      "path": "src/DesktopLayerManager.h",
+      "sha256": "254976CA8A9E1B0A3ADFFAB8010BF9C82CFCEA38B38EF4390102CE5D31CB1D97"
+    },
+    {
+      "path": "src/DragOutService.cpp",
+      "sha256": "FCD09F19A5819AE2C9AA4DDA033451091A47F3402F87CA81C5DB79402A373C1E"
+    },
+    {
+      "path": "src/DragOutService.h",
+      "sha256": "49E89F55A03AA6C4BE0A6C7311AA44071C1C2B0E5924DB26C8A9DDE79B7004C2"
+    },
+    {
+      "path": "src/ExternalDropEffect.h",
+      "sha256": "7CBA360FBAB5D49DCAC85166032B57EDBADB81C7ECE80B939B08FF8336730D5E"
+    },
+    {
+      "path": "src/ExternalDropFeedbackSelfTest.h",
+      "sha256": "602917FD00B1A5E6B0AE222F5F74F869A3B8ED687DE372F35CC7F96688264847"
+    },
+    {
+      "path": "src/GravityDesktop.cpp",
+      "sha256": "99EF81F416011D9D0B3DC876ECAE4546D8012902E73E07311FBC3ECC4576D00E"
+    },
+    {
+      "path": "src/GravityDesktop.ico",
+      "sha256": "719F7A697E85BD598F604CBC8B3BE29C8A75B86FBC8083DC837BDDA9492E64F2"
+    },
+    {
+      "path": "src/GravityDesktop.manifest",
+      "sha256": "E8771DD42E0903D3779878DC9F9EBB33B36BFD2F2302CF8CCC2D8A5CBE795C45"
+    },
+    {
+      "path": "src/GravityDesktop.rc",
+      "sha256": "40005711B939F20D0E512920B3E3D4F3367C2C34A1C6D3767473198392140D7E"
+    },
+    {
+      "path": "src/GravityDesktopLibrary.ico",
+      "sha256": "A32819C1635D2E9232D87CA2E0BCBF7B935D1AF228E31E7396A78030896498A0"
+    },
+    {
+      "path": "src/GravityDesktopRecovery.cpp",
+      "sha256": "45ED4134E2F1EF368D68A8B8604EFB7337B2CE125E9797E466933C4A5865E4B6"
+    },
+    {
+      "path": "src/GravityDesktopRecovery.manifest",
+      "sha256": "82C8F30DA6DE616150F81C08912052C6EE9CF55FFA3D4E3FC1CDACEAEA030E37"
+    },
+    {
+      "path": "src/GravityDesktopRecovery.rc",
+      "sha256": "BF7397CDE3CA84AD6EA5DB6B49065F143B32FFA3CC997242BC7BA9973DAC8564"
+    },
+    {
+      "path": "src/GravityDesktopResource.h",
+      "sha256": "494271F020BE5D41E4A8B4C22DE2261C79FCA43488595B31080A00F972825537"
+    },
+    {
+      "path": "src/GravityDesktopVersion.h",
+      "sha256": "CA0BBA77D906424B064A142DA1F8847E87B6266B66F3F935CF75361A203012C9"
+    },
+    {
+      "path": "src/locales/de-DE.json",
+      "sha256": "160115CD02403D0A44B4E504B151538361BA52AB75238D01B3928884050B4E95"
+    },
+    {
+      "path": "src/locales/en-US.json",
+      "sha256": "94AB64704DFA530483E3A83899D3441DC57AF956D77637A0A781FA55EC43C5F1"
+    },
+    {
+      "path": "src/locales/es-ES.json",
+      "sha256": "1AC760F15834037E9DDDDC316B70DF54E6AC9D8F8DE2345E3417779592417917"
+    },
+    {
+      "path": "src/locales/fr-FR.json",
+      "sha256": "3B448401E6B404F0AFD458A0A3C6A41B206CB3D0FDEE201A02223E4CBFBB8516"
+    },
+    {
+      "path": "src/locales/ja-JP.json",
+      "sha256": "89FA186A16E7CF7C7673487110540969B6C6B4E11314B0D75FB8D3DD82ED6D5C"
+    },
+    {
+      "path": "src/locales/zh-CN.json",
+      "sha256": "C3E9F865552C2E46BBEB122498FBB8900BA8D2106B52ADB4C3C78F7FCDA7D10B"
+    },
+    {
+      "path": "src/Localization.cpp",
+      "sha256": "5F9009D55340E6DBA2C79EEC0458DD683F4C96FE2A03CFFE0BCE60E36E2C2CFF"
+    },
+    {
+      "path": "src/Localization.h",
+      "sha256": "1031D66FD55EE15D3EA5728300E7DA3BB6E8FE4CAA225B1A72CAC0BA4BCE330C"
+    },
+    {
+      "path": "src/OwnedLibraryShortcut.h",
+      "sha256": "286A62E8A51AD8B884B29BEB46E04AD2BEB6FC305BE5BBCEC49560249FCA0FB7"
+    },
+    {
+      "path": "src/PresentationMode.h",
+      "sha256": "5BB26321010BD6D681CD01FE8BC5DBDD814736B92B22EF59B54DA24E3E7C4A36"
+    },
+    {
+      "path": "src/SafeLibraryShortcut.h",
+      "sha256": "BDF4008E689E7F550157AB486A35F5EEE4BF18ED89B84FFE0E18F6FB5A67B30E"
+    },
+    {
+      "path": "src/ZipService.cpp",
+      "sha256": "063123E7FEDB5D72E5529CF18DFD9D7FC4B09C229FD48FB109FB92E070461CF3"
+    },
+    {
+      "path": "src/ZipService.h",
+      "sha256": "461C8E80A7A4FB96386077E711EAC2A2DB5C9B8FC17B0337F1B7BCDF6994A68B"
+    },
+    {
+      "path": "THIRD_PARTY_NOTICES.txt",
+      "sha256": "024B5DFDDF2BBD8764D7C8FE9FBE4FC6ED1D726078FCFB3D872B2208D642760B"
+    },
+    {
+      "path": "third_party/cmake/FindZLIB.cmake",
+      "sha256": "84BFEFFD39BD691F0DFC0893F6E183A9958F5017AC4635B4DA004F4A8C4024B1"
+    },
+    {
+      "path": "third_party/CMakeLists.txt",
+      "sha256": "1E64BD742005FEF6CE0925E38816918CD4912C7CD1FEE8A02249BC21005E6E9D"
+    },
+    {
+      "path": "third_party/minizip-ng/.clang-format",
+      "sha256": "14100923CBCE50928CCE66BF7090F85D2231CAC13D8ABB8084E090BC955F2313"
+    },
+    {
+      "path": "third_party/minizip-ng/.codecov.yaml",
+      "sha256": "3A6C4913CDA62C8CFFBC9A691B25109AC282FB1DA83AD4EFE5898C6D52E3DD05"
+    },
+    {
+      "path": "third_party/minizip-ng/.gitignore",
+      "sha256": "443EFC37EC80CDDED70BCE6F82BCA97C29EFEF86B17735298DB54E78A591340E"
+    },
+    {
+      "path": "third_party/minizip-ng/cmake/clone-repo.cmake",
+      "sha256": "019EFAC6E293E643699F45D05507ABCCD099E7D38C013A05DE95FCDC7B5D31F6"
+    },
+    {
+      "path": "third_party/minizip-ng/cmake/detect-sanitizer.cmake",
+      "sha256": "8FC82403F9981C0A31CA47CA1C7C7FE4E9F865993FFCCC22CA85B6BFA054CCC3"
+    },
+    {
+      "path": "third_party/minizip-ng/CMakeLists.txt",
+      "sha256": "29196623B18A6CDC608392C7A2C6BD9F0D9F78A712C3A967175D4642D50C825F"
+    },
+    {
+      "path": "third_party/minizip-ng/compat/crypt.h",
+      "sha256": "B02B7D653CF845F7CFCBCB7581A055F70F5069304D492429DBBC24F38D65B056"
+    },
+    {
+      "path": "third_party/minizip-ng/compat/ioapi.c",
+      "sha256": "F0EC64F9327C97BD5837F9F269A1F52605BD400C4B584997E80CC856DBC396D9"
+    },
+    {
+      "path": "third_party/minizip-ng/compat/ioapi.h",
+      "sha256": "D0B615C55B261078AF3A2FA63E9B895ECD332D112DF16CF9BA14BC46C4F6263E"
+    },
+    {
+      "path": "third_party/minizip-ng/compat/unzip.c",
+      "sha256": "CA74088745E419751B782B1467A8306EBA9331102E7A1E67FC04B92C6BDA89DB"
+    },
+    {
+      "path": "third_party/minizip-ng/compat/unzip.h",
+      "sha256": "6E53EEABA21413993FA95064B109D9015E0E0296B455632B1E51BD398E98B4F7"
+    },
+    {
+      "path": "third_party/minizip-ng/compat/zip.c",
+      "sha256": "C7397AB00B890DA48C666E8B969A16D360F9F3AC888E67327663E98A5C3AD7D6"
+    },
+    {
+      "path": "third_party/minizip-ng/compat/zip.h",
+      "sha256": "B6299FE5176096E6B146488EC5873E281C554B2910AC8D1DE3F813690BFB8B03"
+    },
+    {
+      "path": "third_party/minizip-ng/INDEX.md",
+      "sha256": "724BFD390CAC0BA186941C7E6D39299CF49DD8952E2B9F9AB96C9361CDF6491B"
+    },
+    {
+      "path": "third_party/minizip-ng/LICENSE",
+      "sha256": "EB37439365F27AA153F9FD45422C931149F957AD656AB34DF6063CE6B8E49D42"
+    },
+    {
+      "path": "third_party/minizip-ng/minigzip.c",
+      "sha256": "AA3B9C09BE513AFAE017A0A6349F32AA6A5E8CAFBE4E39D821E459041B9EEA41"
+    },
+    {
+      "path": "third_party/minizip-ng/minizip.c",
+      "sha256": "269D8A6D0708FBA4EA9920692BA0893A7D5074B1FDC3EB1CA006311CF49BC788"
+    },
+    {
+      "path": "third_party/minizip-ng/minizip.pc.cmakein",
+      "sha256": "F1CBF352C32599F9EF57C033B36962506DD6E2DB5CE135983A5E5D227779DC15"
+    },
+    {
+      "path": "third_party/minizip-ng/mz_config.h.cmakein",
+      "sha256": "B7471BE46943833FC59E99F294684B71FD7A5440A6E7D2CD6A97F6A4B90FDD16"
+    },
+    {
+      "path": "third_party/minizip-ng/mz_crypt_apple.c",
+      "sha256": "EA7CC269841182C8BEA47EF466F1AD765B1F6076A06D2B5118C67E0D2311BE43"
+    },
+    {
+      "path": "third_party/minizip-ng/mz_crypt_openssl.c",
+      "sha256": "301DE27648AA79306E3920A7384F62A9FF0A8307FAE94C3EF1371DFD5F624729"
+    },
+    {
+      "path": "third_party/minizip-ng/mz_crypt_winvista.c",
+      "sha256": "B5C8FA609EC1771D5C4C71AE89854EF2EB33B4166B09736B7F578C93D8696B90"
+    },
+    {
+      "path": "third_party/minizip-ng/mz_crypt_winxp.c",
+      "sha256": "03B49E8B4D89A7E62689D3F9CD97AC64D425B42AF65A0EFFF74FDA40CA842A46"
+    },
+    {
+      "path": "third_party/minizip-ng/mz_crypt.c",
+      "sha256": "4957EB4163EE36DDF306CB54A3920C7027D78DB6186B8640D3960773F9E46F18"
+    },
+    {
+      "path": "third_party/minizip-ng/mz_crypt.h",
+      "sha256": "1B0EC6105F78BDF18CFE235D88FCD3C6F86911152A83DECC32596E84045046AF"
+    },
+    {
+      "path": "third_party/minizip-ng/mz_os_posix.c",
+      "sha256": "2DF62E3DD3D561E7DBBB14A62B98830305DD58D3E7800A0A7D154FDC5B8022A2"
+    },
+    {
+      "path": "third_party/minizip-ng/mz_os_win32.c",
+      "sha256": "9E736DDD7D380B8D19B111F311FFDA198B8AAB120E1D43FD31B3D90D8B4A8901"
+    },
+    {
+      "path": "third_party/minizip-ng/mz_os.c",
+      "sha256": "7FF5E137AD2C1F4E563AA79E4481F333E27001E84CA85B96A87FFE158431F35E"
+    },
+    {
+      "path": "third_party/minizip-ng/mz_os.h",
+      "sha256": "063C51AE7268C382485C9E52B4FE0FA95401E617D43A6F5719D3A1A4D07DDCEF"
+    },
+    {
+      "path": "third_party/minizip-ng/mz_strm_buf.c",
+      "sha256": "18C2085209FA750F7FFEE36A3B95A7D63FC80D42C02AF602CE6646FEE1A1C960"
+    },
+    {
+      "path": "third_party/minizip-ng/mz_strm_buf.h",
+      "sha256": "A1ED95F1546FA78F9DEAE228F97DB0545A9095C69C10DACEC3FE1A316236CE25"
+    },
+    {
+      "path": "third_party/minizip-ng/mz_strm_bzip.c",
+      "sha256": "B46E7BE39E1425101B7508CC9F04F863F89C512D88455B748093C1AE2CB6FD61"
+    },
+    {
+      "path": "third_party/minizip-ng/mz_strm_bzip.h",
+      "sha256": "FAF3CC8C7DAD0CF05FCE63B4675C4CB63096C2038641D6986EE44B0E066DEA8F"
+    },
+    {
+      "path": "third_party/minizip-ng/mz_strm_libcomp.c",
+      "sha256": "47E29BC826DB68722B7E42457CEA9D6D7C7407B1930AF04E512F98801421F299"
+    },
+    {
+      "path": "third_party/minizip-ng/mz_strm_libcomp.h",
+      "sha256": "1EED96BA8191941C1FF9DDF65790E2F23590134B7B81A4AB55DCDB58AAB3DFD9"
+    },
+    {
+      "path": "third_party/minizip-ng/mz_strm_lzma.c",
+      "sha256": "3B0D03F3A2BA0982E3693CBC03DF090D91476E9B4EAF376051AA478477AC0CB7"
+    },
+    {
+      "path": "third_party/minizip-ng/mz_strm_lzma.h",
+      "sha256": "BC961AAF39917AB34D20A01366883071A1088C8FE63742C9A1C43D6B9CD3E4B5"
+    },
+    {
+      "path": "third_party/minizip-ng/mz_strm_mem.c",
+      "sha256": "4E181881955A1F8974FB5723EA841389C46D67B2DB79224B038CC8E8C19C4661"
+    },
+    {
+      "path": "third_party/minizip-ng/mz_strm_mem.h",
+      "sha256": "BA2FE0C69628ACDF6EA7C9C6815B5A9813F7BEF1C2F3910147C3D60AC0F30FA0"
+    },
+    {
+      "path": "third_party/minizip-ng/mz_strm_os_posix.c",
+      "sha256": "C258C71AA13730597BD9625CCA16E99A83ABBDD05EA087F4499D7DFA9ABDBFC1"
+    },
+    {
+      "path": "third_party/minizip-ng/mz_strm_os_win32.c",
+      "sha256": "96C7CCC297892404A5200DA458156833C99874C5296E496ACC9107FE0F6D37AC"
+    },
+    {
+      "path": "third_party/minizip-ng/mz_strm_os.h",
+      "sha256": "E86EBB27E1AE11D7F0D488EF9DD6DA2246865D4A0B44019166F3DE4D20F79650"
+    },
+    {
+      "path": "third_party/minizip-ng/mz_strm_pkcrypt.c",
+      "sha256": "B9D0684820567142B25E4885F66AB75644B5D7250474514C0BBCE945E80EA283"
+    },
+    {
+      "path": "third_party/minizip-ng/mz_strm_pkcrypt.h",
+      "sha256": "7AFBF8812585022676DF39E899E3F00205D3BAED252A19249EA0CE1E47A05436"
+    },
+    {
+      "path": "third_party/minizip-ng/mz_strm_ppmd.c",
+      "sha256": "1AADDBB21625238E46FA49F5706DD1E7D9AB01B2B0F79DAAA3BBFA8BF668A335"
+    },
+    {
+      "path": "third_party/minizip-ng/mz_strm_ppmd.h",
+      "sha256": "6B9B1317998E880CDA1AB0A56AD65DC242321D0C6E8C495D7D387C526923C378"
+    },
+    {
+      "path": "third_party/minizip-ng/mz_strm_split.c",
+      "sha256": "4BD50DC916961542406D682192EBBF5DF04310DC8A6642EDFF1638EB691A05F9"
+    },
+    {
+      "path": "third_party/minizip-ng/mz_strm_split.h",
+      "sha256": "0B1F8BCE468944633A31DC21C771EDBD4905A3EFAAEEBE8FB0CAACCE463E36D9"
+    },
+    {
+      "path": "third_party/minizip-ng/mz_strm_wzaes.c",
+      "sha256": "73DE2C65CB4D8567CCB51DF7F41483DB1FEAC05A903754FCC45C79AEAD42F8B5"
+    },
+    {
+      "path": "third_party/minizip-ng/mz_strm_wzaes.h",
+      "sha256": "4E9CA23513C5ADE984511F4E699CFE82341E7EF0650B56094BFAE1216E85D946"
+    },
+    {
+      "path": "third_party/minizip-ng/mz_strm_zlib.c",
+      "sha256": "5C626700D16767ADDBB0734B3552C3CE806041192D25DA792424FF0604B63642"
+    },
+    {
+      "path": "third_party/minizip-ng/mz_strm_zlib.h",
+      "sha256": "21044F729CFC0D978CE9EA3F8B253E477804469A9234305CAD7BDA88EA292169"
+    },
+    {
+      "path": "third_party/minizip-ng/mz_strm_zstd.c",
+      "sha256": "A9B20C7B5A158C7E20256E7B85F8936F4C9339629128695C2D2ECDA0E3C08D24"
+    },
+    {
+      "path": "third_party/minizip-ng/mz_strm_zstd.h",
+      "sha256": "32E14885ED8B57E0EB8615772125F03B8E5FC03B58D4D3F71EB8B0B20278C9E5"
+    },
+    {
+      "path": "third_party/minizip-ng/mz_strm.c",
+      "sha256": "5FEAD960FA4173EE6288BBF03D76F1EC66E93234427749D3260AD2A26275D7E5"
+    },
+    {
+      "path": "third_party/minizip-ng/mz_strm.h",
+      "sha256": "EB2F45579C206555080C1AA86DE83EBDFE81D29670C16A0F6CD0F53044CB7103"
+    },
+    {
+      "path": "third_party/minizip-ng/mz_zip_rw.c",
+      "sha256": "4686F8B1E83536E31964325B729F663C5965204043B92E8743AB47D954C9985D"
+    },
+    {
+      "path": "third_party/minizip-ng/mz_zip_rw.h",
+      "sha256": "734FFF0A41094260AE538A0121A4CDE28DA55F42673CCA06E1E199B49001FED7"
+    },
+    {
+      "path": "third_party/minizip-ng/mz_zip.c",
+      "sha256": "7F4F407CBD85F472319C2F3F5A26436D61F848B77FA736F230DCA610943BB746"
+    },
+    {
+      "path": "third_party/minizip-ng/mz_zip.h",
+      "sha256": "461781CACB453E67F698CEA29F977627B163035F55FD6B74322B8D342330016A"
+    },
+    {
+      "path": "third_party/minizip-ng/mz.h",
+      "sha256": "E5394B698D2C45DF221BDC037A9DBB6C7D6848B284B381BDD2533546FE4F0C10"
+    },
+    {
+      "path": "third_party/minizip-ng/README.md",
+      "sha256": "07148416E2E63E28EDA02B89E7F82F8DCD3AEC3EB55BA8D4D61A4C9A51D3ADF1"
+    },
+    {
+      "path": "third_party/zlib/.cmake-format.yaml",
+      "sha256": "9B35F8FE50AA88768471403B77D2DE2739BAD4B3077F96084F86D3459E318FC7"
+    },
+    {
+      "path": "third_party/zlib/.gitignore",
+      "sha256": "320C3B2ECE3F12A598076908240425A1BA1B9D6EC0FA07164D99516FE4BA2D1E"
+    },
+    {
+      "path": "third_party/zlib/adler32.c",
+      "sha256": "1E14078FC631F6B5691B7DC42FDE83DC913213EC6EDE54CDF68E612D3EAAF385"
+    },
+    {
+      "path": "third_party/zlib/BUILD.bazel",
+      "sha256": "87A0C48B87EA4F083C51A55F6353911A903CE350CF0135B81BB54F4165B73A22"
+    },
+    {
+      "path": "third_party/zlib/ChangeLog",
+      "sha256": "C02A65EB03194BDC8A5D15A981DEAE233EA55059185D9DB1A31806F68BC02809"
+    },
+    {
+      "path": "third_party/zlib/CMakeLists.txt",
+      "sha256": "7519866EC862814CD7FCBB329836E5601FB9CA9CD9FAE112AAD7698758CF494C"
+    },
+    {
+      "path": "third_party/zlib/compress.c",
+      "sha256": "181BA042AC0675FDCB18489D46710B2B0D8718C2E351FF3463D7DEDF69653918"
+    },
+    {
+      "path": "third_party/zlib/configure",
+      "sha256": "F50807470E542907E840AC763A8C08C8CF7626826D8A2164D8357BEB25D89B71"
+    },
+    {
+      "path": "third_party/zlib/crc32.c",
+      "sha256": "D8C069D1887197D14E5120C1325CED7D831145EF056DFC2EF7EA3344A6480D23"
+    },
+    {
+      "path": "third_party/zlib/crc32.h",
+      "sha256": "5729F6816E505B456A743AA57C25D13DC070EE932E81ACA4FC613F286F85317B"
+    },
+    {
+      "path": "third_party/zlib/deflate.c",
+      "sha256": "57A68B84CA2ACBFDE772632E5439EAEEC17F8CE81925132EBC2813544F91A745"
+    },
+    {
+      "path": "third_party/zlib/deflate.h",
+      "sha256": "205C3013A4470FF702CB1B43B97EDED67B65E58E978F9FBCAF26C475AC9E370F"
+    },
+    {
+      "path": "third_party/zlib/examples/enough.c",
+      "sha256": "409463DE921D80DB7B2098FD646552BF30A32FDE6160C22D8126A37B9BFCE5C0"
+    },
+    {
+      "path": "third_party/zlib/examples/fitblk.c",
+      "sha256": "953FB8389BEFF851880BE373F17A07BBE687C1EB29089745C17E17FEBC0C6124"
+    },
+    {
+      "path": "third_party/zlib/examples/gun.c",
+      "sha256": "7FD91B382B91139CA376616EE6B01DFA6A6A914AA9A5B37D0C7A8E5F48C9D1AD"
+    },
+    {
+      "path": "third_party/zlib/examples/gzappend.c",
+      "sha256": "E2AE339475D42B63D101E1188C75771ED3CBD0E2268B2B8D6F637FCCB55F5F4F"
+    },
+    {
+      "path": "third_party/zlib/examples/gzjoin.c",
+      "sha256": "1F49A0892FD400721073BC41AC6FCA39A9526BA7BB2C21486F2AE673AC07B583"
+    },
+    {
+      "path": "third_party/zlib/examples/gzlog.c",
+      "sha256": "14FC8F7A0700522DC8EA96676A071284EB727622F226C7F791535B8FABD9EB38"
+    },
+    {
+      "path": "third_party/zlib/examples/gzlog.h",
+      "sha256": "AA0B0BE5BB540A67F246DE7B619C5D0BDD5C03E668C89A9C3052EA84B08C7268"
+    },
+    {
+      "path": "third_party/zlib/examples/gznorm.c",
+      "sha256": "FE1C9D1A4247FFFDA605A9D2F824D86D86C2035D1AA78498BCAC60FDC80DB11D"
+    },
+    {
+      "path": "third_party/zlib/examples/README.examples",
+      "sha256": "57D585691375398B0DCECB55E32807647EB78EA669D85CDACCA86D0AD5742A81"
+    },
+    {
+      "path": "third_party/zlib/examples/zlib_how.html",
+      "sha256": "BBC93DC7DA43253D4231AF3925AF7432E3648528DFC81DFB09CEC7A6AFE8ED8B"
+    },
+    {
+      "path": "third_party/zlib/examples/zpipe.c",
+      "sha256": "6509EE81050BAA30BD8A6BCE0589DE7FCDFA7051BEED9AC56B6EFCC0C1601BD7"
+    },
+    {
+      "path": "third_party/zlib/examples/zran.c",
+      "sha256": "EED8C76C217C6448385E09AB20EE4079230CD11725FCB182B2BD0666C9DCDF47"
+    },
+    {
+      "path": "third_party/zlib/examples/zran.h",
+      "sha256": "2AE54EE577FF1486710941A47C853D81C71FDEA4A7DAA8CBDAE2F2B74A91ADF6"
+    },
+    {
+      "path": "third_party/zlib/FAQ",
+      "sha256": "3694ED826E0B49A3F6BC0034CF977621CFBA0A701810A7217F3F4FD3FC52A724"
+    },
+    {
+      "path": "third_party/zlib/gzclose.c",
+      "sha256": "1C766FC1BFC58F18CD3453424D71BE1C962EA9B0A05281FAA45AEC6777DAAD09"
+    },
+    {
+      "path": "third_party/zlib/gzguts.h",
+      "sha256": "3F5BDBD0F9FF6C41D40218322F6DB855C61130E835A4724DD3B26ABFB5781049"
+    },
+    {
+      "path": "third_party/zlib/gzlib.c",
+      "sha256": "C0566173BE6ECA6F4EF21390E6B9BFA21192EBD46D7EF9678DC232D73EA1A132"
+    },
+    {
+      "path": "third_party/zlib/gzread.c",
+      "sha256": "3DCF840106BE928BD9990C1C94F210A797E22600AA5434ECD8CDA9EA058052F7"
+    },
+    {
+      "path": "third_party/zlib/gzwrite.c",
+      "sha256": "7552A6D1C8518FF75A6C98E37D25A32ECB673D354C3F5677119A12C0852F5D2C"
+    },
+    {
+      "path": "third_party/zlib/INDEX",
+      "sha256": "D3F8304FD584D10D0E2FC2A96B6040955A392B8E063E3BF63E56EC5A2DB37351"
+    },
+    {
+      "path": "third_party/zlib/infback.c",
+      "sha256": "6068EE867E1ED9D31D747B5CBEFB22EA12578D5FD5708F59DD9B5CF4F38B4C23"
+    },
+    {
+      "path": "third_party/zlib/inffast.c",
+      "sha256": "09C508AF21E4F537DE990EDCB8609F291DE47BB0850D6B3494172CFC7D28CB0A"
+    },
+    {
+      "path": "third_party/zlib/inffast.h",
+      "sha256": "C9D1F9EE7BD78F9590065DC93EB14B5CFCBFBB28EAF3A990836512446E1A17CD"
+    },
+    {
+      "path": "third_party/zlib/inffixed.h",
+      "sha256": "B763C7F8A2613D85827E65BEC8A9F650C51C3A71603BE7E5FF0E2C1837CA7FFA"
+    },
+    {
+      "path": "third_party/zlib/inflate.c",
+      "sha256": "EE560BD794EB89C35100F975337B81129A8C3CD731C6791658BB79D793E0C894"
+    },
+    {
+      "path": "third_party/zlib/inflate.h",
+      "sha256": "AB17E127AF7CB2355CC8ADB8FEF6B1A360BF6B5F5DABB9AEB258B7F761C63FCE"
+    },
+    {
+      "path": "third_party/zlib/inftrees.c",
+      "sha256": "BCD5A429031F3218AD3236153F86893B60FF70B69FA19113A7D8DECB00AFD7F8"
+    },
+    {
+      "path": "third_party/zlib/inftrees.h",
+      "sha256": "2E997C7C87F7AA901BA8B4472137BA5A12EA3423AF2A6E4EC4F8EA30F90A460C"
+    },
+    {
+      "path": "third_party/zlib/LICENSE",
+      "sha256": "439C75AB12B340C5362B9D4B08FF05EC3A4D0EB7667A6FFF49A9B16D8795C78E"
+    },
+    {
+      "path": "third_party/zlib/make_vms.com",
+      "sha256": "A3469D6F7A5C3D923F1D8F7D0918FCABB787F16F4D338A953742375B0D44DE4D"
+    },
+    {
+      "path": "third_party/zlib/Makefile.in",
+      "sha256": "16F010E6164DBC955C90930B38056333023B3C427FC3FB16DC1679CEDE338F01"
+    },
+    {
+      "path": "third_party/zlib/MODULE.bazel",
+      "sha256": "C663F25823F893F147EDEE860EBDD12140CF634D35726FAE1A349D9FC88FEB9A"
+    },
+    {
+      "path": "third_party/zlib/README",
+      "sha256": "37797DF3D16EAE42CD9C0D1D315B758E1B5DEB573F60B471FC5DA2C006C4ECD8"
+    },
+    {
+      "path": "third_party/zlib/README-cmake.md",
+      "sha256": "A70E5A7DEE3E2F2921C7A5DEA31BE98918A489B6F9E277C3396EC607DE214D25"
+    },
+    {
+      "path": "third_party/zlib/treebuild.xml",
+      "sha256": "79E34DC845E1FA5C8EDC6125557B7DCD919CDCEF70132D8E598258F7C6D26EAE"
+    },
+    {
+      "path": "third_party/zlib/trees.c",
+      "sha256": "0EF48FF27317C9D6B95D1B208974A5C59160CE3E5BFFF89B3B65C98B8403CA1C"
+    },
+    {
+      "path": "third_party/zlib/trees.h",
+      "sha256": "EF4025453D5E62F39DA4F7D0A04CD256E9091C8D2AFF5AADA59C31C22491E4DC"
+    },
+    {
+      "path": "third_party/zlib/uncompr.c",
+      "sha256": "E25B8656E95FB94961F14A5F0FC45669F35F024C2437BA23F12BDE0AEF50DDBD"
+    },
+    {
+      "path": "third_party/zlib/win32/DLL_FAQ.txt",
+      "sha256": "396B2E41E9A4EF180DB3FC38E478A51B836861117D63A467667EB15AB9A65BB9"
+    },
+    {
+      "path": "third_party/zlib/win32/Makefile.bor",
+      "sha256": "3F2E51512F8934B854AB11D88305AB836090E91EC8012392301ACFCA0B2B9E37"
+    },
+    {
+      "path": "third_party/zlib/win32/Makefile.gcc",
+      "sha256": "3198F00D7E6689EBEB7017A9A279A90CB2111296ECDA81104BF13EA32CB56B94"
+    },
+    {
+      "path": "third_party/zlib/win32/Makefile.msc",
+      "sha256": "3DF73EF9A40F651F560B274FDC55572CD97238805D470CE361D24C155BDB30F2"
+    },
+    {
+      "path": "third_party/zlib/win32/README-WIN32.txt",
+      "sha256": "CB3A42693819B76A685FE3645290C8B45EC41742BD7D388CDB3DBBF021C5816E"
+    },
+    {
+      "path": "third_party/zlib/win32/VisualC.txt",
+      "sha256": "E3FBAAD95B1D0C5A384E2D02A8C4E076CB7D23EADC3F570B092AA14F03925A9E"
+    },
+    {
+      "path": "third_party/zlib/win32/zlib.def",
+      "sha256": "F5BFA51482A8E52AD6236FC915F52FB78F0CA2853412C7B79F2706A1891EF45A"
+    },
+    {
+      "path": "third_party/zlib/win32/zlib1.rc",
+      "sha256": "251E4549B456DD276CD8B721E60AA52F5A65B062AC2A07783DA76112E3F62CC6"
+    },
+    {
+      "path": "third_party/zlib/zconf.h.in",
+      "sha256": "C67A074A7930587FD2A4A16361E3890E9AC691187E57DD5B7A137F3E1A55B8E3"
+    },
+    {
+      "path": "third_party/zlib/zlib.3",
+      "sha256": "2B1DD82FB65BADA2B3D0EC8E0D45313F989013E4DD881E9BADE4AEF2E3535ED7"
+    },
+    {
+      "path": "third_party/zlib/zlib.h",
+      "sha256": "AA5D046FE1C26C0FCE240EBFE014D2110A447A49E59AD5FF83975143D17A46AD"
+    },
+    {
+      "path": "third_party/zlib/zlib.map",
+      "sha256": "9C59E7590FE55223BF19687B6BA3A91585DB41CD3414C8FC59C09E737AD4A802"
+    },
+    {
+      "path": "third_party/zlib/zlib.pc.cmakein",
+      "sha256": "FC10F76936477C7361D0C3B300BA9480A00526C8BD15DD3177179CB04B9BFDEA"
+    },
+    {
+      "path": "third_party/zlib/zlib.pc.in",
+      "sha256": "6380CBAFD9BD44BBACE10EA6B852C5E55FE710CF66D7297CF2E77E1D3AE121BF"
+    },
+    {
+      "path": "third_party/zlib/zlibConfig.cmake.in",
+      "sha256": "A6BC086ED352B9463FC4F33E6021781EF1DCD5CE3D272B03E11B6A8061AA7295"
+    },
+    {
+      "path": "third_party/zlib/zutil.c",
+      "sha256": "AB83ECEBD49525F8A15AA751D058D57DCAD7F101682E69B233A62AFEEFC35C5B"
+    },
+    {
+      "path": "third_party/zlib/zutil.h",
+      "sha256": "13CE7E0E5A67F5066947D7AAF54E6A33F2F3B3F4059DE6081337D50ECB43DA99"
+    },
+    {
+      "path": "tools/New-BuildIdentity.ps1",
+      "sha256": "EF0E90ABD31637B2F0A0E8C811501FA578B5A3723741BB3B9F27FC9237910AFA"
+    }
+  ]
+}
